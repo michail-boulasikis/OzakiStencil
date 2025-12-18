@@ -1,0 +1,213 @@
+#ifndef HEADER_STENCIL_HPP
+#define HEADER_STENCIL_HPP
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+#include <vector>
+
+#ifdef __CUDACC__
+#define HD __host__ __device__
+#else
+#define HD
+#endif
+
+namespace ozaki {
+
+template <size_t D> HD constexpr std::array<size_t, D> make_strides_from_shape(const std::array<size_t, D> &shape) {
+  std::array<size_t, D> strides{};
+  size_t acc = 1;
+  for (std::ptrdiff_t i = static_cast<std::ptrdiff_t>(D) - 1; i >= 0; --i) {
+    strides[static_cast<size_t>(i)] = acc;
+    acc *= shape[static_cast<size_t>(i)];
+  }
+  return strides;
+}
+
+template <size_t D>
+HD constexpr size_t linear_from_multi(const std::array<size_t, D> &idx, const std::array<size_t, D> &strides) {
+  size_t lin = 0;
+  for (size_t d = 0; d < D; ++d)
+    lin += idx[d] * strides[d];
+  return lin;
+}
+
+template <size_t D>
+HD constexpr std::array<size_t, D> multi_from_linear(size_t linear, const std::array<size_t, D> &shape) {
+  std::array<size_t, D> idx{};
+  auto strides = make_strides_from_shape(shape);
+  for (size_t i = 0; i < D; ++i) {
+    idx[i] = (linear / strides[i]) % shape[i];
+  }
+  return idx;
+}
+
+template <typename T, size_t... Dims> struct Stencil {
+  static_assert(sizeof...(Dims) >= 1, "Stencil must have at least one dimension");
+  static_assert(((Dims > 0) && ...), "All stencil dimensions must be > 0");
+
+public:
+  static constexpr size_t dims = sizeof...(Dims);
+  HD static constexpr size_t get_dims() { return dims; }
+
+  using value_type = T;
+  using shape_type = std::array<size_t, dims>;
+  using offset_type = std::array<size_t, dims>;
+
+  inline static constexpr shape_type shape = {Dims...};
+  HD static constexpr shape_type get_shape() { return shape; }
+  inline static constexpr size_t size = (Dims * ...);
+  HD static constexpr size_t get_size() { return size; }
+
+  using coeffs_type = std::array<T, size>;
+
+  inline static constexpr shape_type strides = make_strides_from_shape(shape);
+  HD static constexpr shape_type get_strides() { return strides; }
+
+  coeffs_type coeffs{};
+  offset_type offsets{};
+
+  HD constexpr Stencil() noexcept : coeffs{}, offsets{} {
+    for (size_t i = 0; i < dims; ++i)
+      offsets[i] = shape[i] / 2;
+  }
+
+  HD constexpr Stencil(const coeffs_type &c, const offset_type &offs) noexcept : coeffs(c), offsets(offs) {}
+
+  HD constexpr explicit Stencil(const coeffs_type &c) noexcept : coeffs(c), offsets{} {
+    for (size_t i = 0; i < dims; ++i)
+      offsets[i] = shape[i] / 2;
+  }
+
+  HD static constexpr size_t multi_to_linear(const shape_type &idx) {
+    size_t lin = 0;
+    for (size_t i = 0; i < dims; ++i)
+      lin += idx[i] * get_strides()[i];
+    return lin;
+  }
+
+  HD static constexpr shape_type linear_to_multi(int64_t linear) {
+    shape_type idx{};
+    for (size_t i = 0; i < dims; ++i) {
+      idx[i] = (linear / get_strides()[i]) % get_shape()[i];
+    }
+    return idx;
+  }
+
+  template <typename... Idx>
+    requires(sizeof...(Idx) == dims)
+  HD constexpr T &operator()(Idx... idxs) {
+    shape_type idx = {static_cast<size_t>(idxs)...};
+    return coeffs[multi_to_linear(idx)];
+  }
+  template <typename... Idx>
+    requires(sizeof...(Idx) == dims)
+  HD constexpr const T &operator()(Idx... idxs) const {
+    shape_type idx = {static_cast<size_t>(idxs)...};
+    return coeffs[multi_to_linear(idx)];
+  }
+
+  // these two functions overflow and yet they work. I need a smarter way to handle them.
+  template <typename... Idx>
+    requires(sizeof...(Idx) == dims)
+  HD constexpr const T &cfrel(Idx... relidxs) const noexcept {
+    std::array<size_t, dims> rel = {static_cast<size_t>(relidxs)...};
+    shape_type abs{};
+    for (size_t i = 0; i < dims; ++i) {
+      abs[i] = offsets[i] + rel[i];
+    }
+    return coeffs[multi_to_linear(abs)];
+  }
+  template <typename... Idx>
+    requires(sizeof...(Idx) == dims)
+  HD constexpr T &cfrel(Idx... relidxs) noexcept {
+    std::array<size_t, dims> rel = {static_cast<size_t>(relidxs)...};
+    shape_type abs{};
+    for (size_t i = 0; i < dims; ++i) {
+      abs[i] = offsets[i] + rel[i];
+    }
+    return coeffs[multi_to_linear(abs)];
+  }
+
+  HD constexpr T &operator[](size_t linear) noexcept { return coeffs[linear]; }
+  HD constexpr const T &operator[](size_t linear) const noexcept { return coeffs[linear]; }
+
+  template <typename AccType, typename Container>
+  std::vector<AccType> apply_to(const Container &input, const shape_type &in_shape) const {
+    const auto in_strides = make_strides_from_shape(in_shape);
+    size_t in_size_lin = 1;
+    for (const auto sz : in_shape)
+      in_size_lin *= sz;
+
+    std::vector<AccType> output(in_size_lin, static_cast<AccType>(0)); // same size as input
+
+    // For each element in the input array:
+    for (size_t lin = 0; lin < in_size_lin; ++lin) {
+      auto idx = multi_from_linear(lin, in_shape);
+      AccType acc = 0;
+
+      // Loop over stencil coefficients
+      for (size_t s_lin = 0; s_lin < size; ++s_lin) {
+        auto s_idx = linear_to_multi(static_cast<int64_t>(s_lin));
+
+        // Compute position in input after applying stencil offset
+        std::array<int64_t, dims> rel{};
+        for (size_t d = 0; d < dims; ++d)
+          rel[d] = static_cast<int64_t>(idx[d]) + static_cast<int64_t>(s_idx[d]) - static_cast<int64_t>(offsets[d]);
+
+        // Check if inside bounds
+        bool in_bounds = true;
+        for (size_t d = 0; d < dims; ++d)
+          in_bounds &= (rel[d] >= 0 && rel[d] < static_cast<int64_t>(in_shape[d]));
+
+        if (in_bounds) {
+          std::array<size_t, dims> abs{};
+          for (size_t d = 0; d < dims; ++d)
+            abs[d] = static_cast<size_t>(rel[d]);
+          const size_t lin_in = linear_from_multi(abs, in_strides);
+          acc += static_cast<AccType>(coeffs[s_lin]) * static_cast<AccType>(input[lin_in]);
+        }
+      }
+      output[lin] = acc;
+    }
+    return output;
+  }
+};
+
+template <typename T1, size_t... A, typename T2, size_t... B>
+HD constexpr auto correlate(const Stencil<T1, A...> &a, const Stencil<T2, B...> &b)
+    -> Stencil<std::common_type_t<T1, T2>, (A + B - 1)...> {
+  static_assert(sizeof...(A) == sizeof...(B), "Both stencils must have the same number of dimensions");
+
+  using out_type = std::common_type_t<T1, T2>;
+  using out_stencil_type = Stencil<out_type, (A + B - 1)...>;
+  using out_coeffs_type = typename out_stencil_type::coeffs_type;
+  using out_shape_type = typename out_stencil_type::shape_type;
+
+  out_stencil_type out{};
+  for (size_t i = 0; i < out_stencil_type::shape.size(); ++i) {
+    out.offsets[i] = a.offsets[i] + b.offsets[i];
+  }
+
+  constexpr int64_t sizeA = Stencil<T1, A...>::size;
+  constexpr int64_t sizeB = Stencil<T2, B...>::size;
+
+  for (size_t ia = 0; ia < sizeA; ++ia) {
+    auto idxA = a.linear_to_multi(ia);
+    for (size_t jb = 0; jb < sizeB; ++jb) {
+      auto idxB = b.linear_to_multi(jb);
+      out_shape_type out_idx{};
+      for (size_t d = 0; d < out_idx.size(); ++d) {
+        out_idx[d] = idxA[d] + idxB[d];
+      }
+      const size_t out_lin = out_stencil_type::multi_to_linear(out_idx);
+      out.coeffs[out_lin] += static_cast<out_type>(a.coeffs[ia]) * static_cast<out_type>(b.coeffs[jb]);
+    }
+  }
+
+  return out;
+}
+} // namespace ozaki
+
+#endif // HEADER_STENCIL_HPP

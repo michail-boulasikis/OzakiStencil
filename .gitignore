@@ -1,0 +1,14 @@
+build*/
+target*/
+Testing/
+benchmark/ConvStencil/
+benchmark/DRStencil/
+benchmark/LoRAStencil/
+benchmark/TCstencil/
+data/
+
+.cache/
+
+*.csv
+*.dat
+
