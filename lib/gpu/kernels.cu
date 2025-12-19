@@ -11,7 +11,6 @@
 
 using namespace nvcuda;
 
-
 #define TILE_DIM 16
 using FragA = wmma::fragment<wmma::matrix_a, TILE_DIM, TILE_DIM, TILE_DIM, int8_t, wmma::col_major>;
 using FragB = wmma::fragment<wmma::matrix_b, TILE_DIM, TILE_DIM, TILE_DIM, int8_t, wmma::col_major>;
@@ -142,20 +141,19 @@ CUDA_GLOBAL void ozi_mul_stencil(int8_t *__restrict__ out, const int8_t *__restr
       int4 loaded_partial = *(reinterpret_cast<int4 *>(accumulator) + row + col * (TILE_DIM + TILE_PADDING) / 4);
       // step 4.5.2: byte permutation
       byte_permute_slice(&loaded_partial);
-      // step 4.5.3: store back to shared memory before doing byte-wise store. Handling the halo is easier that way, unfortunately
+      // step 4.5.3: store back to shared memory before doing byte-wise store. Handling the halo is easier that way,
+      // unfortunately
       *(reinterpret_cast<int4 *>(accumulator) + row + col * (TILE_DIM + TILE_PADDING) / 4) = loaded_partial;
     }
     __syncthreads();
 
-    // we have (16 - halo) * (16 - halo) bytes per warp 
+    // we have (16 - halo) * (16 - halo) bytes per warp
     if (LANE_ID > halo_size && LANE_ID < TILE_DIM - halo_size) {
-      int8_t *byte_acc = reinterpret_cast<int8_t *>(accumulator) + WARP_ID * (TILE_DIM + TILE_PADDING) * TILE_DIM + LANE_ID * (TILE_DIM + TILE_PADDING);
-//      for (int32_t j = halo_size; j < TILE_DIM - halo_size; ++j)
-//        out[] = byte_acc[j];
-
+      int8_t *byte_acc = reinterpret_cast<int8_t *>(accumulator) + WARP_ID * (TILE_DIM + TILE_PADDING) * TILE_DIM +
+                         LANE_ID * (TILE_DIM + TILE_PADDING);
+      //      for (int32_t j = halo_size; j < TILE_DIM - halo_size; ++j)
+      //        out[] = byte_acc[j];
     }
-
-  
 
     current_slice -= NUM_WARPS;
   }

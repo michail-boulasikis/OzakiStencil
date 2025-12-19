@@ -4,44 +4,32 @@
 #include "../core/ozi.hpp"
 #include "gpu_checks.cuh"
 #include <limits>
-#include <type_traits>
 
 #ifndef RDC_THREADS_PER_BLOCK
 #define RDC_THREADS_PER_BLOCK 512
 #endif
 
 #ifdef __CUDACC__
-template <typename T> struct alignas(16) FourValues {
+template <typename T> struct /*alignas(16)*/ FourValues {
   T a[4];
 };
 
-template <typename T>
-struct BitwiseTypeTraits;
+template <typename T> struct BitwiseTypeTraits;
 
-template <>
-struct BitwiseTypeTraits<float> {
-    using UintType = uint32_t;
-    using IntType  = int32_t;
-    
-    CUDA_DEVICE CUDA_FORCEINLINE static IntType as_int(float x) {
-        return __float_as_int(x);
-    }
-    CUDA_DEVICE CUDA_FORCEINLINE static float as_float(IntType x) {
-        return __int_as_float(x);
-    }
+template <> struct BitwiseTypeTraits<float> {
+  using UintType = uint32_t;
+  using IntType = int32_t;
+
+  CUDA_DEVICE CUDA_FORCEINLINE static IntType as_int(float x) { return __float_as_int(x); }
+  CUDA_DEVICE CUDA_FORCEINLINE static float as_float(IntType x) { return __int_as_float(x); }
 };
 
-template <>
-struct BitwiseTypeTraits<double> {
-    using UintType = uint64_t;
-    using IntType  = int64_t;
+template <> struct BitwiseTypeTraits<double> {
+  using UintType = uint64_t;
+  using IntType = int64_t;
 
-    CUDA_DEVICE CUDA_FORCEINLINE static IntType as_int(double x) {
-        return __double_as_longlong(x);
-    }
-    CUDA_DEVICE CUDA_FORCEINLINE static double as_float(IntType x) {
-        return __longlong_as_double(x);
-    }
+  CUDA_DEVICE CUDA_FORCEINLINE static IntType as_int(double x) { return __double_as_longlong(x); }
+  CUDA_DEVICE CUDA_FORCEINLINE static double as_float(IntType x) { return __longlong_as_double(x); }
 };
 
 template <typename T> CUDA_GLOBAL void fill(T *__restrict__ in, const T val, size_t n) {
@@ -50,7 +38,8 @@ template <typename T> CUDA_GLOBAL void fill(T *__restrict__ in, const T val, siz
     in[tid] = val;
 }
 
-template <typename T> CUDA_GLOBAL void abs_max_nextpow2_reduce(int32_t *__restrict__ out, const T *__restrict__ in, size_t n) {
+template <typename T>
+CUDA_GLOBAL void abs_max_nextpow2_reduce(int32_t *__restrict__ out, const T *__restrict__ in, size_t n) {
   constexpr uint32_t WARPS_PER_BLOCK = RDC_THREADS_PER_BLOCK / WARP_SIZE;
   constexpr uint32_t BLOCK_STRIDE = RDC_THREADS_PER_BLOCK;
   __shared__ T smem[WARPS_PER_BLOCK];
@@ -99,19 +88,19 @@ template <typename T, typename U> CUDA_DEVICE CUDA_FORCEINLINE U gpu_round_and_c
   constexpr int32_t LO = static_cast<int32_t>(std::numeric_limits<U>::min()) + 1;
   constexpr int32_t HI = static_cast<int32_t>(std::numeric_limits<U>::max());
   int32_t r;
-  if constexpr (sizeof(T) == 8) r = __double2int_rn(a); 
-  else r = __float2int_rn(a);
+  if constexpr (sizeof(T) == 8)
+    r = __double2int_rn(a);
+  else
+    r = __float2int_rn(a);
   return static_cast<U>(max(LO, min(HI, r)));
 }
 
-template <>
-CUDA_DEVICE CUDA_FORCEINLINE int8_t gpu_round_and_clamp(double a) {
+template <> CUDA_DEVICE CUDA_FORCEINLINE int8_t gpu_round_and_clamp(double a) {
   int32_t ret;
   asm("cvt.rni.sat.s8.f64 %0, %1;" : "=r"(ret) : "d"(a));
   return static_cast<int8_t>(max(-127, ret));
 }
-template <>
-CUDA_DEVICE CUDA_FORCEINLINE int8_t gpu_round_and_clamp(float a) {
+template <> CUDA_DEVICE CUDA_FORCEINLINE int8_t gpu_round_and_clamp(float a) {
   int32_t ret;
   asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(ret) : "f"(a));
   return static_cast<int8_t>(max(-127, ret));
@@ -128,28 +117,27 @@ CUDA_GLOBAL void ozaki_slice(U *__restrict__ out, const T *__restrict__ in, cons
   int32_t shift_amount = shift_step - *power;
 
   FourValues<T> ins = reinterpret_cast<const FourValues<T> *>(in)[tid];
+  FourValues<U> outs{};
 
 #pragma unroll 4
   for (int32_t s = 0; s < num_slices; ++s) {
-    const size_t flat_offset = (static_cast<size_t>(s) * (n / 4) + static_cast<size_t>(tid)) * 4;
+    const size_t flat_offset = static_cast<size_t>(s) * (n / 4) + static_cast<size_t>(tid);
 #pragma unroll
     for (int32_t v = 0; v < 4; ++v) {
       const T v_scaled = scalbn(ins.a[v], shift_amount);
       const U v_converted = gpu_round_and_clamp<T, U>(v_scaled);
       const T correction = scalbn(static_cast<T>(v_converted), -shift_amount);
       ins.a[v] -= correction;
-      out[flat_offset + v] = v_converted;
+      outs.a[v] = v_converted;
     }
+    reinterpret_cast<FourValues<U> *>(out)[flat_offset] = outs;
     shift_amount += shift_step;
   }
 }
 
-CUDA_GLOBAL void ozi_mul_stencil(
-    int8_t *__restrict__ out,
-    const int8_t *__restrict__ stencil,
-    const int8_t *__restrict__ data,
-    const int32_t num_slices,
-    const size_t m, const size_t n, const size_t halo_size);
+CUDA_GLOBAL void ozi_mul_stencil(int8_t *__restrict__ out, const int8_t *__restrict__ stencil,
+                                 const int8_t *__restrict__ data, const int32_t num_slices, const size_t m,
+                                 const size_t n, const size_t halo_size);
 
 #endif
 
