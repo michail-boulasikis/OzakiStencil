@@ -6,5 +6,5 @@ target_link_libraries(test-gpu PRIVATE CUDA::cudart CUDA::cuda_driver GTest::gte
 add_cpu_app(test-stencil test_stencil.cpp)
 target_link_libraries(test-stencil PRIVATE GTest::gtest_main)
 
-gtest_discover_tests(test-gpu)
+ gtest_discover_tests(test-gpu)
 gtest_discover_tests(test-stencil)

@@ -168,7 +168,7 @@ void gpu_ozaki_decomposition(int8_t *slices, int32_t *exp, const double *input, 
   cudaGetDeviceProperties(&prop, 0);
 
   CUDA_CHECK(cudaMalloc(&d_exp, sizeof(int32_t)));
-  fill<int32_t><<<1, 1>>>(d_exp, std::numeric_limits<int32_t>::min(), 1ull);
+  ozigpu::fill<int32_t><<<1, 1>>>(d_exp, std::numeric_limits<int32_t>::min(), 1ull);
 
   CUDA_CHECK(cudaMalloc(&d_input, size_flat * sizeof(double)));
   CUDA_CHECK(cudaMemcpy(d_input, input, size_flat * sizeof(double), cudaMemcpyHostToDevice));
@@ -178,10 +178,11 @@ void gpu_ozaki_decomposition(int8_t *slices, int32_t *exp, const double *input, 
   uint32_t nBlocksReduce = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / RDC_THREADS_PER_BLOCK;
   uint64_t nThreadsMap = std::min(static_cast<uint64_t>(RDC_THREADS_PER_BLOCK), size_flat / 4);
   uint32_t nBlocksMap = ((size_flat / 4) + nThreadsMap - 1) / nThreadsMap;
-  abs_max_nextpow2_reduce<double><<<nBlocksReduce, RDC_THREADS_PER_BLOCK>>>(d_exp, d_input, size_flat);
+  ozigpu::abs_max_nextpow2_reduce<double><<<nBlocksReduce, RDC_THREADS_PER_BLOCK>>>(d_exp, d_input, size_flat);
   CUDA_CHECK(cudaMemcpy(exp, d_exp, sizeof(int32_t), cudaMemcpyDeviceToHost));
 
-  ozaki_slice<double, int8_t><<<nBlocksMap, nThreadsMap>>>(d_slices, d_input, d_exp, num_slices, size_flat);
+  ozigpu::slice<ozigpu::OzakiFP_Int8<double>>
+      <<<nBlocksMap, nThreadsMap>>>(d_slices, d_input, d_exp, num_slices, size_flat);
 
   CUDA_CHECK(cudaMemcpy(slices, d_slices, num_slices * size_flat * sizeof(int8_t), cudaMemcpyDeviceToHost));
   cudaFree(d_slices);

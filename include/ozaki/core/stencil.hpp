@@ -2,6 +2,7 @@
 #define HEADER_STENCIL_HPP
 
 #include <array>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
@@ -13,7 +14,7 @@
 #define HD
 #endif
 
-namespace ozaki {
+namespace ozi {
 
 template <size_t D> HD constexpr std::array<size_t, D> make_strides_from_shape(const std::array<size_t, D> &shape) {
   std::array<size_t, D> strides{};
@@ -133,45 +134,59 @@ public:
   HD constexpr T &operator[](size_t linear) noexcept { return coeffs[linear]; }
   HD constexpr const T &operator[](size_t linear) const noexcept { return coeffs[linear]; }
 
-  template <typename AccType, typename Container>
-  std::vector<AccType> apply_to(const Container &input, const shape_type &in_shape) const {
+  template <typename AccType, typename OutContainer, typename InContainer>
+  void apply_to(OutContainer &output, const InContainer &input, const shape_type &in_shape) const {
+
+    if constexpr (requires {
+                    std::data(output);
+                    std::data(input);
+                  }) {
+      const void *out_ptr = static_cast<const void *>(std::data(output));
+      const void *in_ptr = static_cast<const void *>(std::data(input));
+      if (out_ptr && in_ptr) {
+        assert(out_ptr != in_ptr && "Cannot apply stencil in-place");
+      }
+    }
+
     const auto in_strides = make_strides_from_shape(in_shape);
     size_t in_size_lin = 1;
     for (const auto sz : in_shape)
       in_size_lin *= sz;
 
-    std::vector<AccType> output(in_size_lin, static_cast<AccType>(0)); // same size as input
+    auto linear_to_multi_fast = [&](size_t linear) {
+      std::array<size_t, dims> idx{};
+      for (size_t i = 0; i < dims; ++i) {
+        idx[i] = (linear / in_strides[i]) % in_shape[i];
+      }
+      return idx;
+    };
 
-    // For each element in the input array:
     for (size_t lin = 0; lin < in_size_lin; ++lin) {
-      auto idx = multi_from_linear(lin, in_shape);
+      auto idx = linear_to_multi_fast(lin);
       AccType acc = 0;
 
-      // Loop over stencil coefficients
       for (size_t s_lin = 0; s_lin < size; ++s_lin) {
         auto s_idx = linear_to_multi(static_cast<int64_t>(s_lin));
-
-        // Compute position in input after applying stencil offset
         std::array<int64_t, dims> rel{};
-        for (size_t d = 0; d < dims; ++d)
-          rel[d] = static_cast<int64_t>(idx[d]) + static_cast<int64_t>(s_idx[d]) - static_cast<int64_t>(offsets[d]);
-
-        // Check if inside bounds
         bool in_bounds = true;
-        for (size_t d = 0; d < dims; ++d)
+
+        for (size_t d = 0; d < dims; ++d) {
+          rel[d] = static_cast<int64_t>(idx[d]) + static_cast<int64_t>(s_idx[d]) - static_cast<int64_t>(offsets[d]);
           in_bounds &= (rel[d] >= 0 && rel[d] < static_cast<int64_t>(in_shape[d]));
+        }
 
         if (in_bounds) {
           std::array<size_t, dims> abs{};
           for (size_t d = 0; d < dims; ++d)
             abs[d] = static_cast<size_t>(rel[d]);
+
           const size_t lin_in = linear_from_multi(abs, in_strides);
+
           acc += static_cast<AccType>(coeffs[s_lin]) * static_cast<AccType>(input[lin_in]);
         }
       }
       output[lin] = acc;
     }
-    return output;
   }
 };
 
@@ -208,6 +223,6 @@ HD constexpr auto correlate(const Stencil<T1, A...> &a, const Stencil<T2, B...> 
 
   return out;
 }
-} // namespace ozaki
+} // namespace ozi
 
 #endif // HEADER_STENCIL_HPP

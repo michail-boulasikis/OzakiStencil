@@ -1,2 +1,2 @@
 add_subdirectory(ozaki)
-add_subdirectory(isl)
+add_subdirectory(stencil)

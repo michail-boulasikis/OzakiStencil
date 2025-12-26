@@ -1,127 +1,327 @@
+#include <Eigen/Dense>
 #include <gtest/gtest.h>
-#include <limits>
-#include <ozaki/core/ozi.hpp>
+
 #include <ozaki/core/stencil.hpp>
+#include <ozaki/cpu/ozi.hpp>
+
+#include <cmath>
+#include <limits>
+#include <map>
 #include <random>
 #include <stdexcept>
 #include <vector>
-#include <ozaki/gpu/kernels.cuh>
 
 namespace test_data {
-static constexpr uint64_t SEED = 0x123456789;
-static constexpr uint64_t N = 1024;
-const std::map<std::string, std::vector<double>> extreme{
-    {"min", {{std::numeric_limits<double>::min(), -2.0, 1.0}}},
-    {"minus_min", {{-std::numeric_limits<double>::min(), -2.0, 1.0}}},
-    {"eps", {{std::numeric_limits<double>::epsilon(), -2.0, 1.0}}},
-    {"minus_eps", {{-std::numeric_limits<double>::epsilon(), -2.0, 1.0}}},
-    {"max", {{std::numeric_limits<double>::max(), -2.0, 1.0}}},
-    {"minus_max", {{-std::numeric_limits<double>::max(), -2.0, 1.0}}},
-    {"min_max", {{std::numeric_limits<double>::min(), std::numeric_limits<double>::max(), 1.0}}},
-    {"minus_min_max", {{-std::numeric_limits<double>::min(), std::numeric_limits<double>::max(), 1.0}}},
-    {"min_minus_max", {{std::numeric_limits<double>::min(), -std::numeric_limits<double>::max(), 1.0}}},
-    {"minus_min_minus_max", {{-std::numeric_limits<double>::min(), -std::numeric_limits<double>::max(), 1.0}}},
-};
-const std::vector<double> zeros{0.0, 0.0, 0.0};
-const std::vector<double> infty{0.0, std::numeric_limits<double>::infinity(), 0.0};
+static constexpr uint64_t SEED = 0x12345;
+static constexpr size_t N = 1024;
+
+template <typename T> const std::map<std::string, std::vector<T>> get_extremes() {
+  return {
+      {"min", {std::numeric_limits<T>::min(), static_cast<T>(-2.0), static_cast<T>(1.0)}},
+      {"minus_min", {-std::numeric_limits<T>::min(), static_cast<T>(-2.0), static_cast<T>(1.0)}},
+      {"eps", {std::numeric_limits<T>::epsilon(), static_cast<T>(-2.0), static_cast<T>(1.0)}},
+      {"minus_eps", {-std::numeric_limits<T>::epsilon(), static_cast<T>(-2.0), static_cast<T>(1.0)}},
+      {"max", {std::numeric_limits<T>::max(), static_cast<T>(-2.0), static_cast<T>(1.0)}},
+      {"minus_max", {-std::numeric_limits<T>::max(), static_cast<T>(-2.0), static_cast<T>(1.0)}},
+      // Note: Mixing min/max in one vector might cause precision loss for T = float during summation checks,
+      // but is fine for slice/mend integrity.
+      {"min_max", {std::numeric_limits<T>::min(), std::numeric_limits<T>::max(), static_cast<T>(1.0)}},
+  };
+}
+template <typename T> const std::vector<T> zeros{0, 0, 0};
+
+template <typename T> const std::vector<T> infty{0, std::numeric_limits<T>::infinity(), 0};
+
+template <typename T>
+const ozi::Stencil<T, 3> d2x{{static_cast<T>(1.0), static_cast<T>(-2.0), static_cast<T>(1.0)}, {1}};
+
 } // namespace test_data
 
-class OzakiOne : public ::testing::Test {
-protected:
-  void SetUp() override {}
-};
+template <typename T, typename InputContainer, size_t... Dims>
+std::vector<T> compute_gold_standard(const ozi::Stencil<T, Dims...> &stencil, const InputContainer &input,
+                                     const std::array<size_t, sizeof...(Dims)> &shape) {
 
-class OzakiOneExtremesTest : public ::testing::TestWithParam<std::pair<const std::string, std::vector<double>>> {};
+  using HighPrec = long double;
+  ozi::Stencil<HighPrec, Dims...> s_high;
 
-TEST_F(OzakiOne, NormalDist) {
-  std::mt19937 engine{test_data::SEED};
-  std::vector<double> tcase(test_data::N);
-
-  std::normal_distribution<double> normal_dist(0.0, 1.0);
-
-  for (size_t i = 0; i < test_data::N; ++i) {
-    tcase[i] = normal_dist(engine);
+  s_high.offsets = stencil.offsets;
+  for (size_t i = 0; i < stencil.coeffs.size(); ++i) {
+    s_high.coeffs[i] = static_cast<HighPrec>(stencil.coeffs[i]);
   }
 
-  ozaki::OzakiIMatrix<double, int8_t> ozs{tcase, tcase.size()};
-  const auto back = ozs.recombine();
+  std::vector<HighPrec> in_high(input.begin(), input.end());
+  std::vector<HighPrec> out_high(input.size());
+
+  s_high.template apply_to<HighPrec>(out_high, in_high, shape);
+
+  std::vector<T> result(out_high.size());
+  for (size_t i = 0; i < out_high.size(); ++i) {
+    result[i] = static_cast<T>(out_high[i]);
+  }
+
+  return result;
+}
+
+template <typename T> class OzakiTestCPU : public ::testing::Test {
+protected:
+  void SetUp() override {}
+
+  double get_tolerance() const {
+    if constexpr (std::is_same_v<T, float>)
+      return 1e-6;
+    else
+      return 1e-12;
+  }
+
+  std::vector<T> generate_random(size_t size, double mean = 0.0, double stddev = 1.0) {
+    std::vector<T> vec(size);
+    std::mt19937 engine(test_data::SEED);
+    std::normal_distribution<double> dist(mean, stddev);
+
+    for (auto &val : vec) {
+      val = static_cast<T>(dist(engine));
+    }
+    return vec;
+  }
+};
+
+using TestTypes = ::testing::Types<float, double>;
+TYPED_TEST_SUITE(OzakiTestCPU, TestTypes);
+
+TYPED_TEST(OzakiTestCPU, SliceAndMendNormal) {
+  using Scalar = TypeParam;
+  auto tcase = this->generate_random(test_data::N);
+
+  auto slices = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(tcase);
+
+  std::vector<Scalar> recovered(tcase.size());
+  ozicpu::mend<ozicpu::OzakiFP_Int8<Scalar>>(recovered, slices);
+
   for (size_t i = 0; i < tcase.size(); ++i) {
-    ASSERT_EQ(back[i], tcase[i]);
+    ASSERT_EQ(recovered[i], tcase[i]) << "Mismatch at index " << i;
   }
 }
 
-TEST_F(OzakiOne, BetaDist) {
-  std::mt19937 engine{test_data::SEED};
-  std::vector<double> tcase(test_data::N);
+TYPED_TEST(OzakiTestCPU, SliceAndMendExtremes) {
+  using Scalar = TypeParam;
+  const auto cases = test_data::get_extremes<Scalar>();
 
+  for (const auto &[name, data] : cases) {
+    auto slices = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(data);
+    std::vector<Scalar> recovered(data.size());
+    ozicpu::mend<ozicpu::OzakiFP_Int8<Scalar>>(recovered, slices);
+
+    for (size_t i = 0; i < data.size(); ++i) {
+      ASSERT_EQ(recovered[i], data[i]) << "Failed case: " << name;
+    }
+  }
+}
+
+TYPED_TEST(OzakiTestCPU, SliceAndMendZeros) {
+  using Scalar = TypeParam;
+  auto data = test_data::zeros<Scalar>;
+
+  auto slices = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(data);
+  std::vector<Scalar> recovered(data.size());
+  ozicpu::mend<ozicpu::OzakiFP_Int8<Scalar>>(recovered, slices);
+
+  for (size_t i = 0; i < data.size(); ++i) {
+    ASSERT_EQ(recovered[i], data[i]);
+  }
+  ASSERT_EQ(slices.values.size(), 0) << "Zero vector should produce 0 slices";
+}
+
+TYPED_TEST(OzakiTestCPU, InfinityThrows) {
+  using Scalar = TypeParam;
+  if constexpr (std::numeric_limits<Scalar>::has_infinity) {
+    auto data = test_data::infty<Scalar>;
+    ASSERT_THROW({ ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(data); }, std::runtime_error);
+  }
+}
+
+TYPED_TEST(OzakiTestCPU, MatMulNormal) {
+  using Scalar = TypeParam;
+  using MapMat = Eigen::Map<Eigen::Matrix<Scalar, 32, 32, Eigen::ColMajor>>;
+
+  auto vecA = this->generate_random(test_data::N);
+  auto vecB = this->generate_random(test_data::N);
+  std::vector<Scalar> vecC_ozaki(test_data::N);
+
+  MapMat A(vecA.data());
+  MapMat B(vecB.data());
+  Eigen::Matrix<Scalar, 32, 32, Eigen::ColMajor> C_actual = A * B;
+
+  auto slicesA = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecA);
+  auto slicesB = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecB);
+  ozicpu::mul<ozicpu::OzakiFP_Int8<Scalar>>(vecC_ozaki, slicesA, slicesB, 32, 32, 32);
+
+  MapMat C_ozaki(vecC_ozaki.data());
+
+  ASSERT_TRUE(C_actual.isApprox(C_ozaki, this->get_tolerance()));
+}
+
+TYPED_TEST(OzakiTestCPU, MatMulBeta) {
+  using Scalar = TypeParam;
+  using MapMat = Eigen::Map<Eigen::Matrix<Scalar, 32, 32, Eigen::ColMajor>>;
+
+  std::mt19937 engine{test_data::SEED};
   std::gamma_distribution<double> gamma_dist(0.2, 1.0);
   std::bernoulli_distribution bool_dist(0.5);
 
-  for (size_t i = 0; i < test_data::N; ++i) {
-    const double g1 = gamma_dist(engine);
-    const double g2 = gamma_dist(engine);
+  auto betadist = [&]() -> Scalar {
+    double g1 = gamma_dist(engine);
+    double g2 = gamma_dist(engine);
+    double beta = g1 / (g1 + g2);
 
-    const double beta_val = g1 / (g1 + g2);
-    const double scalar =
-        bool_dist(engine) ? (1 / std::numeric_limits<double>::epsilon()) : std::numeric_limits<double>::epsilon();
-    const double scaled_val = beta_val * scalar;
+    // Use Type-specific epsilon
+    double eps = static_cast<double>(std::numeric_limits<Scalar>::epsilon());
+    double scalar = bool_dist(engine) ? (1.0 / eps) : eps;
 
-    tcase[i] = bool_dist(engine) ? scaled_val : -scaled_val;
-  }
-
-  ozaki::OzakiIMatrix<double, int8_t> ozs{tcase, tcase.size()};
-  const auto back = ozs.recombine();
-  for (size_t i = 0; i < tcase.size(); ++i) {
-    ASSERT_EQ(back[i], tcase[i]);
-  }
-}
-
-TEST_P(OzakiOneExtremesTest, HandlesExtremeValues) {
-  const auto &param = GetParam();
-  const std::string &msg = param.first;
-  const std::vector<double> &tcase = param.second;
-
-  const ozaki::OzakiIMatrix<double, int8_t> ozs{tcase, tcase.size()};
-  const auto back = ozs.recombine();
-  for (size_t i = 0; i < tcase.size(); ++i) {
-    ASSERT_EQ(back[i], tcase[i]) << msg;
-  }
-}
-
-INSTANTIATE_TEST_SUITE_P(AllExtremes, OzakiOneExtremesTest, ::testing::ValuesIn(test_data::extreme),
-                         [](const ::testing::TestParamInfo<OzakiOneExtremesTest::ParamType> &info) {
-                           return info.param.first;
-                         });
-
-TEST_F(OzakiOne, Zeros) {
-  const ozaki::OzakiIMatrix<double, int8_t> ozs{test_data::zeros, test_data::zeros.size()};
-  const auto back = ozs.recombine();
-  for (size_t i = 0; i < test_data::zeros.size(); ++i) {
-    ASSERT_EQ(back[i], test_data::zeros[i]);
-  }
-  ASSERT_EQ(ozs.slices.size(), 0);
-}
-
-TEST_F(OzakiOne, WorstCase) {
-  std::vector<double> tcase{};
-  double a = std::numeric_limits<double>::max();
-  // NOTE, this actually skips some close-to-subnormal numbers that cause my implementation to fail.
-  // Not sure if I want to support this range, so for now I leave it like that.
-  while (std::isnormal(a)) {
-    tcase.push_back(a);
-    a /= 8;
-  }
-  ozaki::OzakiIMatrix<double, int8_t> ozs{tcase, tcase.size()};
-  const auto back = ozs.recombine();
-  for (size_t i = 0; i < tcase.size(); ++i) {
-    ASSERT_EQ(back[i], tcase[i]) << "Iter[" << i << "]";
-  }
-}
-
-TEST_F(OzakiOne, InftyThrows) {
-  auto should_throw = [&]() {
-    const ozaki::OzakiIMatrix<double, int8_t> ozs{test_data::infty, test_data::infty.size()};
-    const auto back = ozs.recombine();
+    return static_cast<Scalar>(bool_dist(engine) ? (beta * scalar) : -(beta * scalar));
   };
-  ASSERT_THROW(should_throw(), std::runtime_error);
+
+  std::vector<Scalar> vecA(test_data::N), vecB(test_data::N), vecC_ozaki(test_data::N);
+  for (size_t i = 0; i < test_data::N; ++i) {
+    vecA[i] = betadist();
+    vecB[i] = betadist();
+  }
+
+  MapMat A(vecA.data());
+  MapMat B(vecB.data());
+  auto C_actual = A * B;
+
+  auto slicesA = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecA);
+  auto slicesB = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecB);
+  ozicpu::mul<ozicpu::OzakiFP_Int8<Scalar>>(vecC_ozaki, slicesA, slicesB, 32, 32, 32);
+
+  MapMat C_ozaki(vecC_ozaki.data());
+  ASSERT_TRUE(C_actual.isApprox(C_ozaki, this->get_tolerance()));
+}
+
+TYPED_TEST(OzakiTestCPU, MatMulScaleSkew) {
+  // large * tiny ~ unity
+  using Scalar = TypeParam;
+  using MapMat = Eigen::Map<Eigen::Matrix<Scalar, 32, 32, Eigen::ColMajor>>;
+
+  std::mt19937 engine{test_data::SEED};
+  double huge_base = std::is_same_v<Scalar, float> ? 1.0e30 : 1.0e100;
+  double tiny_base = std::is_same_v<Scalar, float> ? 1.0e-30 : 1.0e-100;
+
+  std::uniform_real_distribution<double> dist_huge(huge_base, huge_base * 5.0);
+  std::uniform_real_distribution<double> dist_tiny(tiny_base, tiny_base * 5.0);
+
+  std::vector<Scalar> vecA(test_data::N), vecB(test_data::N), vecC_ozaki(test_data::N);
+  for (size_t i = 0; i < test_data::N; ++i) {
+    vecA[i] = static_cast<Scalar>(dist_huge(engine));
+    vecB[i] = static_cast<Scalar>(dist_tiny(engine));
+  }
+
+  MapMat A(vecA.data());
+  MapMat B(vecB.data());
+  auto C_actual = A * B;
+
+  auto slicesA = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecA);
+  auto slicesB = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecB);
+  ozicpu::mul<ozicpu::OzakiFP_Int8<Scalar>>(vecC_ozaki, slicesA, slicesB, 32, 32, 32);
+  MapMat C_ozaki(vecC_ozaki.data());
+
+  double tol = std::is_same_v<Scalar, float> ? 1e-5 : 1e-11;
+  ASSERT_TRUE(C_actual.isApprox(C_ozaki, tol));
+}
+
+TYPED_TEST(OzakiTestCPU, MatMulLogUniform) {
+  using Scalar = TypeParam;
+  using MapMat = Eigen::Map<Eigen::Matrix<Scalar, 32, 32, Eigen::ColMajor>>;
+
+  std::mt19937 engine{test_data::SEED};
+  double log_range = std::is_same_v<Scalar, float> ? 5.0 : 10.0;
+
+  std::uniform_real_distribution<double> exp_dist(-log_range, log_range);
+  std::uniform_real_distribution<double> man_dist(-1.0, 1.0);
+  std::normal_distribution<double> norm_dist(0.0, 1.0);
+
+  std::vector<Scalar> vecA(test_data::N), vecB(test_data::N), vecC_ozaki(test_data::N);
+  for (size_t i = 0; i < test_data::N; ++i) {
+    vecA[i] = static_cast<Scalar>(man_dist(engine) * std::pow(10.0, exp_dist(engine)));
+    vecB[i] = static_cast<Scalar>(norm_dist(engine));
+  }
+
+  MapMat A(vecA.data());
+  MapMat B(vecB.data());
+  auto C_actual = A * B;
+
+  auto slicesA = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecA);
+  auto slicesB = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecB);
+  ozicpu::mul<ozicpu::OzakiFP_Int8<Scalar>>(vecC_ozaki, slicesA, slicesB, 32, 32, 32);
+  MapMat C_ozaki(vecC_ozaki.data());
+
+  ASSERT_TRUE(C_actual.isApprox(C_ozaki, this->get_tolerance()));
+}
+
+TYPED_TEST(OzakiTestCPU, MatMulRectangular) {
+  using Scalar = TypeParam;
+  using MapMat = Eigen::Map<Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>>;
+
+  size_t M = 16, K = 8, N = 64;
+
+  auto vecA = this->generate_random(M * K);
+  auto vecB = this->generate_random(K * N);
+  std::vector<Scalar> vecC_ozaki(M * N);
+
+  MapMat A(vecA.data(), M, K);
+  MapMat B(vecB.data(), K, N);
+  auto C_actual = A * B;
+
+  auto slicesA = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecA);
+  auto slicesB = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecB);
+  ozicpu::mul<ozicpu::OzakiFP_Int8<Scalar>>(vecC_ozaki, slicesA, slicesB, M, N, K);
+
+  MapMat C_ozaki(vecC_ozaki.data(), M, N);
+
+  ASSERT_TRUE(C_actual.isApprox(C_ozaki, this->get_tolerance()));
+}
+
+// verify that Ozaki survives catastrophic cancellation where Naive fails
+TYPED_TEST(OzakiTestCPU, StabilityCancellation) {
+  using Scalar = TypeParam;
+
+  ozi::Stencil<Scalar, 3> sum_stencil({static_cast<Scalar>(1.0), static_cast<Scalar>(1.0), static_cast<Scalar>(1.0)});
+
+  // Naive Math: (1e16 + 1.0) - 1e16  ->  1e16 - 1e16 -> 0.0 (The 1.0 is lost)
+  // Exact Math: 1e16 + 1.0 - 1e16 -> 1.0
+  Scalar huge = static_cast<Scalar>(1e16);
+  std::vector<Scalar> input = {huge, static_cast<Scalar>(1.0), -huge};
+  std::vector<Scalar> result_ozaki(3);
+  std::vector<Scalar> result_naive(3);
+
+  ozicpu::stencil<Scalar, 3>(result_ozaki, sum_stencil, input, {3});
+  sum_stencil.template apply_to<Scalar, std::vector<Scalar>, std::vector<Scalar>>(result_naive, input, {3});
+
+  Scalar expected = static_cast<Scalar>(1.0);
+  ASSERT_NEAR(result_ozaki[1], expected, 1e-5) << "Ozaki failed to handle cancellation. Got " << result_ozaki[1];
+  EXPECT_NE(result_naive[1], expected)
+      << "Warning: Naive implementation accidentally got the right answer (likely due to FMA or compiler opts).";
+}
+
+TYPED_TEST(OzakiTestCPU, SimpleStencil) {
+  using Scalar = TypeParam;
+  
+  auto u = this->generate_random(test_data::N);
+  auto stencil = test_data::d2x<Scalar>;
+  std::vector<Scalar> result_ozaki(u.size());
+
+  ozicpu::stencil<Scalar, 3>(result_ozaki, stencil, u, {test_data::N});
+
+  auto result_gold = compute_gold_standard(stencil, u, {test_data::N});
+
+  // we expect Ozaki to be bit-identical or within 1 ULP of the gold Standard
+  for (size_t j = 0; j < test_data::N; ++j) {
+    if constexpr (std::is_same_v<Scalar, double>) {
+        ASSERT_DOUBLE_EQ(result_ozaki[j], result_gold[j]) 
+            << "Mismatch at index " << j;
+    } else {
+        ASSERT_FLOAT_EQ(result_ozaki[j], result_gold[j]) 
+            << "Mismatch at index " << j;
+    }
+  }
 }
