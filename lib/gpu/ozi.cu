@@ -6,7 +6,7 @@
 #include <cuda/pipeline>
 #include <cuda_runtime.h>
 #include <mma.h>
-#include <ozaki/gpu/kernels.cuh>
+#include <ozaki/gpu/ozi.cuh>
 #include <vector_types.h>
 
 using namespace nvcuda;

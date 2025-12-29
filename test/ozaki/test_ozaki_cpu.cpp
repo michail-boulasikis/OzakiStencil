@@ -305,7 +305,7 @@ TYPED_TEST(OzakiTestCPU, StabilityCancellation) {
 
 TYPED_TEST(OzakiTestCPU, SimpleStencil) {
   using Scalar = TypeParam;
-  
+
   auto u = this->generate_random(test_data::N);
   auto stencil = test_data::d2x<Scalar>;
   std::vector<Scalar> result_ozaki(u.size());
@@ -317,11 +317,9 @@ TYPED_TEST(OzakiTestCPU, SimpleStencil) {
   // we expect Ozaki to be bit-identical or within 1 ULP of the gold Standard
   for (size_t j = 0; j < test_data::N; ++j) {
     if constexpr (std::is_same_v<Scalar, double>) {
-        ASSERT_DOUBLE_EQ(result_ozaki[j], result_gold[j]) 
-            << "Mismatch at index " << j;
+      ASSERT_DOUBLE_EQ(result_ozaki[j], result_gold[j]) << "Mismatch at index " << j;
     } else {
-        ASSERT_FLOAT_EQ(result_ozaki[j], result_gold[j]) 
-            << "Mismatch at index " << j;
+      ASSERT_FLOAT_EQ(result_ozaki[j], result_gold[j]) << "Mismatch at index " << j;
     }
   }
 }

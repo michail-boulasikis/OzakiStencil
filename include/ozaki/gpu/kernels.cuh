@@ -4,22 +4,23 @@
 #include "../core/ozconcepts.hpp"
 #include "gpu_checks.cuh"
 
-#include <limits>
+#include <concepts>
 
 #ifndef RDC_THREADS_PER_BLOCK
 #define RDC_THREADS_PER_BLOCK 512
 #endif
 
 namespace ozigpu {
+
 using namespace ozi;
+
 #ifdef __CUDACC__
+// for vectorized load store ops
 template <typename T> struct FourValues {
   T a[4];
 };
 
-template <typename T>
-  requires std::is_integral_v<T>
-__host__ __device__ __forceinline__ int32_t ozaki_scaling_factor(int32_t *v) {
+template <std::integral T> __host__ __device__ __forceinline__ int32_t ozaki_scaling_factor(int32_t *v) {
   int32_t factor = (CHAR_BIT * sizeof(T) - 1) - *v;
   *v -= CHAR_BIT * sizeof(T) - 1;
   return factor;
@@ -46,9 +47,7 @@ __device__ __forceinline__ int8_t down_cast(float a, int32_t scale) {
   return static_cast<int8_t>(max(-127, temp));
 }
 
-template <OzakiData T, OzakiTarget U>
-  requires std::is_floating_point_v<T> && std::is_integral_v<U>
-__device__ __forceinline__ T up_cast(U a, int32_t scale) {
+template <std::floating_point T, std::integral U> __device__ __forceinline__ T up_cast(U a, int32_t scale) {
   return scalbn(static_cast<T>(a), -scale);
 }
 
@@ -130,6 +129,35 @@ __global__ void slice(typename O::target_type *__restrict__ out, const typename 
     }
     reinterpret_cast<FourValues<Target> *>(out)[flat_offset] = outs;
   }
+}
+
+template <OzakiPair O>
+__global__ void mend(typename O::data_type *__restrict__ out, const typename O::target_type *__restrict__ in,
+                     const int32_t *__restrict__ power, const int32_t num_slices, const size_t n) {
+  using Data = typename O::data_type;
+  using Target = typename O::target_type;
+
+  const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tid >= n / 4)
+    return;
+
+  int32_t local_power = *power;
+
+  FourValues<Data> outs{};
+  FourValues<Target> ins{};
+
+#pragma unroll 4
+  for (int32_t s = 0; s < num_slices; ++s) {
+    int32_t shift_amount = ozaki_scaling_factor<Target>(&local_power);
+    const size_t flat_offset = static_cast<size_t>(s) * (n / 4) + static_cast<size_t>(tid);
+    ins = reinterpret_cast<const FourValues<Target> *>(in)[flat_offset];
+#pragma unroll
+    for (int32_t v = 0; v < 4; ++v) {
+      outs.a[v] += up_cast<Data, Target>(ins.a[v], shift_amount);
+    }
+  }
+
+  reinterpret_cast<FourValues<Data> *>(out)[tid] = outs;
 }
 
 CUDA_GLOBAL void ozi_mul_stencil(int8_t *__restrict__ out, const int8_t *__restrict__ stencil,
