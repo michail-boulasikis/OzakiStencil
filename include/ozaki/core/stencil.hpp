@@ -6,12 +6,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
-#include <vector>
 
 #ifdef __CUDACC__
 #define HD __host__ __device__
+#define OZI_ALWAYS_INLINE __forceinline__
 #else
 #define HD
+#if defined(_MSC_VER)
+#define OZI_ALWAYS_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define OZI_ALWAYS_INLINE inline __attribute__((always_inline))
+#else
+#define OZI_ALWAYS_INLINE inline
+#endif
 #endif
 
 namespace ozi {
@@ -44,7 +51,7 @@ HD constexpr std::array<size_t, D> multi_from_linear(size_t linear, const std::a
   return idx;
 }
 
-template <typename T, size_t... Dims> struct Stencil {
+template <typename T, size_t... Dims> HD struct Stencil {
   static_assert(sizeof...(Dims) >= 1, "Stencil must have at least one dimension");
   static_assert(((Dims > 0) && ...), "All stencil dimensions must be > 0");
 
@@ -57,14 +64,14 @@ public:
   using offset_type = std::array<size_t, dims>;
 
   inline static constexpr shape_type shape = {Dims...};
-  HD static constexpr shape_type get_shape() { return shape; }
+  HD static constexpr shape_type get_shape() { return {Dims...}; }
   inline static constexpr size_t size = (Dims * ...);
-  HD static constexpr size_t get_size() { return size; }
+  HD static constexpr size_t get_size() { return (Dims * ...); }
 
   using coeffs_type = std::array<T, size>;
 
   inline static constexpr shape_type strides = make_strides_from_shape(shape);
-  HD static constexpr shape_type get_strides() { return strides; }
+  HD static constexpr shape_type get_strides() { return make_strides_from_shape(shape_type{Dims...}); }
 
   coeffs_type coeffs{};
   offset_type offsets{};
@@ -133,6 +140,47 @@ public:
 
   HD constexpr T &operator[](size_t linear) noexcept { return coeffs[linear]; }
   HD constexpr const T &operator[](size_t linear) const noexcept { return coeffs[linear]; }
+
+  template <size_t Is> HD constexpr int64_t compute_neighbor_offset(const std::array<size_t, dims> &in_strides) const {
+    constexpr auto s_idx = linear_to_multi(Is);
+    int64_t offset = 0;
+
+    for (size_t d = 0; d < dims; ++d) {
+      int64_t diff = static_cast<int64_t>(s_idx[d]) - static_cast<int64_t>(offsets[d]);
+      offset += diff * static_cast<int64_t>(in_strides[d]);
+    }
+    return offset;
+  }
+  template <typename AccType, typename InputT, typename... Idx, size_t... Is>
+  HD OZI_ALWAYS_INLINE AccType apply_unrolled_impl(const InputT *__restrict__ src,
+                                                   const std::array<size_t, dims> &in_strides,
+                                                   std::index_sequence<Is...>, Idx... center_indices) const {
+
+    const std::array<size_t, dims> c_idx = {static_cast<size_t>(center_indices)...};
+    int64_t center_base = 0;
+    for (size_t d = 0; d < dims; ++d) {
+      center_base += static_cast<int64_t>(c_idx[d]) * static_cast<int64_t>(in_strides[d]);
+    }
+
+    // fold expression with casting to AccType
+    return ((static_cast<AccType>(coeffs[Is]) *
+             static_cast<AccType>(src[center_base + compute_neighbor_offset<Is>(in_strides)])) +
+            ...);
+  }
+  template <typename InputT, typename... Idx>
+    requires(sizeof...(Idx) == dims)
+  HD OZI_ALWAYS_INLINE auto apply_at(const InputT *__restrict__ src, const std::array<size_t, dims> &in_strides,
+                                     Idx... idx) const {
+    using CommonType = std::common_type_t<T, InputT>;
+    return apply_unrolled_impl<CommonType>(src, in_strides, std::make_index_sequence<size>{}, idx...);
+  }
+
+  template <typename AccType, typename InputT, typename... Idx>
+    requires(sizeof...(Idx) == dims)
+  HD OZI_ALWAYS_INLINE AccType apply_at_as(const InputT *__restrict__ src, const std::array<size_t, dims> &in_strides,
+                                           Idx... idx) const {
+    return apply_unrolled_impl<AccType>(src, in_strides, std::make_index_sequence<size>{}, idx...);
+  }
 
   template <typename AccType, typename OutContainer, typename InContainer>
   void apply_to(OutContainer &output, const InContainer &input, const shape_type &in_shape) const {

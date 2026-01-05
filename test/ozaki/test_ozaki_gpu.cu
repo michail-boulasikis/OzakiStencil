@@ -1,20 +1,64 @@
 #include "gtest/gtest.h"
+#include <concepts>
 #include <cuda_runtime_api.h>
 #include <driver_types.h>
-#include <functional>
 #include <gtest/gtest.h>
 
-#include <limits>
 #include <ozaki/core/stencil.hpp>
 #include <ozaki/gpu/gpu_checks.cuh>
 #include <ozaki/gpu/ozi.cuh>
 
+#include <bit>
 #include <cstdint>
+#include <format>
+#include <functional>
+#include <limits>
 #include <random>
 #include <type_traits>
+#include <vector>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+
+template <typename T> struct get_uint_same_size {
+  // Ensure we only pass floating point types
+  static_assert(std::is_floating_point_v<T>, "Type must be floating point");
+
+  using type =
+      typename std::conditional<sizeof(T) == sizeof(std::uint32_t), std::uint32_t,
+                                typename std::conditional<sizeof(T) == sizeof(std::uint64_t), std::uint64_t,
+                                                          typename std::conditional<sizeof(T) == sizeof(std::uint16_t),
+                                                                                    std::uint16_t, // For half-floats
+                                                                                    void>::type>::type>::type;
+
+  // Ensure we actually found a match
+  static_assert(!std::is_void_v<type>, "No uint type of same size found for this float");
+};
+template <typename T> using get_uint_same_size_t = typename get_uint_same_size<T>::type;
+template <typename T, typename InputContainer, size_t... Dims>
+std::vector<T> compute_gold_standard(const ozi::Stencil<T, Dims...> &stencil, const InputContainer &input,
+                                     const std::array<size_t, sizeof...(Dims)> &shape) {
+
+  using HighPrec = long double;
+  ozi::Stencil<HighPrec, Dims...> s_high;
+
+  s_high.offsets = stencil.offsets;
+  for (size_t i = 0; i < stencil.coeffs.size(); ++i) {
+    s_high.coeffs[i] = static_cast<HighPrec>(stencil.coeffs[i]);
+  }
+
+  std::vector<HighPrec> in_high(input.begin(), input.end());
+  std::vector<HighPrec> out_high(input.size());
+
+  s_high.template apply_to<HighPrec>(out_high, in_high, shape);
+
+  std::vector<T> result(out_high.size());
+  for (size_t i = 0; i < out_high.size(); ++i) {
+    result[i] = static_cast<T>(out_high[i]);
+  }
+
+  return result;
+}
 
 template <typename T> class OzakiTestGPU : public ::testing::Test {
 public:
@@ -158,4 +202,53 @@ TYPED_TEST(OzakiTestGPU, SliceAndMendNormal) {
 
 TYPED_TEST(OzakiTestGPU, SliceAndMendBeta) {
   this->verify_slice_and_mend(36, [this]() { this->generate_beta(this->h_data, this->N); });
+}
+
+TYPED_TEST(OzakiTestGPU, OzakiStencil) {
+  using Scalar = TypeParam;
+  std::vector<Scalar> h_data(this->N);
+  this->generate_normal(h_data.data(), this->N);
+  std::vector<Scalar> h_ozaki(this->N);
+
+  ozi::Stencil<int8_t, 3> s{{16, 32, 16}, {1}};
+  ozi::Stencil<Scalar, 3> s_real{{0.125, 0.25, 0.125}, {1}};
+
+  const int32_t num_slices = 12;
+  ASSERT_EQ(CUDA_SUCCESS, cudaMemcpy(this->d_data, h_data.data(), this->N * sizeof(Scalar), cudaMemcpyHostToDevice));
+
+  int8_t *d_slices_in, *d_slices_out;
+  ASSERT_EQ(CUDA_SUCCESS, cudaMalloc(&d_slices_in, num_slices * this->N * sizeof(int8_t)));
+  ASSERT_EQ(CUDA_SUCCESS, cudaMalloc(&d_slices_out, num_slices * this->N * sizeof(int8_t)));
+
+  int32_t *d_ptr = reinterpret_cast<int32_t *>(this->d_data_s);
+  ozigpu::fill<int32_t><<<1, 1>>>(d_ptr, std::numeric_limits<int32_t>::min(), 1ull);
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, 0);
+  uint32_t nBlocksReduce = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / RDC_THREADS_PER_BLOCK;
+
+  uint64_t nThreadsMap = std::min(static_cast<uint64_t>(RDC_THREADS_PER_BLOCK), this->N / 4);
+  uint32_t nBlocksMap = ((this->N / 4) + nThreadsMap - 1) / nThreadsMap;
+  uint64_t nThreadsStencil = 512;
+  uint64_t nBlocksStencil = (this->N + nThreadsStencil - 1) / nThreadsStencil;
+
+  ozigpu::abs_max_nextpow2_reduce<Scalar><<<nBlocksReduce, RDC_THREADS_PER_BLOCK>>>(d_ptr, this->d_data, this->N);
+  ozigpu::slice<ozigpu::OzakiFP_Int8<Scalar>>
+      <<<nBlocksMap, nThreadsMap>>>(d_slices_in, this->d_data, d_ptr, num_slices, this->N);
+
+  ozigpu::stencil_v1<ozigpu::OzakiFP_Int8<Scalar>, 3>
+      <<<nBlocksStencil, nThreadsStencil>>>(d_slices_out, d_slices_in, s, {this->N}, num_slices);
+  ASSERT_EQ(CUDA_SUCCESS, cudaDeviceSynchronize());
+
+  ozigpu::mend<ozigpu::OzakiFP_Int8<Scalar>>
+      <<<nBlocksMap, nThreadsMap>>>(this->d_data, d_slices_out, d_ptr, num_slices, this->N);
+
+  auto h_ref = compute_gold_standard(s_real, h_data, {this->N});
+
+  ASSERT_EQ(CUDA_SUCCESS, cudaMemcpy(h_ozaki.data(), this->d_data, this->N * sizeof(Scalar), cudaMemcpyDeviceToHost));
+
+  for (size_t i = 1; i < this->N - 1; ++i) {
+    EXPECT_NEAR(h_ozaki[i], h_ref[i], this->get_tolerance()) << "Ozaki deviated from the gold standard.";
+  }
+  cudaFree(d_slices_in);
+  cudaFree(d_slices_out);
 }

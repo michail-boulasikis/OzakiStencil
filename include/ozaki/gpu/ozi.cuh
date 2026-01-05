@@ -2,10 +2,11 @@
 #define HEADER_OZI_CUH
 
 #include "../core/ozconcepts.hpp"
+#include "../core/stencil.hpp"
 #include "gpu_checks.cuh"
 
 #include <concepts>
-#include <limits>
+#include <type_traits>
 
 #ifndef RDC_THREADS_PER_BLOCK
 #define RDC_THREADS_PER_BLOCK 512
@@ -161,13 +162,100 @@ __global__ void mend(typename O::data_type *__restrict__ out, const typename O::
   reinterpret_cast<FourValues<Data> *>(out)[tid] = outs;
 }
 
-CUDA_GLOBAL void ozi_mul_stencil(int8_t *__restrict__ out, const int8_t *__restrict__ stencil,
-                                 const int8_t *__restrict__ data, const int32_t num_slices, const size_t m,
-                                 const size_t n, const size_t halo_size);
+template <OzakiPair O, size_t... Dims>
+  requires(sizeof...(Dims) <= 3) && std::is_integral_v<typename O::target_type>
+__global__ void stencil_v1(typename O::target_type *__restrict__ out, const typename O::target_type *__restrict__ in,
+                           const Stencil<typename O::target_type, Dims...> s,
+                           const typename Stencil<typename O::target_type, Dims...>::shape_type input_shape,
+                           int32_t num_slices_in) {
+  using Data = typename O::data_type;
+  using Target = typename O::target_type;
+  using UTarget = std::make_unsigned_t<Target>;
+  using Acc = typename O::acc_type;
+
+  constexpr UTarget mask = std::numeric_limits<UTarget>::max() >> 1;
+
+  int32_t i, j, k;
+  i = threadIdx.x + blockDim.x * blockIdx.x;
+  if constexpr (sizeof...(Dims) > 1)
+    j = threadIdx.y + blockDim.y * blockIdx.y;
+  if constexpr (sizeof...(Dims) > 2)
+    k = threadIdx.z + blockDim.z * blockIdx.z;
+
+  bool in_bounds = true;
+  const auto &s_shape = s.get_shape();
+
+  auto check_dim = [&] __device__(int32_t idx, size_t dim_idx) {
+    return (idx >= s.offsets[dim_idx] && idx <= input_shape[dim_idx] - (s_shape[dim_idx] - s.offsets[dim_idx]));
+  };
+  if constexpr (sizeof...(Dims) == 1) {
+    in_bounds = in_bounds && check_dim(i, 0);
+  } else if constexpr (sizeof...(Dims) == 2) {
+    in_bounds = in_bounds && check_dim(j, 0);
+    in_bounds = in_bounds && check_dim(i, 1);
+  } else if constexpr (sizeof...(Dims) == 3) {
+    in_bounds = in_bounds && check_dim(k, 0);
+    in_bounds = in_bounds && check_dim(j, 1);
+    in_bounds = in_bounds && check_dim(i, 2);
+  }
+  if (!in_bounds)
+    return;
+
+  size_t slice_stride = 1;
+  for (auto d : input_shape) {
+    slice_stride *= d;
+  }
+  const auto input_strides = ozi::make_strides_from_shape(input_shape);
+
+  Acc partial_result = static_cast<Acc>(0);
+  Acc local_val = static_cast<Acc>(0);
+  Target r;
+
+#pragma unroll 4
+  for (int32_t current_slice = num_slices_in - 1; current_slice >= 0; --current_slice) {
+    const Target *current_slice_ptr = in + slice_stride * current_slice;
+
+    /*if (current_slice > 0) {
+      const UTarget *u_current_slice_ptr = reinterpret_cast<const UTarget *>(current_slice_ptr);
+      if constexpr (sizeof...(Dims) == 1)
+        partial_result = s.template apply_at_as<Acc>(u_current_slice_ptr, input_strides, i);
+      else if constexpr (sizeof...(Dims) == 2)
+        partial_result = s.template apply_at_as<Acc>(u_current_slice_ptr, input_strides, j, i);
+      else if constexpr (sizeof...(Dims) == 3)
+        partial_result = s.template apply_at_as<Acc>(u_current_slice_ptr, input_strides, k, j, i);
+    } else {*/
+    if constexpr (sizeof...(Dims) == 1)
+      partial_result = s.template apply_at_as<Acc>(current_slice_ptr, input_strides, i);
+    else if constexpr (sizeof...(Dims) == 2)
+      partial_result = s.template apply_at_as<Acc>(current_slice_ptr, input_strides, j, i);
+    else if constexpr (sizeof...(Dims) == 3)
+      partial_result = s.template apply_at_as<Acc>(current_slice_ptr, input_strides, k, j, i);
+    /*}*/
+
+    local_val += partial_result;
+
+    if (current_slice != num_slices_in - 1) {
+      r = static_cast<Target>(local_val & mask);
+      Target *output_slice_ptr = out + slice_stride * (current_slice + 1);
+      if constexpr (sizeof...(Dims) == 1)
+        output_slice_ptr[i] = r;
+      else if constexpr (sizeof...(Dims) == 2)
+        output_slice_ptr[i + j * input_shape[0]] = r;
+      else if constexpr (sizeof...(Dims) == 3)
+        output_slice_ptr[i + j * input_shape[1] + k * input_shape[0] * input_shape[1]] = r;
+    }
+    local_val >>= CHAR_BIT * sizeof(Target) - 1;
+  }
+  r = static_cast<Target>(local_val);
+  if constexpr (sizeof...(Dims) == 1)
+    out[i] = r;
+  else if constexpr (sizeof...(Dims) == 2)
+    out[i + j * input_shape[0]] = r;
+  else if constexpr (sizeof...(Dims) == 3)
+    out[i + j * input_shape[1] + k * input_shape[0] * input_shape[1]] = r;
+}
 
 #endif
 } // namespace ozigpu
-
-void gpu_ozaki_decomposition(int8_t *slices, int32_t *exp, const double *input, const int num_slices, size_t size_flat);
 
 #endif // HEADER_OZI_CUH

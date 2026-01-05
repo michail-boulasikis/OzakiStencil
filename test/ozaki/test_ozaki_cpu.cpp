@@ -173,7 +173,6 @@ TYPED_TEST(OzakiTestCPU, MatMulBeta) {
     double g2 = gamma_dist(engine);
     double beta = g1 / (g1 + g2);
 
-    // Use Type-specific epsilon
     double eps = static_cast<double>(std::numeric_limits<Scalar>::epsilon());
     double scalar = bool_dist(engine) ? (1.0 / eps) : eps;
 
