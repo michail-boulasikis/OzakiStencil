@@ -19,3 +19,4 @@ for file in data/reports/H100/*.sqlite; do
   row=$(sqlite3 --csv --noheader ${file} "${QUERY}")
   echo "${instance},${row}"
 done
+

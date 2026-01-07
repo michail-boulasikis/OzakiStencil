@@ -9,6 +9,8 @@ data/
 
 .cache/
 
+presentation/node_modules/
+
 *.csv
 *.dat
 
