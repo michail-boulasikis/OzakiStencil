@@ -85,14 +85,14 @@ protected:
     }
   }
 
-  void verify_slice_and_mend(int32_t num_slices, const std::function<void()> &datagen) {
+  void verify_slice_and_mend(int32_t num_slices_max, bool dynamic_slicing, const std::function<void()> &datagen) {
     using Scalar = T;
 
     datagen();
     ASSERT_EQ(CUDA_SUCCESS, cudaMemcpy(this->d_data, this->h_data, this->N * sizeof(Scalar), cudaMemcpyHostToDevice));
 
     int8_t *d_slices;
-    ASSERT_EQ(CUDA_SUCCESS, cudaMalloc(&d_slices, num_slices * this->N * sizeof(int8_t)));
+    ASSERT_EQ(CUDA_SUCCESS, cudaMalloc(&d_slices, num_slices_max * this->N * sizeof(int8_t)));
 
     int32_t *d_ptr = reinterpret_cast<int32_t *>(this->d_data_s);
     ozigpu::fill<int32_t><<<1, 1>>>(d_ptr, std::numeric_limits<int32_t>::min(), 1ull);
@@ -105,10 +105,10 @@ protected:
 
     ozigpu::abs_max_nextpow2_reduce<Scalar><<<nBlocksReduce, RDC_THREADS_PER_BLOCK>>>(d_ptr, this->d_data, this->N);
     ozigpu::slice<ozigpu::OzakiFP_Int8<Scalar>>
-        <<<nBlocksMap, nThreadsMap>>>(d_slices, this->d_data, d_ptr, num_slices, this->N);
+        <<<nBlocksMap, nThreadsMap>>>(d_slices, this->d_data, d_ptr, dynamic_slicing ? 0 : num_slices_max, this->N);
     ASSERT_EQ(CUDA_SUCCESS, cudaDeviceSynchronize());
     ozigpu::mend<ozigpu::OzakiFP_Int8<Scalar>>
-        <<<nBlocksMap, nThreadsMap>>>(this->d_data, d_slices, d_ptr, num_slices, this->N);
+        <<<nBlocksMap, nThreadsMap>>>(this->d_data, d_slices, d_ptr, dynamic_slicing ? 0 : num_slices_max, this->N);
     ASSERT_EQ(CUDA_SUCCESS, cudaDeviceSynchronize());
 
     Scalar *h_op_result = new Scalar[this->N];
@@ -197,11 +197,19 @@ TYPED_TEST(OzakiTestGPU, ScaleExtraction) {
 }
 
 TYPED_TEST(OzakiTestGPU, SliceAndMendNormal) {
-  this->verify_slice_and_mend(12, [this]() { this->generate_normal(this->h_data, this->N); });
+  this->verify_slice_and_mend(12, false, [this]() { this->generate_normal(this->h_data, this->N); });
 }
 
 TYPED_TEST(OzakiTestGPU, SliceAndMendBeta) {
-  this->verify_slice_and_mend(36, [this]() { this->generate_beta(this->h_data, this->N); });
+  this->verify_slice_and_mend(36, false, [this]() { this->generate_beta(this->h_data, this->N); });
+}
+
+TYPED_TEST(OzakiTestGPU, SliceAndMendNormalDyn) {
+  this->verify_slice_and_mend(12, true, [this]() { this->generate_normal(this->h_data, this->N); });
+}
+
+TYPED_TEST(OzakiTestGPU, SliceAndMendBetaDyn) {
+  this->verify_slice_and_mend(36, true, [this]() { this->generate_beta(this->h_data, this->N); });
 }
 
 TYPED_TEST(OzakiTestGPU, OzakiStencil) {
