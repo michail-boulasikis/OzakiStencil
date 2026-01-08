@@ -6,6 +6,7 @@
 #include "gpu_checks.cuh"
 
 #include <concepts>
+#include <limits>
 #include <type_traits>
 
 #ifndef RDC_THREADS_PER_BLOCK
@@ -21,6 +22,84 @@ using namespace ozi;
 template <typename T> struct FourValues {
   T a[4];
 };
+
+template <typename To, typename From> __device__ __forceinline__ To bit_cast(const From &src) {
+  static_assert(sizeof(To) == sizeof(From), "Size mismatch in bit_cast");
+  To dst;
+  memcpy(&dst, &src, sizeof(To));
+  return dst;
+}
+
+template <size_t Bytes> struct UintByType;
+template <> struct UintByType<2> {
+  using type = uint16_t;
+};
+template <> struct UintByType<4> {
+  using type = uint32_t;
+};
+template <> struct UintByType<8> {
+  using type = uint64_t;
+};
+
+template <typename T> using RawInt = typename UintByType<sizeof(T)>::type;
+
+template <typename T> struct FloatTraits;
+template <> struct FloatTraits<__half> {
+  static constexpr int32_t MantissaBits = 10;
+  static constexpr int32_t ExponentBias = 15;
+};
+template <> struct FloatTraits<float> {
+  static constexpr int32_t MantissaBits = 23;
+  static constexpr int32_t ExponentBias = 127;
+};
+template <> struct FloatTraits<double> {
+  static constexpr int32_t MantissaBits = 52;
+  static constexpr int32_t ExponentBias = 1023;
+};
+template <> struct FloatTraits<__float128> {
+  static constexpr int32_t MantissaBits = 112;
+  static constexpr int32_t ExponentBias = 16383;
+};
+
+template <typename T> __device__ __forceinline__ int32_t ffs(T val) {
+  if constexpr (sizeof(T) <= 4) {
+    return __ffs(static_cast<int32_t>(val));
+  } else if constexpr (sizeof(T) <= 8) {
+    return __ffsll(static_cast<int64_t>(val));
+  } else {
+    auto lo = static_cast<uint64_t>(val);
+    if (lo != 0)
+      return __ffsll(lo);
+    auto hi = static_cast<uint64_t>(val >> 64);
+    int hi_bit = __ffsll(hi);
+    return hi_bit ? hi_bit + 64 : 0;
+  }
+}
+
+template <typename T> __device__ __forceinline__ int32_t dyn_min_lsb(T a, int32_t current_lsb) {
+  using IntType = RawInt<T>;
+  using Traits = FloatTraits<T>;
+
+  if (a == static_cast<T>(0))
+    return current_lsb;
+
+  IntType raw = bit_cast<IntType>(a);
+
+  constexpr IntType One = 1;
+  constexpr int32_t M_Bits = Traits::MantissaBits;
+  constexpr IntType M_Mask = (One << M_Bits) - 1;
+  constexpr int32_t TotalBits = sizeof(T) * CHAR_BIT;
+  IntType exponent_bits = (raw >> M_Bits) & ((One << (TotalBits - 1 - M_Bits)) - 1);
+  IntType mantissa = raw & M_Mask;
+  if (exponent_bits != 0) {
+    mantissa |= (One << M_Bits);
+  } else {
+    exponent_bits = 1;
+  }
+  int32_t ffs_index = ffs(mantissa);
+  int32_t bit_exponent = (static_cast<int32_t>(exponent_bits) - Traits::ExponentBias) - (M_Bits - (ffs_index - 1));
+  return min(current_lsb, bit_exponent);
+}
 
 template <std::integral T> __host__ __device__ __forceinline__ int32_t ozaki_scaling_factor(int32_t *v) {
   int32_t factor = (CHAR_BIT * sizeof(T) - 1) - *v;
@@ -63,65 +142,76 @@ template <OzakiData T>
 __global__ void abs_max_nextpow2_reduce(int32_t *__restrict__ out, const T *__restrict__ in, size_t n) {
   constexpr uint32_t WARPS_PER_BLOCK = RDC_THREADS_PER_BLOCK / WARP_SIZE;
   constexpr uint32_t BLOCK_STRIDE = RDC_THREADS_PER_BLOCK;
-  __shared__ T smem[WARPS_PER_BLOCK];
+  __shared__ T smem_max[WARPS_PER_BLOCK];
+  __shared__ int32_t smem_min[WARPS_PER_BLOCK];
 
   const uint32_t GRID_SIZE = BLOCK_STRIDE * gridDim.x;
   uint32_t i = threadIdx.x + blockIdx.x * BLOCK_STRIDE;
 
-  T local_val = static_cast<T>(0);
-#pragma unroll 4
+  T local_max_val = static_cast<T>(0);
+  int32_t local_min_val = std::numeric_limits<int32_t>::max();
+#pragma unroll 2
   while (4 * i < n) { // I assume that n is a multiple of four.
     const T *src = in + 4 * i;
     FourValues<T> vals = *reinterpret_cast<const FourValues<T> *>(src);
-    local_val = max(max(max(abs(vals.a[0]), abs(vals.a[1])), abs(vals.a[2])), abs(vals.a[3]));
+    local_max_val = max(max(max(abs(vals.a[0]), abs(vals.a[1])), abs(vals.a[2])), abs(vals.a[3]));
+    local_min_val =
+        dyn_min_lsb(vals.a[0], dyn_min_lsb(vals.a[1], dyn_min_lsb(vals.a[2], dyn_min_lsb(vals.a[3], local_min_val))));
     i += GRID_SIZE;
   }
 
   constexpr uint32_t FULL_MASK = 0xFFFF'FFFF;
-  local_val = max(local_val, __shfl_down_sync(FULL_MASK, local_val, 16));
-  local_val = max(local_val, __shfl_down_sync(FULL_MASK, local_val, 8));
-  local_val = max(local_val, __shfl_down_sync(FULL_MASK, local_val, 4));
-  local_val = max(local_val, __shfl_down_sync(FULL_MASK, local_val, 2));
-  local_val = max(local_val, __shfl_down_sync(FULL_MASK, local_val, 1));
+#pragma unroll
+  for (int32_t offset = 16; offset > 0; offset /= 2) {
+    local_max_val = max(local_max_val, __shfl_down_sync(FULL_MASK, local_max_val, offset));
+    local_min_val = min(local_min_val, __shfl_down_sync(FULL_MASK, local_min_val, offset));
+  }
 
   const uint32_t WARP_ID = threadIdx.x / WARP_SIZE;
   const uint32_t LANE_ID = threadIdx.x % WARP_SIZE;
 
   if (LANE_ID == 0) {
-    smem[WARP_ID] = local_val;
+    smem_max[WARP_ID] = local_max_val;
+    smem_min[WARP_ID] = local_min_val;
   }
   __syncthreads();
 
   if ((WARP_ID == 0) && (LANE_ID < WARPS_PER_BLOCK)) {
     uint32_t mask = __activemask();
-    local_val = smem[LANE_ID];
+    local_max_val = smem_max[LANE_ID];
+    local_min_val = smem_min[LANE_ID];
 #pragma unroll
-    for (uint32_t offset = WARPS_PER_BLOCK / 2; offset > 0; offset /= 2)
-      local_val = max(local_val, __shfl_down_sync(mask, local_val, offset));
+    for (uint32_t offset = WARPS_PER_BLOCK / 2; offset > 0; offset /= 2) {
+      local_max_val = max(local_max_val, __shfl_down_sync(mask, local_max_val, offset));
+      local_min_val = min(local_min_val, __shfl_down_sync(mask, local_min_val, offset));
+    }
     if (LANE_ID == 0) {
-      int32_t block_partial_result = static_cast<int32_t>(ceil(log2(local_val)));
+      int32_t block_partial_result = static_cast<int32_t>(ceil(log2(local_max_val)));
       atomicMax(out, block_partial_result);
+      atomicMin(out + 1, local_min_val);
     }
   }
 }
 
 template <OzakiPair O>
 __global__ void slice(typename O::target_type *__restrict__ out, const typename O::data_type *__restrict__ in,
-                      const int32_t *__restrict__ power, const int32_t num_slices, const size_t n) {
+                      const int32_t *__restrict__ power, int32_t num_slices, const size_t n) {
   using Data = typename O::data_type;
   using Target = typename O::target_type;
   const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
   if (tid >= n / 4)
     return;
 
-  int32_t local_power = *power;
+  int2 dynamic_range = *reinterpret_cast<const int2 *>(power);
+  int32_t total_slices =
+      (num_slices == 0) ? 1 + (dynamic_range.x - dynamic_range.y) / (CHAR_BIT * sizeof(Target) - 1) : num_slices;
 
   FourValues<Data> ins = reinterpret_cast<const FourValues<Data> *>(in)[tid];
   FourValues<Target> outs{};
 
 #pragma unroll 4
-  for (int32_t s = 0; s < num_slices; ++s) {
-    int32_t shift_amount = ozaki_scaling_factor<Target>(&local_power);
+  for (int32_t s = 0; s < total_slices; ++s) {
+    int32_t shift_amount = ozaki_scaling_factor<Target>(&dynamic_range.x);
     const size_t flat_offset = static_cast<size_t>(s) * (n / 4) + static_cast<size_t>(tid);
 #pragma unroll
     for (int32_t v = 0; v < 4; ++v) {
@@ -143,14 +233,15 @@ __global__ void mend(typename O::data_type *__restrict__ out, const typename O::
   if (tid >= n / 4)
     return;
 
-  int32_t local_power = *power;
+  int2 dynamic_range = *reinterpret_cast<const int2 *>(power);
+  int32_t total_slices =
+      (num_slices == 0) ? 1 + (dynamic_range.x - dynamic_range.y) / (CHAR_BIT * sizeof(Target) - 1) : num_slices;
 
   FourValues<Data> outs{};
   FourValues<Target> ins{};
-
 #pragma unroll 4
-  for (int32_t s = 0; s < num_slices; ++s) {
-    int32_t shift_amount = ozaki_scaling_factor<Target>(&local_power);
+  for (int32_t s = 0; s < total_slices; ++s) {
+    int32_t shift_amount = ozaki_scaling_factor<Target>(&dynamic_range.x);
     const size_t flat_offset = static_cast<size_t>(s) * (n / 4) + static_cast<size_t>(tid);
     ins = reinterpret_cast<const FourValues<Target> *>(in)[flat_offset];
 #pragma unroll
@@ -158,7 +249,6 @@ __global__ void mend(typename O::data_type *__restrict__ out, const typename O::
       outs.a[v] += up_cast<Data, Target>(ins.a[v], shift_amount);
     }
   }
-
   reinterpret_cast<FourValues<Data> *>(out)[tid] = outs;
 }
 
