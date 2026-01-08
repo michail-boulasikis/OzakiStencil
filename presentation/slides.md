@@ -49,11 +49,11 @@ transition: slide-up
 
 # R-CCS in RIKEN
 
-- Home to the Fugaku Supercomputer. 
+- RIKEN: Japan's largest research center.
+- R-CCS: Kobe, home to the Fugaku SC. 
 - Organized into two _units_, **Science of Computing** and **Science by Computing**.
 - _Units_ composed of _teams_ (5-year projects).
 
-<br>
 <div v-click="1">
 <img src="./media/RCCS.png">
 <div v-mark.circle.orange="2" class="jens"></div>
@@ -85,11 +85,13 @@ What will go into FugakuNext?
 
 - SPR will inform FugakuNext's hardware.
 - Research on what supercomputers spend most of their time in.
-- Should RIKEN invest in TCs and AI Accelerators?
+- Should RIKEN/Japan invest in TCs and AI Accelerators?
 
-<img src="./media/SPR_Result.png">
+<img v-click="1" src="./media/SPR_Result.png">
 
 ::right::
+
+<div v-click="2">
 
 ### The Need for High Precision
 
@@ -97,15 +99,17 @@ What will go into FugakuNext?
 
 <img src="./media/GPU_Precision_Trends.png">
 
+<br>
+
+- Looking for ways to use low-precision (or emulate high-precision) for their applications.
+
+</div>
+
 <style>
 .two-cols-header {
   column-gap: 4em;
 }
 </style>
-
-<br>
-
-- Looking for ways to use low-precision (or emulate high-precision) for their applications.
 
 ---
 title: The Ozaki Scheme
@@ -121,12 +125,129 @@ Invented by Katsuhisa Ozaki in RIKEN
 
 - High-precision matrix multiplication using low-precision arithmetic.
 
-Say we want to emulate FP64 operations using INT8.
+**Emulation Example:** Say we want to emulate operations on 3 FP32 numbers, $\alpha, \beta, \gamma$, using INT8.
+
+<v-switch>
+  <template #1> <img src="./media/Alpha_Beta_Gamma_1.svg"> </template>
+  <template #2> <img src="./media/Alpha_Beta_Gamma_2.svg"> </template>
+  <template #3-6> <img src="./media/Alpha_Beta_Gamma_3.svg"> </template>
+</v-switch>
+
+::right::
+
+<div v-click="4">
+
+- To compute $\alpha \times \beta$, we cross-multiply all slices...
+
+<img width="80%" src="./media/AlphaBeta_Mul.svg">
+
+</div>
+
+<div v-click="5">
+
+- ...and accumulate the partial products.
+
+</div>
+
+<style>
+.two-cols-header {
+  column-gap: 4em;
+}
+</style>
+
+---
+title: Ozaki Scheme Properties
+level: 1
+layout: two-cols-header
+transition: slide-left
+---
+
+# Ozaki Scheme Properties
+For any set of floating point numbers $\mathcal{A} \in \mathbb{F}^n$...
+
+::left::
+
+<div v-click="1">
+
+- Higher dynamic range $\rightarrow$ more slices.
+- Reduce slices by scaling rows and columns differently.
+
+<img scale="85%" src="./media/OzakiScalingMatrices.svg">
+
+- Emulation with `float` types is also possible.
+
+</div>
 
 
+<div v-click="2">
 
-$$
-\mathcal{A} = \{3.0, 0.3\times10^3, 0.3\times10^{-3}\}
-$$
+- Emulated `double` is <span v-mark.highlight.yellow="3">more accurate</span> than native `double` precision.
+
+</div>
+
+::right::
+
+<div v-click="2">
+
+**Example:** Compute $(10^{16} + 1) - 10^{16}$.
+- Native arithmetic: loses the `+1.0` due to rounding. Result: `0.0` ❌
+- Ozaki: Slices similar magnitude, carries propagated. Result: `1.0` ✅
+
+</div>
+
+<div v-click="4">
+
+<br>
+<hr>
+
+Ozaki Scheme $\rightarrow$ solution to the precision problem in GPAI.
+
+- But has only been used for matrix multiplication.
+- Can we use it for more computation patterns?
+
+</div>
+
+---
+title: OzakiStencil
+level: 1
+layout: two-cols-header
+transition: slide-left
+---
+
+# OzakiStencil
+Adapting the Ozaki Scheme for stencil loops.
+
+::left::
+
+## Opportunities
+
+- <span class="plus">GPU/AI Accelerator friendly</span> implementation.
+  - Avoids usage of `float64` units which see dwindling support.
+  - Allows efficient usage of tensor cores.
+- Capability of emulating <span class="plus">arbitrary/adaptive precision</span>.
+- Allows for <span class="plus">coarser tiling</span>, reducing communication and improving locality.
 
 
+::right::
+
+
+## Challenges
+
+
+- GEMM is harder &mdash; $O(n^3)$ vs $O(nk)$ &mdash; than stencil loops.
+  - <span class="minus">Overhead</span> much more noticeable.
+  - <span class="minus">Memory-bound</span> application, limiting performance gains.
+- More <span class="minus">complicated temporal blocking</span>.
+- Scaling needs to be <span class="minus">applied globally</span>.
+
+<style>
+.two-cols-header {
+  column-gap: 4em;
+}
+.plus {
+  color: #6AB500;
+}
+.minus {
+  color: #ED1313;
+}
+</style>
