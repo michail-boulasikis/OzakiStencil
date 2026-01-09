@@ -219,6 +219,12 @@ public:
 
     for (size_t lin = 0; lin < in_size_lin; ++lin) {
       auto idx = linear_to_multi_fast(lin);
+      bool valid = true;
+#pragma unroll
+      for (size_t j = 0; j < dims; ++j)
+        valid &= (idx[j] >= offsets[j]) && (idx[j] <= in_shape[j] - (shape[j] - offsets[j]));
+      if (!valid)
+        continue;
       AccType acc = 0;
 
       for (size_t s_lin = 0; s_lin < size; ++s_lin) {
