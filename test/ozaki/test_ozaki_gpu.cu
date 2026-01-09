@@ -103,7 +103,7 @@ protected:
     uint32_t nBlocksMap = ((this->N / 4) + nThreadsMap - 1) / nThreadsMap;
     uint32_t nBlocksReduce = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / RDC_THREADS_PER_BLOCK;
 
-    ozigpu::abs_max_nextpow2_reduce<Scalar><<<nBlocksReduce, RDC_THREADS_PER_BLOCK>>>(d_ptr, this->d_data, this->N);
+    ozigpu::dyn_range<Scalar><<<nBlocksReduce, RDC_THREADS_PER_BLOCK>>>(d_ptr, this->d_data, this->N);
     ozigpu::slice<ozigpu::OzakiFP_Int8<Scalar>>
         <<<nBlocksMap, nThreadsMap>>>(d_slices, this->d_data, d_ptr, dynamic_slicing ? 0 : num_slices_max, this->N);
     ASSERT_EQ(CUDA_SUCCESS, cudaDeviceSynchronize());
@@ -182,7 +182,7 @@ TYPED_TEST(OzakiTestGPU, ScaleExtraction) {
   cudaDeviceProp prop;
   cudaGetDeviceProperties(&prop, 0);
   uint32_t nBlocksReduce = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / RDC_THREADS_PER_BLOCK;
-  ozigpu::abs_max_nextpow2_reduce<Scalar>
+  ozigpu::dyn_range<Scalar>
       <<<nBlocksReduce, RDC_THREADS_PER_BLOCK>>>(reinterpret_cast<int32_t *>(this->d_data_s), this->d_data, this->N);
 
   int32_t hexp_real = std::numeric_limits<int32_t>::min();
@@ -239,7 +239,7 @@ TYPED_TEST(OzakiTestGPU, OzakiStencil) {
   uint64_t nThreadsStencil = 512;
   uint64_t nBlocksStencil = (this->N + nThreadsStencil - 1) / nThreadsStencil;
 
-  ozigpu::abs_max_nextpow2_reduce<Scalar><<<nBlocksReduce, RDC_THREADS_PER_BLOCK>>>(d_ptr, this->d_data, this->N);
+  ozigpu::dyn_range<Scalar><<<nBlocksReduce, RDC_THREADS_PER_BLOCK>>>(d_ptr, this->d_data, this->N);
   ozigpu::slice<ozigpu::OzakiFP_Int8<Scalar>>
       <<<nBlocksMap, nThreadsMap>>>(d_slices_in, this->d_data, d_ptr, num_slices, this->N);
 

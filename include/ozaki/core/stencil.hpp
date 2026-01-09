@@ -5,7 +5,9 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
+#include <span>
 
 #ifdef __CUDACC__
 #define HD __host__ __device__
@@ -85,7 +87,13 @@ public:
 
   HD constexpr explicit Stencil(const coeffs_type &c) noexcept : coeffs(c), offsets{} {
     for (size_t i = 0; i < dims; ++i)
-      offsets[i] = shape[i] / 2;
+      offsets[i] = shape_type{shape}[i] / 2;
+  }
+
+  HD constexpr explicit Stencil(std::span<const T> c) : offsets{} {
+    std::memcpy(coeffs.data(), &c, sizeof(T) * size);
+    for (size_t i = 0; i < dims; ++i)
+      offsets[i] = shape_type{shape}[i] / 2;
   }
 
   HD static constexpr size_t multi_to_linear(const shape_type &idx) {

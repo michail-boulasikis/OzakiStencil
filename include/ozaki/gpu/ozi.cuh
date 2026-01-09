@@ -138,8 +138,7 @@ template <typename T> __global__ void fill(T *__restrict__ in, const T val, size
     in[tid] = val;
 }
 
-template <OzakiData T>
-__global__ void abs_max_nextpow2_reduce(int32_t *__restrict__ out, const T *__restrict__ in, size_t n) {
+template <OzakiData T> __global__ void dyn_range(int32_t *__restrict__ out, const T *__restrict__ in, size_t n) {
   constexpr uint32_t WARPS_PER_BLOCK = RDC_THREADS_PER_BLOCK / WARP_SIZE;
   constexpr uint32_t BLOCK_STRIDE = RDC_THREADS_PER_BLOCK;
   __shared__ T smem_max[WARPS_PER_BLOCK];
