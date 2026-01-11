@@ -13,4 +13,5 @@ presentation/node_modules/
 
 *.csv
 *.dat
-
+*.nsys-rep
+*.ncu-rep
