@@ -210,35 +210,39 @@ Ozaki Scheme $\rightarrow$ solution to the precision problem in GPAI.
 ---
 title: OzakiStencil
 level: 1
-layout: two-cols-header
+layout: two-cols
 transition: slide-left
 ---
+
+<img class="flavor" src="./media/PlusMinusBackground.jpg">
+
+::right::
 
 # OzakiStencil
 Adapting the Ozaki Scheme for stencil loops.
 
-::left::
+<br>
+
+<div v-click="1">
 
 ## Opportunities
 
 - <span class="plus">GPU/AI Accelerator friendly</span> implementation.
-  - Avoids usage of `float64` units which see dwindling support.
-  - Allows efficient usage of tensor cores.
-- Capability of emulating <span class="plus">arbitrary/adaptive precision</span>.
-- Allows for <span class="plus">coarser tiling</span>, reducing communication and improving locality.
+- Can emulate <span class="plus">arbitrary/adaptive precision</span>.
+- Allows for <span class="plus">coarser tiling</span>.
 
+</div>
 
-::right::
+<br>
 
+<div v-click="2">
 
 ## Challenges
-
-
-- GEMM is harder &mdash; $O(n^3)$ vs $O(nk)$ &mdash; than stencil loops.
+- Needs to be <span class="minus">very efficient</span>.
   - <span class="minus">Overhead</span> much more noticeable.
-  - <span class="minus">Memory-bound</span> application, limiting performance gains.
-- More <span class="minus">complicated temporal blocking</span>.
-- Scaling needs to be <span class="minus">applied globally</span>.
+- <span class="minus">Dynamic range changes</span> across loop iterations.
+
+</div>
 
 <style>
 .two-cols-header {
@@ -249,5 +253,12 @@ Adapting the Ozaki Scheme for stencil loops.
 }
 .minus {
   color: #ED1313;
+}
+.flavor {
+  position: absolute;
+  top: -5em;
+  right: 30em;
+  width: 50%;
+  height: auto;
 }
 </style>
