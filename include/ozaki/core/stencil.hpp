@@ -6,10 +6,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <type_traits>
 #include <span>
-#include <utility>
 #include <tuple>
+#include <type_traits>
+#include <utility>
+
+#ifdef OZAKI_USE_OPENMP
+#include <omp.h>
+#endif
 
 #ifdef __CUDACC__
 #define HD __host__ __device__
@@ -219,6 +223,7 @@ public:
       return idx;
     };
 
+#pragma omp parallel for 
     for (size_t lin = 0; lin < in_size_lin; ++lin) {
       auto idx = linear_to_multi_fast(lin);
       bool valid = true;
@@ -227,9 +232,11 @@ public:
         valid &= (idx[j] >= offsets[j]) && (idx[j] <= in_shape[j] - (shape[j] - offsets[j]));
       if (!valid)
         continue;
-        output[lin] = std::apply([&](auto... unpacked_indices) {
-          return this->apply_at_as<AccType>(std::data(input), in_strides, unpacked_indices...);
-        }, idx);
+      output[lin] = std::apply(
+          [&](auto... unpacked_indices) {
+            return this->apply_at_as<AccType>(std::data(input), in_strides, unpacked_indices...);
+          },
+          idx);
     }
   }
 };
