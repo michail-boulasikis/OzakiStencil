@@ -8,6 +8,8 @@
 #include <cstring>
 #include <type_traits>
 #include <span>
+#include <utility>
+#include <tuple>
 
 #ifdef __CUDACC__
 #define HD __host__ __device__
@@ -225,29 +227,9 @@ public:
         valid &= (idx[j] >= offsets[j]) && (idx[j] <= in_shape[j] - (shape[j] - offsets[j]));
       if (!valid)
         continue;
-      AccType acc = 0;
-
-      for (size_t s_lin = 0; s_lin < size; ++s_lin) {
-        auto s_idx = linear_to_multi(static_cast<int64_t>(s_lin));
-        std::array<int64_t, dims> rel{};
-        bool in_bounds = true;
-
-        for (size_t d = 0; d < dims; ++d) {
-          rel[d] = static_cast<int64_t>(idx[d]) + static_cast<int64_t>(s_idx[d]) - static_cast<int64_t>(offsets[d]);
-          in_bounds &= (rel[d] >= 0 && rel[d] < static_cast<int64_t>(in_shape[d]));
-        }
-
-        if (in_bounds) {
-          std::array<size_t, dims> abs{};
-          for (size_t d = 0; d < dims; ++d)
-            abs[d] = static_cast<size_t>(rel[d]);
-
-          const size_t lin_in = linear_from_multi(abs, in_strides);
-
-          acc += static_cast<AccType>(coeffs[s_lin]) * static_cast<AccType>(input[lin_in]);
-        }
-      }
-      output[lin] = acc;
+        output[lin] = std::apply([&](auto... unpacked_indices) {
+          return this->apply_at_as<AccType>(std::data(input), in_strides, unpacked_indices...);
+        }, idx);
     }
   }
 };
