@@ -18,7 +18,7 @@ struct Config {
 #else
   static constexpr int RDC_THREADS = RDC_THREADS_PER_BLOCK;
 #endif
-  static constexpr int STENCIL_ITERS = 512;
+  static constexpr int STENCIL_ITERS_DEFAULT = 4096;
   static constexpr size_t STENCIL_BLOCK_DIM_X = 16;
   static constexpr size_t STENCIL_BLOCK_DIM_Y = 16;
 };
@@ -29,6 +29,7 @@ int32_t *d_flush_buffer = nullptr;
 size_t flush_buffer_size = 0;
 
 void invalidate_caches() {
+  NVTX_PUSH("Flushing L2")
   if (d_flush_buffer == nullptr) {
     int device_id;
     int l2_cache_size;
@@ -39,6 +40,7 @@ void invalidate_caches() {
   }
   CUDA_CHECK(cudaMemset(d_flush_buffer, 0, flush_buffer_size));
   CUDA_CHECK(cudaDeviceSynchronize());
+  NVTX_POP();
 }
 
 struct Tensor {
@@ -88,7 +90,8 @@ Tensor read_tensor(const std::string &filepath) {
 struct ReferenceSolver {
   template <typename ComputeType>
   static std::vector<ComputeType> compute(const Tensor &input, const ozi::Stencil<Real, 3, 3> &stencil_def,
-                                          const std::string &label = "Reference") {
+                                          const std::string &label = "Reference",
+                                          const int32_t iterations = Config::STENCIL_ITERS_DEFAULT) {
     NVTX_PUSH(std::format("{} Solver", label).c_str());
 
     std::vector<ComputeType> u_curr(input.data.size());
@@ -103,7 +106,7 @@ struct ReferenceSolver {
       stencil_typed.coeffs[i] = static_cast<ComputeType>(stencil_def.coeffs[i]);
     }
 
-    for (size_t i = 0; i < Config::STENCIL_ITERS; ++i) {
+    for (size_t i = 0; i < iterations; ++i) {
       stencil_typed.template apply_to<ComputeType>(u_curr, u_next, {input.width(), input.height()});
       std::swap(u_curr, u_next);
     }
@@ -121,9 +124,16 @@ class OzakiRunner {
   Tensor host_input;
   int32_t num_slices_total = 0;
   size_t n_elems = 0;
+  int32_t n_iterations = Config::STENCIL_ITERS_DEFAULT;
 
 public:
   OzakiRunner(const Tensor &input) : host_input(input), n_elems(input.size()) {
+    allocate_resources();
+    compute_dynamic_range();
+  }
+
+  OzakiRunner(const Tensor &input, const int32_t iterations)
+      : host_input(input), n_elems(input.size()), n_iterations(iterations) {
     allocate_resources();
     compute_dynamic_range();
   }
@@ -185,15 +195,13 @@ public:
     NVTX_PUSH(std::format("Run {} Slices", active_slices).c_str());
 
     prepare_slices();
-    NVTX_PUSH("Flushing L2")
     invalidate_caches();
-    NVTX_POP();
 
     const dim3 block(Config::STENCIL_BLOCK_DIM_X, Config::STENCIL_BLOCK_DIM_Y);
     const dim3 grid((host_input.width() + block.x - 1) / block.x, (host_input.height() + block.y - 1) / block.y);
 
     NVTX_PUSH("Integration Loop");
-    for (size_t t = 0; t < Config::STENCIL_ITERS; ++t) {
+    for (size_t t = 0; t < n_iterations; ++t) {
       ozigpu::stencil_v1<ozigpu::OzakiFP_Int8<Real>, 3, 3><<<grid, block>>>(
           d_slices_2, d_slices_1, stencil_gpu, {host_input.width(), host_input.height()}, active_slices);
       std::swap(d_slices_1, d_slices_2);
@@ -221,13 +229,16 @@ public:
 
 int main(int argc, char *argv[]) {
   if (argc < 2) {
-    std::cerr << std::format("Usage: {} <input_tensor_file>\n", argv[0]);
+    std::cerr << std::format("Usage: {} <input_tensor_file> [<n_iter>]\n", argv[0]);
     return 1;
   }
 
   try {
     NVTX_PUSH("Initialization");
     Tensor input = read_tensor(argv[1]);
+    int32_t n_iters = Config::STENCIL_ITERS_DEFAULT;
+    if (argc == 3)
+      n_iters = std::stoi(argv[2]);
 
     const Real r = 3.0 / 16.0;
     const std::array<Real, 9> coeffs{0.0, r, 0.0, r, 1.0 - 4.0 * r, r, 0.0, r, 0.0};
@@ -237,34 +248,34 @@ int main(int argc, char *argv[]) {
     const ozi::Stencil<int8_t, 3, 3> heat_ozaki{coeffs_oz, {1, 1}};
     NVTX_POP();
 
-    auto gold_result = ReferenceSolver::compute<long double>(input, heat, "Gold (long double)");
+    auto gold_result = ReferenceSolver::compute<long double>(input, heat, "Gold (long double)", n_iters);
 
-    std::cout << "type,slices,error\n";
+    std::cout << "Type,Iterations,Slices,Error\n";
 
     {
-      auto res = ReferenceSolver::compute<float>(input, heat, "Ref (float)");
+      auto res = ReferenceSolver::compute<float>(input, heat, "Ref (float)", n_iters);
       long double mse = calculate_mse(res, gold_result);
-      std::cout << std::format("float_ref,0,{}\n", mse);
+      std::cout << std::format("float_ref,{},0,{}\n", n_iters, mse);
     }
 
     {
-      auto res = ReferenceSolver::compute<double>(input, heat, "Ref (double)");
+      auto res = ReferenceSolver::compute<double>(input, heat, "Ref (double)", n_iters);
       long double mse = calculate_mse(res, gold_result);
-      std::cout << std::format("double_red,0,{}\n", mse);
+      std::cout << std::format("double_ref,{},0,{}\n", n_iters, mse);
     }
 
-    OzakiRunner runner(input);
+    OzakiRunner runner(input, n_iters);
 
     NVTX_PUSH("Ozaki Loop");
     for (int32_t s = 1; s < runner.get_max_slices(); ++s) {
       std::vector<Real> gpu_raw = runner.run_experiment(s, heat_ozaki);
       long double error = calculate_mse(gpu_raw, gold_result);
-      std::cout << std::format("ozaki,{},{}\n", s, error);
+      std::cout << std::format("ozaki,{},{},{}\n", n_iters, s, error);
     }
     NVTX_POP();
 
   } catch (const std::exception &e) {
-    std::cerr << std::format("Error: {}\n", e.what());
+    std::cerr << std::format("Execution error: {}\n", e.what());
     return 1;
   }
 

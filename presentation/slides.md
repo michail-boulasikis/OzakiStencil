@@ -262,3 +262,172 @@ Adapting the Ozaki Scheme for stencil loops.
   height: auto;
 }
 </style>
+
+---
+title: OzStencil Efficiency
+level: 1
+layout: two-cols-header
+transition: slide-left
+---
+
+# Improving OzakiStencil
+Using stencil properties
+
+::left::
+
+Stencils operate on arrays (lattices)
+
+<img class="px-6" style="width: 50%" src="./media/StencilArrayLattice.svg">
+
+<div v-click="1">
+
+Coefficients $c_i \in \alpha\mathbb{Z},\; \alpha \in \mathbb{R}$.
+- Find $\alpha$ and factor it out.
+- Resulting coefficients are integers.
+
+</div>
+
+::right::
+
+<div v-click="2">
+
+### Example (Heat Equation)
+
+</div>
+<v-switch>
+  <template #2>
+
+$\mathcal{S} = \left[ \frac{7}{16\pi^2} \; \frac{1 - \frac{14}{16}}{\pi^2} \; \frac{7}{16\pi^2}\right]$
+  
+  </template>
+  <template #3-6>
+
+$\mathcal{S} = \left[ \frac{7}{16\pi^2} \; \frac{1 - \frac{14}{16}}{\pi^2} \; \frac{7}{16\pi^2}\right] =$
+    <span v-mark.highlight.yellow="4">
+$\frac{1}{16\pi^2}\left[ 7 \quad 2 \quad 7\right]$
+    </span>
+  </template>
+</v-switch>
+
+<div v-click="4">
+
+Can be represented with just one INT8 slice.
+
+<img class="px-2" style="width: 75%" src="./media/StencilOneSlice.svg">
+
+</div>
+
+<br>
+
+<div v-click="5">
+
+- Useful with euclidean geometry and Taylor stencils.
+- Not useful with spectral methods or unstructured meshes.
+
+</div>
+
+---
+title: OzStencil Efficiency
+level: 1
+layout: two-cols-gap
+transition: slide-left
+gap: gap-12
+---
+
+# Improving OzakiStencil
+Reducing overhead
+
+Originally slicing and mending (reconstructing) every timestep.
+
+- GEMM: Slicing & Mending <span class="plus">~5%</span> of runtime.
+- Stencil: Slicing & Mending <span class="minus">~98%</span> of runtime.
+
+<br>
+
+<img v-click="1" src="./media/AmortizeOverhead.svg">
+
+<br>
+
+<div v-click="1">
+
+- Can we <span v-mark.highlight.underline.green="1">keep the data sliced</span>?
+
+</div>
+
+::right::
+
+<img v-click="2" style="width: 80%" src="./media/KeepResultSliced.svg">
+
+<div v-click="3">
+
+- Result needs to fit in current slices.
+- Estimate when new slice is necessary (depends on stencil and boundary).
+- Introduce mend & slice pair when needed.
+
+</div>
+
+<style>
+.plus {
+  color: #6AB500;
+}
+.minus {
+  color: #ED1313;
+}
+</style>
+
+
+---
+title: OzStencil Efficiency
+level: 1
+layout: two-cols-gap
+transition: slide-left
+gap: gap-12
+---
+
+
+# What is Done
+
+<div v-click="1">
+
+- CPU versions and rudimentary GPU versions done.
+- Confirmed that OzakiStencil works!
+
+<img width="80%" src="./media/OzakiErrorsFigure.png">
+
+</div>
+
+::right::
+
+# Left to Do
+
+<div v-click="2">
+
+- Optimize code to improve performance.
+- Use INT8 tensor cores for integration.
+
+<br>
+
+<img src="./media/StencilAsGEMM.png">
+
+<br>
+
+- «Rigorize» slice and mend insertions.
+
+</div>
+
+
+---
+title: Thank you
+level: 1
+class: text-center
+layout: cover
+background: ./media/ThankYou.jpg
+---
+
+<div style="background-color: rgba(180, 180, 180, 0.2); margin-top:-14em;" class="p-4">
+
+# Thank you!
+
+## Questions?
+
+</div>
