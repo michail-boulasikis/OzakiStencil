@@ -25,6 +25,22 @@ struct Config {
 
 using Real = double;
 
+int32_t *d_flush_buffer = nullptr;
+size_t flush_buffer_size = 0;
+
+void invalidate_caches() {
+  if (d_flush_buffer == nullptr) {
+    int device_id;
+    int l2_cache_size;
+    CUDA_CHECK(cudaGetDevice(&device_id));
+    CUDA_CHECK(cudaDeviceGetAttribute(&l2_cache_size, cudaDevAttrL2CacheSize, device_id));
+    flush_buffer_size = l2_cache_size * 4;
+    CUDA_CHECK(cudaMalloc(&d_flush_buffer, flush_buffer_size));
+  }
+  CUDA_CHECK(cudaMemset(d_flush_buffer, 0, flush_buffer_size));
+  CUDA_CHECK(cudaDeviceSynchronize());
+}
+
 struct Tensor {
   std::vector<size_t> shape;
   std::vector<Real> data;
@@ -169,6 +185,9 @@ public:
     NVTX_PUSH(std::format("Run {} Slices", active_slices).c_str());
 
     prepare_slices();
+    NVTX_PUSH("Flushing L2")
+    invalidate_caches();
+    NVTX_POP();
 
     const dim3 block(Config::STENCIL_BLOCK_DIM_X, Config::STENCIL_BLOCK_DIM_Y);
     const dim3 grid((host_input.width() + block.x - 1) / block.x, (host_input.height() + block.y - 1) / block.y);
@@ -185,11 +204,13 @@ public:
     const int32_t nThreadsMend = std::min(static_cast<size_t>(Config::RDC_THREADS), n_elems / 4);
     const int32_t nBlocksMend = ((n_elems / 4) + nThreadsMend - 1) / nThreadsMend;
 
+    NVTX_PUSH("Mending & Download")
     ozigpu::mend<ozigpu::OzakiFP_Int8<Real>>
         <<<nBlocksMend, nThreadsMend>>>(d_res, d_slices_2, d_dyn_range, active_slices, n_elems);
 
     std::vector<Real> gpu_result(n_elems);
     CUDA_CHECK(cudaMemcpy(gpu_result.data(), d_res, n_elems * sizeof(Real), cudaMemcpyDeviceToHost));
+    NVTX_POP();
     NVTX_POP();
 
     return gpu_result;
