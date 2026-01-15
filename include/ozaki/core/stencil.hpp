@@ -239,6 +239,15 @@ public:
           idx);
     }
   }
+
+  template <typename AccType = value_type>
+  AccType l1_norm() {
+    AccType norm = static_cast<AccType>(0);
+    for (const auto& coeff : coeffs) {
+      norm += std::abs(coeff);
+    }
+    return norm;
+  }
 };
 
 template <typename T1, size_t... A, typename T2, size_t... B>

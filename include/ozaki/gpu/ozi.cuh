@@ -138,6 +138,12 @@ template <typename T> __global__ void fill(T *__restrict__ in, const T val, size
     in[tid] = val;
 }
 
+template <typename T> __global__ void scale(T *__restrict__ in, const T val, size_t n) {
+  const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+  if (tid < n)
+    in[tid] *= val;
+}
+
 template <OzakiData T> __global__ void dyn_range(int32_t *__restrict__ out, const T *__restrict__ in, size_t n) {
   constexpr uint32_t WARPS_PER_BLOCK = RDC_THREADS_PER_BLOCK / WARP_SIZE;
   constexpr uint32_t BLOCK_STRIDE = RDC_THREADS_PER_BLOCK;
@@ -149,11 +155,12 @@ template <OzakiData T> __global__ void dyn_range(int32_t *__restrict__ out, cons
 
   T local_max_val = static_cast<T>(0);
   int32_t local_min_val = std::numeric_limits<int32_t>::max();
-#pragma unroll 2
+#pragma unroll 4
   while (4 * i < n) { // I assume that n is a multiple of four.
     const T *src = in + 4 * i;
     FourValues<T> vals = *reinterpret_cast<const FourValues<T> *>(src);
-    local_max_val = max(max(max(abs(vals.a[0]), abs(vals.a[1])), abs(vals.a[2])), abs(vals.a[3]));
+    T current_max = max(max(max(abs(vals.a[0]), abs(vals.a[1])), abs(vals.a[2])), abs(vals.a[3]));
+    local_max_val = max(local_max_val, current_max);
     local_min_val =
         dyn_min_lsb(vals.a[0], dyn_min_lsb(vals.a[1], dyn_min_lsb(vals.a[2], dyn_min_lsb(vals.a[3], local_min_val))));
     i += GRID_SIZE;
@@ -304,22 +311,12 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
   for (int32_t current_slice = num_slices_in - 1; current_slice >= 0; --current_slice) {
     const Target *current_slice_ptr = in + slice_stride * current_slice;
 
-    /*if (current_slice > 0) {
-      const UTarget *u_current_slice_ptr = reinterpret_cast<const UTarget *>(current_slice_ptr);
-      if constexpr (sizeof...(Dims) == 1)
-        partial_result = s.template apply_at_as<Acc>(u_current_slice_ptr, input_strides, i);
-      else if constexpr (sizeof...(Dims) == 2)
-        partial_result = s.template apply_at_as<Acc>(u_current_slice_ptr, input_strides, j, i);
-      else if constexpr (sizeof...(Dims) == 3)
-        partial_result = s.template apply_at_as<Acc>(u_current_slice_ptr, input_strides, k, j, i);
-    } else {*/
     if constexpr (sizeof...(Dims) == 1)
       partial_result = s.template apply_at_as<Acc>(current_slice_ptr, input_strides, i);
     else if constexpr (sizeof...(Dims) == 2)
       partial_result = s.template apply_at_as<Acc>(current_slice_ptr, input_strides, j, i);
     else if constexpr (sizeof...(Dims) == 3)
       partial_result = s.template apply_at_as<Acc>(current_slice_ptr, input_strides, k, j, i);
-    /*}*/
 
     local_val += partial_result;
 

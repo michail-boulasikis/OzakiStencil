@@ -1,3 +1,4 @@
+#include "ozaki/utils/utils.hpp"
 #include <algorithm>
 #include <array>
 #include <climits>
@@ -23,7 +24,7 @@ struct Config {
   static constexpr size_t STENCIL_BLOCK_DIM_Y = 16;
 };
 
-using Real = double;
+using Real = float;
 
 int32_t *d_flush_buffer = nullptr;
 size_t flush_buffer_size = 0;
@@ -53,7 +54,7 @@ struct Tensor {
 };
 
 template <typename T_Test, typename T_Ref>
-long double calculate_mse(const std::vector<T_Test> &test, const std::vector<T_Ref> &ref) {
+long double calculate_rmse(const std::vector<T_Test> &test, const std::vector<T_Ref> &ref) {
   if (test.size() != ref.size()) {
     throw std::runtime_error("Size mismatch in MSE calculation");
   }
@@ -62,7 +63,7 @@ long double calculate_mse(const std::vector<T_Test> &test, const std::vector<T_R
     long double diff = static_cast<long double>(test[i]) - static_cast<long double>(ref[i]);
     err += diff * diff;
   }
-  return err / static_cast<long double>(test.size());
+  return std::sqrt(err / static_cast<long double>(test.size()));
 }
 
 Tensor read_tensor(const std::string &filepath) {
@@ -86,6 +87,62 @@ Tensor read_tensor(const std::string &filepath) {
 
   return {shape, data};
 }
+
+void write_tensor(const std::string &filepath, const Tensor &tensor) {
+  std::ofstream f(filepath, std::ios::out | std::ios::binary);
+  if (!f.is_open()) {
+    throw std::runtime_error(std::format("Could not open file at {}.", filepath));
+  }
+
+  size_t n_dims = tensor.shape.size();
+  f.write(reinterpret_cast<const char *>(&n_dims), sizeof(size_t));
+  f.write(reinterpret_cast<const char *>(tensor.shape.data()), n_dims * sizeof(size_t));
+  f.write(reinterpret_cast<const char *>(tensor.data.data()), tensor.size() * sizeof(Real));
+}
+
+struct RangeAnalyzer {
+  static void analyze(const Tensor &input, const ozi::Stencil<Real, 3, 3> &stencil,
+                      const int32_t iterations = Config::STENCIL_ITERS_DEFAULT) {
+    NVTX_PUSH("Range Analysis");
+    std::cout << "Starting Dynamic Range Analysis..." << std::endl;
+    std::cout << "Time,Max_Exp,Min_Exp" << std::endl;
+
+    int32_t *d_dyn_range = nullptr;
+    Real *d_data = nullptr;
+    size_t n_elems = input.size();
+
+    CUDA_CHECK(cudaMalloc(&d_dyn_range, 64 * sizeof(int32_t)));
+    CUDA_CHECK(cudaMalloc(&d_data, n_elems * sizeof(Real)));
+
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    const int32_t nThreads = Config::RDC_THREADS;
+    const int32_t nBlocks = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / Config::RDC_THREADS;
+
+    std::vector<Real> u_curr = input.data;
+    std::vector<Real> u_next = u_curr;
+
+    for (int32_t t = 0; t <= iterations; ++t) {
+      CUDA_CHECK(cudaMemcpy(d_data, u_curr.data(), n_elems * sizeof(Real), cudaMemcpyHostToDevice));
+      ozigpu::fill<<<1, 1>>>(reinterpret_cast<int2 *>(d_dyn_range), {-10000, +10000}, 1);
+      ozigpu::dyn_range<<<nBlocks, nThreads>>>(d_dyn_range, d_data, n_elems);
+      CUDA_CHECK(cudaGetLastError());
+
+      int32_t h_dyn_range[64];
+      CUDA_CHECK(cudaMemcpy(h_dyn_range, d_dyn_range, 64 * sizeof(int32_t), cudaMemcpyDeviceToHost));
+
+      std::cout << std::format("{},{},{}\n", t, h_dyn_range[0], h_dyn_range[1]);
+      if (t < iterations) {
+        stencil.template apply_to<Real>(u_curr, u_next, {input.width(), input.height()});
+        std::swap(u_curr, u_next);
+      }
+    }
+
+    cudaFree(d_dyn_range);
+    cudaFree(d_data);
+    NVTX_POP();
+  }
+};
 
 struct ReferenceSolver {
   template <typename ComputeType>
@@ -137,6 +194,11 @@ public:
     allocate_resources();
     compute_dynamic_range();
   }
+  OzakiRunner(const Tensor &input, const int32_t iterations, const int32_t extra_msb, const int32_t extra_lsb)
+      : host_input(input), n_elems(input.size()), n_iterations(iterations) {
+    allocate_resources();
+    compute_dynamic_range(extra_msb, extra_lsb);
+  }
 
   ~OzakiRunner() {
     cudaFree(d_slices_1);
@@ -155,12 +217,12 @@ public:
     NVTX_POP();
   }
 
-  void compute_dynamic_range() {
+  void compute_dynamic_range(const int32_t extra_msb = 0, const int32_t extra_lsb = 0) {
     NVTX_PUSH("Compute Dyn Range");
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
 
-    ozigpu::fill<<<1, 1>>>(reinterpret_cast<int2 *>(d_dyn_range), {-1000, +1000}, 1);
+    ozigpu::fill<<<1, 1>>>(reinterpret_cast<int2 *>(d_dyn_range), {-10000, +10000}, 1);
 
     const int32_t nThreads = Config::RDC_THREADS;
     const int32_t nBlocks = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / Config::RDC_THREADS;
@@ -169,7 +231,9 @@ public:
 
     int32_t h_dyn_range[64];
     CUDA_CHECK(cudaMemcpy(h_dyn_range, d_dyn_range, 64 * sizeof(int32_t), cudaMemcpyDeviceToHost));
-
+    h_dyn_range[0] += extra_msb;
+    h_dyn_range[1] -= extra_lsb;
+    CUDA_CHECK(cudaMemcpy(d_dyn_range, h_dyn_range, 64 * sizeof(int32_t), cudaMemcpyHostToDevice));
     num_slices_total = 1 + (h_dyn_range[0] - h_dyn_range[1]) / (CHAR_BIT * sizeof(int8_t) - 1);
 
     CUDA_CHECK(cudaMalloc(&d_slices_1, num_slices_total * n_elems * sizeof(int8_t)));
@@ -219,6 +283,9 @@ public:
     std::vector<Real> gpu_result(n_elems);
     CUDA_CHECK(cudaMemcpy(gpu_result.data(), d_res, n_elems * sizeof(Real), cudaMemcpyDeviceToHost));
     NVTX_POP();
+    NVTX_PUSH("Storing Result");
+    write_tensor(std::format("ozaki_{}.dat", active_slices), {host_input.shape, gpu_result});
+    NVTX_POP();
     NVTX_POP();
 
     return gpu_result;
@@ -248,28 +315,31 @@ int main(int argc, char *argv[]) {
     const ozi::Stencil<int8_t, 3, 3> heat_ozaki{coeffs_oz, {1, 1}};
     NVTX_POP();
 
+    RangeAnalyzer::analyze(input, heat, n_iters);
+    std::cout << "Analysis complete. Running solvers...\n";
+
     auto gold_result = ReferenceSolver::compute<long double>(input, heat, "Gold (long double)", n_iters);
 
     std::cout << "Type,Iterations,Slices,Error\n";
 
     {
       auto res = ReferenceSolver::compute<float>(input, heat, "Ref (float)", n_iters);
-      long double mse = calculate_mse(res, gold_result);
+      long double mse = calculate_rmse(res, gold_result);
       std::cout << std::format("float_ref,{},0,{}\n", n_iters, mse);
     }
 
     {
       auto res = ReferenceSolver::compute<double>(input, heat, "Ref (double)", n_iters);
-      long double mse = calculate_mse(res, gold_result);
+      long double mse = calculate_rmse(res, gold_result);
       std::cout << std::format("double_ref,{},0,{}\n", n_iters, mse);
     }
 
-    OzakiRunner runner(input, n_iters);
+    OzakiRunner runner(input, n_iters, 0, 0);
 
     NVTX_PUSH("Ozaki Loop");
     for (int32_t s = 1; s < runner.get_max_slices(); ++s) {
       std::vector<Real> gpu_raw = runner.run_experiment(s, heat_ozaki);
-      long double error = calculate_mse(gpu_raw, gold_result);
+      long double error = calculate_rmse(gpu_raw, gold_result);
       std::cout << std::format("ozaki,{},{},{}\n", n_iters, s, error);
     }
     NVTX_POP();
