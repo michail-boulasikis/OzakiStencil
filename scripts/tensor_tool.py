@@ -2,6 +2,9 @@ import numpy as np
 import struct
 import argparse
 import sys
+import os
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 def get_dtype_map():
@@ -17,6 +20,55 @@ def get_dtype_map():
     else:
         dtypes["float128"] = np.longdouble
     return dtypes
+
+
+def load_tensor(filepath, dtype=np.float64):
+    """Reads a binary tensor file."""
+    if not os.path.exists(filepath):
+        print(f"File not found: {filepath}")
+        return None
+
+    with open(filepath, "rb") as f:
+        n_dims_bytes = f.read(8)
+        if not n_dims_bytes:
+            return None
+        n_dims = struct.unpack("Q", n_dims_bytes)[0]
+        dims_bytes = f.read(8 * n_dims)
+        dims = struct.unpack("Q" * n_dims, dims_bytes)
+        data_bytes = f.read()
+        tensor_data = np.frombuffer(data_bytes, dtype=dtype)
+        try:
+            tensor = tensor_data.reshape(dims)
+        except ValueError as e:
+            print(
+                f"Error reshaping data in {filepath}. Expected {dims}, got {tensor_data.shape}"
+            )
+            raise e
+        print(f"Loaded {os.path.basename(filepath)}: Shape={tensor.shape}")
+    return tensor
+
+
+def plot_tensor_simple(tensor, title):
+    """Plots a tensor using seaborn."""
+    if tensor is None:
+        print("No tensor to plot")
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ndim = tensor.ndim
+
+    if ndim == 1:
+        sns.lineplot(data=tensor, ax=ax)
+        ax.set_title(f"{title} (1D)")
+    elif ndim == 2:
+        sns.heatmap(tensor, ax=ax, cmap="viridis", annot=False)
+        ax.set_title(f"{title}")
+    else:
+        ax.text(0.5, 0.5, f"{ndim}D Tensor\nNot Supported", ha="center", va="center")
+        ax.set_title(title)
+
+    plt.tight_layout()
+    plt.show()
 
 
 def generate_data(n, n_peaks, dtype_name, halo_avg, output_path):
@@ -59,7 +111,10 @@ def generate_data(n, n_peaks, dtype_name, halo_avg, output_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("output_file", type=str)
+    parser.add_argument("file", type=str)
+    parser.add_argument(
+        "--plot", "-p", action="store_true", help="Plot mode: load and display a tensor"
+    )
     parser.add_argument(
         "--type",
         type=str,
@@ -70,4 +125,11 @@ if __name__ == "__main__":
     parser.add_argument("--halo-avg", action="store_true")
     args = parser.parse_args()
 
-    generate_data(args.N, 10, args.type, args.halo_avg, args.output_file)
+    if args.plot:
+        tensor = load_tensor(args.file)
+        if args.halo_avg:
+            print("WARNING: Halo averaging mode ignored when in plot mode.")
+        if tensor is not None:
+            plot_tensor_simple(tensor, os.path.basename(args.file))
+    else:
+        generate_data(args.N, 10, args.type, args.halo_avg, args.file)
