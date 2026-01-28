@@ -1,1 +1,1 @@
-add_cpu_lib(utils utils.cpp)
+add_cpu_lib(utilcpu utils.cpp)

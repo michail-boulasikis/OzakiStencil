@@ -1,4 +1,4 @@
-#include "ozaki/gpu/gpu_checks.cuh"
+/*#include "ozaki/gpu/gpu_checks.cuh"
 #include <climits>
 #include <cstdint>
 #include <cuda.h>
@@ -157,4 +157,4 @@ CUDA_GLOBAL void ozi_mul_stencil(int8_t *__restrict__ out, const int8_t *__restr
 
     current_slice -= NUM_WARPS;
   }
-}
+}*/
