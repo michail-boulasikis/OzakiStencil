@@ -241,7 +241,7 @@ public:
   }
 
   template <typename AccType = value_type>
-  AccType l1_norm() {
+  AccType l1_norm() const {
     AccType norm = static_cast<AccType>(0);
     for (const auto& coeff : coeffs) {
       norm += std::abs(coeff);
