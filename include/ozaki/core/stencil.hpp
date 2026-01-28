@@ -97,7 +97,7 @@ public:
   }
 
   HD constexpr explicit Stencil(std::span<const T> c) : offsets{} {
-    std::memcpy(coeffs.data(), &c, sizeof(T) * size);
+    std::memcpy(coeffs.data(), c.data(), sizeof(T) * size);
     for (size_t i = 0; i < dims; ++i)
       offsets[i] = shape_type{shape}[i] / 2;
   }
