@@ -86,7 +86,7 @@ public:
 
   HD constexpr Stencil() noexcept : coeffs{}, offsets{} {
     for (size_t i = 0; i < dims; ++i)
-      offsets[i] = shape[i] / 2;
+      offsets[i] = shape_type{shape}[i] / 2;
   }
 
   HD constexpr Stencil(const coeffs_type &c, const offset_type &offs) noexcept : coeffs(c), offsets(offs) {}

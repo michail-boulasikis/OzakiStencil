@@ -6,8 +6,7 @@
 #include "gpu_checks.cuh"
 
 #include <concepts>
-#include <cuda_runtime.h>
-#include <device_atomic_functions.h>
+#include <cuda_fp16.h>
 #include <limits>
 #include <type_traits>
 
