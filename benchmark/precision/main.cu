@@ -21,7 +21,7 @@
 namespace po = boost::program_options;
 
 using Real = float;
-using AccumulatorType = float;
+using AccumulatorType = double;
 using RealStencil = ozi::Stencil<Real, 3, 3>;
 using IntStencil = ozi::Stencil<int8_t, 3, 3>;
 

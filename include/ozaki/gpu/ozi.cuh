@@ -6,6 +6,7 @@
 #include "gpu_checks.cuh"
 
 #include <concepts>
+#include <cuda_runtime.h>
 #include <device_atomic_functions.h>
 #include <limits>
 #include <type_traits>
@@ -16,56 +17,37 @@
 
 namespace ozigpu {
 
-using namespace ozi;
-
-#ifdef __CUDACC__
-// for vectorized load store ops
-template <typename T> struct FourValues {
-  T a[4];
+template <std::floating_point T>
+  requires(sizeof(T) > 1)
+struct OzakiFP_Int8 {
+  using data_type = T;
+  using target_type = int8_t;
+  using acc_type = int32_t;
 };
 
-template <OzakiPair O> __host__ __device__ struct alignas(256) OzakiDescriptor {
+template <ozi::OzakiPair O> struct alignas(256) OzakiDescriptor {
   using Data = typename O::data_type;
   using Target = typename O::target_type;
   using Acc = typename O::acc_type;
 
-  int32_t e_max = std::numeric_limits<int32_t>::min(); //< Maximum exponent bit represented by the slices without carry.
-  int32_t e_min = std::numeric_limits<int32_t>::max(); //< Minimum exponent bit represented by the slices without carry.
-  int32_t n_slices_input = 8;                          //< Number of slices of the input.
-  int32_t n_slices_stencil = 1;                        //< Number of slices of the stencil.
+  int32_t e_max = std::numeric_limits<int32_t>::min();
+  int32_t e_min = std::numeric_limits<int32_t>::max();
+  int32_t n_slices_input = 8;
+  int32_t n_slices_stencil = 1;
 
-  int32_t n_shifts = 0;       //< Total number of shifts done during the stencil loop.
-  int32_t shift_required = 0; //< Whether we need to shift the slices to incorporate the carry slice and throw away the
-                              // least significant slice.
-  int32_t just_shifted = 1;   //< Whether a window shift just occurred. Used to conceptually zero the buffer.
-  Target overflow_danger_threshold = std::numeric_limits<Target>::max() /
-                                     2; //< If any |element| of the carry slice is
-                                        // higher than this we risk overflow next iteration.
-                                        // A simple way to guard against overflow - might make it more complex later.
-  int32_t carry_slice_index = 0;        //< The index of the carry slice.
+  int32_t n_shifts = 0;
+  int32_t shift_required = 0;
+  int32_t just_shifted = 1;
+  Target overflow_danger_threshold = std::numeric_limits<Target>::max() / 2;
+  int32_t carry_slice_index = 0;
 };
 
-template <typename To, typename From> __device__ __forceinline__ To bit_cast(const From &src) {
-  static_assert(sizeof(To) == sizeof(From), "Size mismatch in bit_cast");
-  To dst;
-  memcpy(&dst, &src, sizeof(To));
-  return dst;
-}
+namespace detail {
 
-template <OzakiPair O>
-__host__ __device__ typename O::data_type total_integration_scale_factor(typename O::data_type a, int64_t time_steps,
-                                                                         int64_t shifts) {
-  using std::frexp;
-  using std::pow;
-  using std::scalbn;
-  using Data = typename O::data_type;
-  using Target = typename O::target_type;
-
-  int32_t exp;
-  double frac;
-  frac = static_cast<double>(frexp(a, &exp));
-  return static_cast<Data>(scalbn(pow(frac, time_steps), time_steps * exp + (CHAR_BIT * sizeof(Target) - 1) * shifts));
-}
+// Vectorized load/store helper
+template <typename T> struct FourValues {
+  T a[4];
+};
 
 template <size_t Bytes> struct UintByType;
 template <> struct UintByType<2> {
@@ -77,7 +59,6 @@ template <> struct UintByType<4> {
 template <> struct UintByType<8> {
   using type = uint64_t;
 };
-
 template <typename T> using RawInt = typename UintByType<sizeof(T)>::type;
 
 template <typename T> struct FloatTraits;
@@ -93,10 +74,19 @@ template <> struct FloatTraits<double> {
   static constexpr int32_t MantissaBits = 52;
   static constexpr int32_t ExponentBias = 1023;
 };
+#if __CUDA_ARCH__ >= 100
 template <> struct FloatTraits<__float128> {
   static constexpr int32_t MantissaBits = 112;
   static constexpr int32_t ExponentBias = 16383;
 };
+#endif
+
+template <typename To, typename From> __device__ __forceinline__ To bit_cast(const From &src) {
+  static_assert(sizeof(To) == sizeof(From), "Size mismatch in bit_cast");
+  To dst;
+  memcpy(&dst, &src, sizeof(To));
+  return dst;
+}
 
 template <typename T> __device__ __forceinline__ int32_t ffs(T val) {
   if constexpr (sizeof(T) <= 4) {
@@ -139,35 +129,60 @@ template <typename T> __device__ __forceinline__ int32_t dyn_min_lsb(T a, int32_
   return min(current_lsb, bit_exponent);
 }
 
-template <std::integral T> __host__ __device__ __forceinline__ int32_t ozaki_scaling_factor(int32_t *v) {
-  int32_t factor = (CHAR_BIT * sizeof(T) - 1) - *v;
-  *v -= CHAR_BIT * sizeof(T) - 1;
-  return factor;
-}
+} // namespace detail
+} // namespace ozigpu
 
-template <std::floating_point T>
-  requires(sizeof(T) > 1)
-struct OzakiFP_Int8 {
-  using data_type = T;
-  using target_type = int8_t;
-  using acc_type = int32_t;
+namespace ozi {
+template <std::floating_point T> struct OzakiPairTraits<ozigpu::OzakiFP_Int8<T>> {
+  using Data = typename ozigpu::OzakiFP_Int8<T>::data_type;
+  using Target = typename ozigpu::OzakiFP_Int8<T>::target_type;
+  using Acc = typename ozigpu::OzakiFP_Int8<T>::acc_type;
+
+  __device__ __forceinline__ static Target down_cast(Data a, int32_t scale) {
+    if constexpr (std::is_same_v<Data, double>) {
+      double a_scaled = scalbn(a, scale);
+      int32_t temp;
+      asm("cvt.rni.sat.s8.f64 %0, %1;" : "=r"(temp) : "d"(a_scaled));
+      return static_cast<Target>(temp);
+    } else if constexpr (std::is_same_v<Data, float>) {
+      float a_scaled = scalbn(static_cast<float>(a), scale);
+      int32_t temp;
+      asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(temp) : "f"(a_scaled));
+      return static_cast<Target>(temp);
+    } else {
+      static_assert(false, "down_cast not implemented for this type yet.");
+    }
+  }
+
+  __host__ __device__ __forceinline__ static Data up_cast(Target a, int32_t scale) {
+    return OzakiTraits<Data>::scalbn(static_cast<Data>(a), -scale);
+  }
+
+  __host__ __device__ __forceinline__ static Data up_cast_acc(Acc a, int32_t scale, int32_t n_mult) {
+    return OzakiTraits<Data>::scalbn(static_cast<Data>(a), -(n_mult * OzakiTraits<Target>::scaling_factor(scale)));
+  }
+
+  // Stub matmul implementation (not used in stencil code but required by concept)
+  static void matmul(Acc *C, const Target *A, const Target *B, size_t m, size_t n, size_t k) {
+    // Not implemented for stencil operations
+  }
 };
 
-__device__ __forceinline__ int8_t down_cast(double a, int32_t scale) {
-  double a_scaled = scalbn(a, scale);
-  int32_t temp;
-  asm("cvt.rni.sat.s8.f64 %0, %1;" : "=r"(temp) : "d"(a_scaled));
-  return static_cast<int8_t>(temp);
-}
-__device__ __forceinline__ int8_t down_cast(float a, int32_t scale) {
-  float a_scaled = scalbn(a, scale);
-  int32_t temp;
-  asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(temp) : "f"(a_scaled));
-  return static_cast<int8_t>(temp);
-}
+} // namespace ozi
 
-template <std::floating_point T, std::integral U> __device__ __forceinline__ T up_cast(U a, int32_t scale) {
-  return scalbn(static_cast<T>(a), -scale);
+namespace ozigpu {
+using namespace ozi;
+
+template <OzakiPair O>
+__host__ typename O::data_type total_integration_scale_factor(typename O::data_type a, int64_t time_steps,
+                                                              int64_t shifts) {
+  using Data = typename O::data_type;
+  using Target = typename O::target_type;
+
+  int32_t exp;
+  double frac = OzakiTraits<double>::frexp(static_cast<double>(a), &exp);
+  return static_cast<Data>(
+      OzakiTraits<double>::scalbn(pow(frac, time_steps), time_steps * exp + (CHAR_BIT * sizeof(Target) - 1) * shifts));
 }
 
 template <typename T> __global__ void fill(T *__restrict__ in, const T val, size_t n) {
@@ -182,8 +197,7 @@ template <typename T> __global__ void scale(T *__restrict__ in, const double val
     in[tid] = static_cast<T>(static_cast<double>(in[tid]) * val);
 }
 
-/** Finds the dynamic range [pos(MSB), pos(LSB)] of a set of numbers. pos(MSB) - pos(LSB) + 1 gives the number of bits
- * needed to represent the given set of numbers using a fixed point representation without loss of information. */
+/** Finds the dynamic range [pos(MSB), pos(LSB)] of a set of numbers */
 template <OzakiPair O>
 __global__ void dyn_range(OzakiDescriptor<O> *__restrict__ out, const typename O::data_type *__restrict__ in,
                           size_t n) {
@@ -199,20 +213,30 @@ __global__ void dyn_range(OzakiDescriptor<O> *__restrict__ out, const typename O
 
   Data local_max_val = static_cast<Data>(0);
   int32_t local_min_val = std::numeric_limits<int32_t>::max();
+
 #pragma unroll 4
-  while (4 * i < n) { // I assume that n is a multiple of four.
+  while (4 * i < n) {
     const Data *src = in + 4 * i;
-    FourValues<Data> vals = *reinterpret_cast<const FourValues<Data> *>(src);
-    local_max_val = max(max(max(max(abs(vals.a[0]), abs(vals.a[1])), abs(vals.a[2])), abs(vals.a[3])), local_max_val);
-    local_min_val =
-        dyn_min_lsb(vals.a[0], dyn_min_lsb(vals.a[1], dyn_min_lsb(vals.a[2], dyn_min_lsb(vals.a[3], local_min_val))));
+    detail::FourValues<Data> vals = *reinterpret_cast<const detail::FourValues<Data> *>(src);
+
+    Data abs0 = OzakiTraits<Data>::abs(vals.a[0]);
+    Data abs1 = OzakiTraits<Data>::abs(vals.a[1]);
+    Data abs2 = OzakiTraits<Data>::abs(vals.a[2]);
+    Data abs3 = OzakiTraits<Data>::abs(vals.a[3]);
+
+    local_max_val = OzakiTraits<Data>::max(
+        OzakiTraits<Data>::max(OzakiTraits<Data>::max(OzakiTraits<Data>::max(abs0, abs1), abs2), abs3), local_max_val);
+
+    local_min_val = detail::dyn_min_lsb(
+        vals.a[0],
+        detail::dyn_min_lsb(vals.a[1], detail::dyn_min_lsb(vals.a[2], detail::dyn_min_lsb(vals.a[3], local_min_val))));
     i += GRID_SIZE;
   }
 
   constexpr uint32_t FULL_MASK = 0xFFFF'FFFF;
 #pragma unroll
   for (int32_t offset = 16; offset > 0; offset /= 2) {
-    local_max_val = max(local_max_val, __shfl_down_sync(FULL_MASK, local_max_val, offset));
+    local_max_val = OzakiTraits<Data>::max(local_max_val, __shfl_down_sync(FULL_MASK, local_max_val, offset));
     local_min_val = min(local_min_val, __shfl_down_sync(FULL_MASK, local_min_val, offset));
   }
 
@@ -231,7 +255,7 @@ __global__ void dyn_range(OzakiDescriptor<O> *__restrict__ out, const typename O
     local_min_val = smem_min[LANE_ID];
 #pragma unroll
     for (uint32_t offset = WARPS_PER_BLOCK / 2; offset > 0; offset /= 2) {
-      local_max_val = max(local_max_val, __shfl_down_sync(mask, local_max_val, offset));
+      local_max_val = OzakiTraits<Data>::max(local_max_val, __shfl_down_sync(mask, local_max_val, offset));
       local_min_val = min(local_min_val, __shfl_down_sync(mask, local_min_val, offset));
     }
     if (LANE_ID == 0) {
@@ -242,48 +266,48 @@ __global__ void dyn_range(OzakiDescriptor<O> *__restrict__ out, const typename O
   }
 }
 
-/** Computes the Ozaki decomposition of a set of numbers and stores it in *out. The carry slice, which is assumed to be
- * at exactly &out, gets assigned zeroes. */
+/** Computes the Ozaki decomposition of a set of numbers and stores it in *out */
 template <OzakiPair O>
 __global__ void slice(typename O::target_type *__restrict__ out, const typename O::data_type *__restrict__ in,
                       OzakiDescriptor<O> *__restrict__ desc, const size_t n) {
   using Data = typename O::data_type;
   using Target = typename O::target_type;
+
   const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
   if (tid >= n / 4)
     return;
 
   int32_t emax = desc->e_max;
   int32_t total_slices = desc->n_slices_input;
-  // We interpret a zero as a request to dynamically determine the amount of slices
-  // Everything that follows assumes that adequate amount of space was allocated.
+
   if (desc->n_slices_input == 0) {
     total_slices = 2 + (desc->e_max - desc->e_min) / (CHAR_BIT * sizeof(Target) - 1);
     if (tid == 0)
       desc->n_slices_input = total_slices;
   }
 
-  FourValues<Data> ins = reinterpret_cast<const FourValues<Data> *>(in)[tid];
-  FourValues<Target> outs{{0, 0, 0, 0}};
+  detail::FourValues<Data> ins = reinterpret_cast<const detail::FourValues<Data> *>(in)[tid];
+  detail::FourValues<Target> outs{{0, 0, 0, 0}};
 
 #pragma unroll 2
   for (int32_t s = 0; s < total_slices; ++s) {
     const size_t flat_offset = static_cast<size_t>(s) * (n / 4) + static_cast<size_t>(tid);
-    if (s != 0) { // s == 0 is carry slice in the beginning, all zeros no need to compute
-      int32_t shift_amount = ozaki_scaling_factor<Target>(&emax);
+    if (s != 0) {
+      int32_t shift_amount = OzakiTraits<Target>::scaling_factor(emax);
+      emax = OzakiTraits<Target>::slice_step(emax);
+
 #pragma unroll
       for (int32_t v = 0; v < 4; ++v) {
-        const Target v_converted = down_cast(ins.a[v], shift_amount);
-        ins.a[v] -= up_cast<Data, Target>(v_converted, shift_amount);
+        const Target v_converted = OzakiPairTraits<O>::down_cast(ins.a[v], shift_amount);
+        ins.a[v] -= OzakiPairTraits<O>::up_cast(v_converted, shift_amount);
         outs.a[v] = v_converted;
       }
     }
-    reinterpret_cast<FourValues<Target> *>(out)[flat_offset] = outs;
+    reinterpret_cast<detail::FourValues<Target> *>(out)[flat_offset] = outs;
   }
 }
 
-/** Reconstructs (mends) the slices of an Ozaki decomposition of numbers to the original values.
- * The exponents are not assumed to be monotonic, but shuffled due to integrating, so the indices are computed. */
+/** Reconstructs (mends) the slices of an Ozaki decomposition */
 template <OzakiPair O, typename OutputType = typename O::data_type>
 __global__ void mend(OutputType *__restrict__ out, const typename O::target_type *__restrict__ in,
                      OzakiDescriptor<O> *__restrict__ desc, const size_t n) {
@@ -295,39 +319,32 @@ __global__ void mend(OutputType *__restrict__ out, const typename O::target_type
     return;
 
   int32_t n_shifts = desc->n_shifts;
-  int32_t global_max_exp = desc->e_max + (/*n_shifts +*/ 1) * (CHAR_BIT * sizeof(Target) - 1);
+  int32_t global_max_exp = desc->e_max + 1 * (CHAR_BIT * sizeof(Target) - 1);
   int32_t total_slices = desc->n_slices_input;
   int32_t carry_idx = desc->carry_slice_index;
 
   constexpr int32_t SLICE_BITS = CHAR_BIT * sizeof(Target) - 1;
 
-  FourValues<OutputType> outs{{0, 0, 0, 0}};
-  FourValues<Target> ins{};
+  detail::FourValues<OutputType> outs{{0, 0, 0, 0}};
+  detail::FourValues<Target> ins{};
 
   for (int32_t logic_s = total_slices - 1; logic_s >= 0; --logic_s) {
-
-    // Calculate exponent for this specific slice manually
-    // Original logic: factor = bits - current_v; current_v -= bits;
-    // So current_v for slice 's' is: global_max_exp - s * SLICE_BITS
     int32_t current_slice_exp = global_max_exp - (logic_s * SLICE_BITS);
-
-    // The scaling factor required by up_cast/scalbn
     int32_t shift_amount = SLICE_BITS - current_slice_exp;
 
-    // Map to physical slice
     const int32_t physical_slice = (carry_idx + logic_s) % total_slices;
     const size_t flat_offset = physical_slice * (n / 4) + static_cast<size_t>(tid);
-    ins = reinterpret_cast<const FourValues<Target> *>(in)[flat_offset];
+    ins = reinterpret_cast<const detail::FourValues<Target> *>(in)[flat_offset];
 
+#pragma unroll
     for (int32_t v = 0; v < 4; ++v) {
-      outs.a[v] += static_cast<OutputType>(up_cast<Data, Target>(ins.a[v], shift_amount));
+      outs.a[v] += static_cast<OutputType>(OzakiPairTraits<O>::up_cast(ins.a[v], shift_amount));
     }
   }
-  reinterpret_cast<FourValues<OutputType> *>(out)[tid] = outs;
+  reinterpret_cast<detail::FourValues<OutputType> *>(out)[tid] = outs;
 }
-/** Computes S @ u, where u is the ozaki decomposition of a tensor, and S is a stencil. Boundaries are excluded in the
- * calculation. Also detects whether an overflow is possible on the carry slice and signals a slice shift if this is the
- * case. */
+
+/** Computes S @ u, where u is the ozaki decomposition of a tensor, and S is a stencil */
 template <OzakiPair O, size_t... Dims>
   requires(sizeof...(Dims) <= 3) && std::is_integral_v<typename O::target_type>
 __global__ void stencil_v1(typename O::target_type *__restrict__ out, const typename O::target_type *__restrict__ in,
@@ -336,14 +353,11 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
                            OzakiDescriptor<O> *__restrict__ desc) {
   using Data = typename O::data_type;
   using Target = typename O::target_type;
-  using UTarget = std::make_unsigned_t<Target>;
   using Acc = typename O::acc_type;
 
-  // loads from the descriptor.
   const int32_t total_slices = desc->n_slices_input;
   const int32_t carry_idx = desc->carry_slice_index;
   const Target threshold = desc->overflow_danger_threshold;
-  // used for the reduction.
   __shared__ int32_t smem[32];
 
   int32_t i, j, k;
@@ -354,18 +368,17 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
     k = threadIdx.z + blockDim.z * blockIdx.z;
   int32_t tid = threadIdx.x + threadIdx.y * blockDim.x + threadIdx.z * blockDim.x * blockDim.y;
 
-  // zero smem
   if (tid < 32) {
     smem[tid] = 0;
   }
   __syncthreads();
 
-  // Bounds check
   bool in_bounds = true;
   const auto &s_shape = s.get_shape();
   auto check_dim = [&] __device__(int32_t idx, size_t dim_idx) {
     return (idx >= s.offsets[dim_idx] && idx <= input_shape[dim_idx] - (s_shape[dim_idx] - s.offsets[dim_idx]));
   };
+
   if constexpr (sizeof...(Dims) == 1) {
     in_bounds = in_bounds && check_dim(i, 0);
   } else if constexpr (sizeof...(Dims) == 2) {
@@ -383,12 +396,11 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
   if constexpr (sizeof...(Dims) > 2)
     valid_thread &= (k < input_shape[2]);
 
-  // computing constants used for indexing.
   size_t slice_stride = 1;
   for (auto d : input_shape) {
     slice_stride *= d;
   }
-  // This represents the integer growth factor per step
+
   Acc stencil_gain = 0;
   for (const auto &c : s.coeffs) {
     stencil_gain += abs(static_cast<Acc>(c));
@@ -397,9 +409,6 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
 
   Acc local_val = static_cast<Acc>(0);
 
-  // process all slices (Logical N-1 down to 0)
-  // logical N-1 = least significant slice (LSS)
-  // logical 0 = carry slice (Holds MSBs, must be stenciled)
   if (valid_thread) {
     size_t out_offset = 0;
     if constexpr (sizeof...(Dims) == 1)
@@ -409,7 +418,7 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
     else if constexpr (sizeof...(Dims) == 3)
       out_offset = i + j * input_shape[1] + k * input_shape[0] * input_shape[1];
 
-#pragma unroll
+#pragma unroll 4
     for (int32_t logic_s = total_slices - 1; logic_s >= 0; --logic_s) {
       int32_t phys_idx = (carry_idx + logic_s) % total_slices;
       const Target *current_slice_input = in + slice_stride * phys_idx;
@@ -442,16 +451,15 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
       }
     }
   }
-  // check whether the carry slice risks overflow (block reduction on boolean)
+
   int32_t dangerous = __any_sync(__activemask(), (abs(local_val) > static_cast<Acc>(threshold)));
-  if (tid % WARP_SIZE == 0) // lane 0 writes result
+  if (tid % WARP_SIZE == 0)
     smem[tid / WARP_SIZE] = dangerous;
-  __syncthreads(); // wait for shared memory update
-  // First warp does the final reduction and write
+  __syncthreads();
+
   if (tid < 32) {
     int32_t flag = smem[tid];
     flag = __any_sync(__activemask(), flag);
-    // elect a leader thread to write on the flag
     if (flag && (__ffs(__activemask()) - 1 == tid)) {
       atomicExch(&desc->shift_required, 1);
     }
@@ -461,25 +469,17 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
 /** State update kernel for integration */
 template <OzakiPair O> __global__ void update_ozaki_desc(OzakiDescriptor<O> *__restrict__ desc) {
   if (threadIdx.x == 0) {
-    // see whether a shift is required by previous stencil step
     int32_t perform_shift = desc->shift_required;
     if (perform_shift) {
-      // 1. update the carry index (backwards shift logic, LSS becomes new carry)
       int32_t total = desc->n_slices_input;
       desc->carry_slice_index = (desc->carry_slice_index + total - 1) % total;
-      // 2. track number of shifts for final mending.
       desc->n_shifts += 1;
-      // 3. clear the required shift
       desc->shift_required = 0;
     }
-    // 4. set the flag for the UPCOMING stencil step
-    // If we shifted, the next stencil invokation must treat the new carry slice as 0.
-    // If we didn't, it proceeds as normal.
     desc->just_shifted = perform_shift;
   }
 }
 
-#endif
 } // namespace ozigpu
 
 #endif // HEADER_OZI_CUH

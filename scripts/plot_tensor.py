@@ -138,7 +138,7 @@ def main():
         return
 
     print(f"Target: {target_file}")
-    target_tensor = load_tensor(target_file)
+    target_tensor = load_tensor(target_file, dtype=np.float32)
     if target_tensor is None:
         return
 

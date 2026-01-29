@@ -126,7 +126,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.plot:
-        tensor = load_tensor(args.file)
+        tensor = load_tensor(args.file, get_dtype_map()[args.type])
         if args.halo_avg:
             print("WARNING: Halo averaging mode ignored when in plot mode.")
         if tensor is not None:

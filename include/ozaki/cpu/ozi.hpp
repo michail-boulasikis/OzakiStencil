@@ -14,27 +14,8 @@
 #include <type_traits>
 #include <vector>
 
+
 namespace ozicpu {
-using namespace ozi;
-
-// generic unimplemented template which is specialized
-template <typename T> int32_t ozaki_scaling_factor(int32_t x) {
-  static_assert(false, "`ozaki_scaling_factor` is not implemented for this data type.");
-  return -1;
-}
-template <OzakiPair O> struct OzakiSlices {
-  // store all slices contiguously
-  std::vector<typename O::target_type> values;
-  std::vector<int32_t> exponents;
-  size_t width;
-
-  // helper to view a specific slice row without copying
-  std::span<const typename O::target_type> get_slice(size_t index) const {
-    return {values.data() + (index * width), width};
-  }
-};
-
-// Supported ozaki schemes
 template <std::floating_point T>
   requires(sizeof(T) > 1)
 struct OzakiFP_Int8 {
@@ -42,53 +23,65 @@ struct OzakiFP_Int8 {
   using target_type = int8_t;
   using acc_type = int32_t;
 };
+} // namespace ozicpu
 
-void matmul(int32_t *__restrict C, const int8_t *__restrict A, const int8_t *__restrict B, size_t m, size_t n,
-            size_t k);
+namespace ozi {
 
-template <typename T>
-  requires std::is_integral_v<T>
-inline int32_t ozaki_scaling_factor(int32_t v) {
-  return (CHAR_BIT * sizeof(T) - 1) - v;
-}
+template <std::floating_point T>
+struct OzakiPairTraits<ozicpu::OzakiFP_Int8<T>> {
+  using Data = typename ozicpu::OzakiFP_Int8<T>::data_type;
+  using Target = typename ozicpu::OzakiFP_Int8<T>::target_type;
+  using Acc = typename ozicpu::OzakiFP_Int8<T>::acc_type;
 
-template <OzakiData T, OzakiTarget U>
-  requires std::is_floating_point_v<T> && std::is_integral_v<U>
-inline U down_cast(T a, int32_t scale) {
-  using std::llround;
-  using std::scalbn;
-  constexpr auto LO = static_cast<int64_t>(std::numeric_limits<U>::min() + 1);
-  constexpr auto HI = static_cast<int64_t>(std::numeric_limits<U>::max());
-  auto r = llround(scalbn(a, ozaki_scaling_factor<U>(scale)));
-  if (r < LO)
-    r = LO;
-  if (r > HI)
-    r = HI;
-  return static_cast<U>(r);
-}
+  static inline Target down_cast(Data a, int32_t scale) {
+    constexpr auto LO = static_cast<int64_t>(std::numeric_limits<Target>::min() + 1);
+    constexpr auto HI = static_cast<int64_t>(std::numeric_limits<Target>::max());
+    auto r = llround(OzakiTraits<Data>::scalbn(a, OzakiTraits<Target>::scaling_factor(scale)));
+    if (r < LO)
+      r = LO;
+    if (r > HI)
+      r = HI;
+    return static_cast<Target>(r);
+  }
 
-template <OzakiData T, OzakiTarget U>
-  requires std::is_floating_point_v<T> && std::is_integral_v<U>
-inline T up_cast(U a, int32_t scale) {
-  using std::scalbn;
-  return scalbn(static_cast<T>(a), -ozaki_scaling_factor<U>(scale));
-}
+  static inline Data up_cast(Target a, int32_t scale) {
+    return OzakiTraits<Data>::scalbn(static_cast<Data>(a), -OzakiTraits<Target>::scaling_factor(scale));
+  }
 
-template <std::floating_point T, std::integral U, std::integral A>
-inline T up_cast_acc(A a, int32_t scale, int32_t n_mul) {
-  using std::scalbn;
-  return scalbn(static_cast<T>(a), -(n_mul * (CHAR_BIT * sizeof(U) - 1) - scale));
-}
+  static inline Data up_cast_acc(Acc a, int32_t scale, int32_t n_mult) {
+    return OzakiTraits<Data>::scalbn(static_cast<Data>(a), -(n_mult * (CHAR_BIT * sizeof(Target) - 1) - scale));
+  }
 
-// generic ozaki scheme routines
+  static void matmul(Acc *__restrict C, const Target *__restrict A, const Target *__restrict B, size_t m, size_t n, size_t k) {
+    for (size_t mm = 0; mm < m; ++mm) {
+      for (size_t nn = 0; nn < n; ++nn) {
+        Acc res = 0;
+        for (size_t kk = 0; kk < k; ++kk) {
+          res += static_cast<Acc>(A[mm + m * kk]) * static_cast<Acc>(B[kk + nn * k]);
+        }
+        C[mm + m * nn] = res;
+      }
+    }
+  }
+};
+} // namespace ozi
+
+namespace ozicpu {
+using namespace ozi;
+
+template <OzakiPair O> struct OzakiSlices {
+  std::vector<typename O::target_type> values;
+  std::vector<int32_t> exponents;
+  size_t width;
+
+  std::span<const typename O::target_type> get_slice(size_t index) const {
+    return {values.data() + (index * width), width};
+  }
+};
 
 template <OzakiPair O> OzakiSlices<O> slice(std::span<const typename O::data_type> data, size_t max_slices = 0) {
   using Data = typename O::data_type;
   using Target = typename O::target_type;
-  using std::abs;
-  using std::frexp;
-  using std::isfinite;
-  using std::max;
 
   size_t n = data.size();
   OzakiSlices<O> result;
@@ -108,15 +101,15 @@ template <OzakiPair O> OzakiSlices<O> slice(std::span<const typename O::data_typ
 
     Data abs_max = static_cast<Data>(0);
     for (const auto &val : residual)
-      abs_max = max(abs(val), abs_max);
+      abs_max = OzakiTraits<Data>::max(OzakiTraits<Data>::abs(val), abs_max);
 
-    if (!isfinite(abs_max))
+    if (!OzakiTraits<Data>::isfinite(abs_max))
       throw std::runtime_error("Ozaki scheme diverged: infinity detected.");
     if (abs_max == static_cast<Data>(0))
       break;
 
     int32_t exp;
-    frexp(abs_max, &exp);
+    OzakiTraits<Data>::frexp(abs_max, &exp);
     result.exponents.push_back(exp);
 
     size_t start_offset = result.values.size();
@@ -126,8 +119,8 @@ template <OzakiPair O> OzakiSlices<O> slice(std::span<const typename O::data_typ
     Data *residual_ptr = residual.data();
 
     for (size_t j = 0; j < n; ++j) {
-      current_slice_ptr[j] = down_cast<Data, Target>(residual_ptr[j], exp);
-      residual_ptr[j] -= up_cast<Data, Target>(current_slice_ptr[j], exp);
+      current_slice_ptr[j] = OzakiPairTraits<O>::down_cast(residual_ptr[j], exp);
+      residual_ptr[j] -= OzakiPairTraits<O>::up_cast(current_slice_ptr[j], exp);
     }
 
     current_slice_idx++;
@@ -154,7 +147,7 @@ template <OzakiPair O> void mend(std::span<typename O::data_type> out, const Oza
     const int32_t scale = slices.exponents[i];
 
     for (size_t j = 0; j < n; ++j) {
-      out[j] += up_cast<Data, Target>(sptr[j], scale);
+      out[j] += OzakiPairTraits<O>::up_cast(sptr[j], scale);
     }
   }
 }
@@ -178,11 +171,11 @@ void mul(std::span<typename O::data_type> out, const OzakiSlices<O> &a, const Oz
   for (size_t sA = 0; sA < a.exponents.size(); ++sA)
     for (size_t sB = 0; sB < b.exponents.size(); ++sB) {
       if (sA + sB + 1 <= max_slices) {
-        matmul(temp.data(), a.get_slice(sA).data(), b.get_slice(sB).data(), m, n, k);
+        OzakiPairTraits<O>::matmul(temp.data(), a.get_slice(sA).data(), b.get_slice(sB).data(), m, n, k);
         for (size_t i = 0; i < m; ++i)
           for (size_t j = 0; j < n; ++j)
             out[i + j * m] +=
-                up_cast_acc<Data, Target, Accumulator>(temp[i + j * m], a.exponents[sA] + b.exponents[sB], 2);
+                OzakiPairTraits<O>::up_cast_acc(temp[i + j * m], a.exponents[sA] + b.exponents[sB], 2);
       }
     }
 }
@@ -230,7 +223,7 @@ void stencil(std::span<T> out, const ozi::Stencil<T, Dims...> &s, std::span<cons
       int32_t scale = input_slices.exponents[sI] + stencil_slices.exponents[sS];
 
       for (size_t i = 0; i < domain_size; ++i) {
-        out[i] += up_cast_acc<Data, Target, Acc>(temp_acc[i], scale, 2);
+        out[i] += OzakiPairTraits<Traits>::up_cast_acc(temp_acc[i], scale, 2);
       }
     }
   }
