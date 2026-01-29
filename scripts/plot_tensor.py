@@ -138,7 +138,7 @@ def main():
         return
 
     print(f"Target: {target_file}")
-    target_tensor = load_tensor(target_file, dtype=np.float32)
+    target_tensor = load_tensor(target_file)
     if target_tensor is None:
         return
 
@@ -149,7 +149,7 @@ def main():
     )
 
     for ref_data in REFERENCES:
-        ref_tensor = load_tensor(ref_data["name"], ref_data["dtype"])
+        ref_tensor = load_tensor(ref_data["name"])
         if ref_tensor is not None:
             ref_name = os.path.basename(ref_data["name"])
 

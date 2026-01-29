@@ -22,17 +22,48 @@ def get_dtype_map():
     return dtypes
 
 
-def load_tensor(filepath, dtype=np.float64):
-    """Reads a binary tensor file."""
+def get_type_id_from_dtype(dtype):
+    """Maps numpy dtype to type ID (0=float, 1=double, 2=long double, 3=__float128)."""
+    dtype_map = get_dtype_map()
+    if dtype == dtype_map["float32"]:
+        return 0
+    elif dtype == dtype_map["float64"]:
+        return 1
+    elif dtype == dtype_map["float128"]:
+        return 2
+    else:
+        raise ValueError(f"Unsupported dtype: {dtype}")
+
+
+def load_tensor(filepath):
+    """Reads a binary tensor file and infers type from file."""
     if not os.path.exists(filepath):
         print(f"File not found: {filepath}")
         return None
+
+    dtype_map = get_dtype_map()
+    type_id_map = {
+        0: dtype_map["float32"],
+        1: dtype_map["float64"],
+        2: dtype_map["float128"],
+        3: dtype_map["float128"],
+    }
 
     with open(filepath, "rb") as f:
         n_dims_bytes = f.read(8)
         if not n_dims_bytes:
             return None
         n_dims = struct.unpack("Q", n_dims_bytes)[0]
+
+        type_id_bytes = f.read(8)
+        type_id = struct.unpack("Q", type_id_bytes)[0]
+
+        if type_id not in type_id_map:
+            print(f"Error: Unknown type ID {type_id} in {filepath}")
+            return None
+
+        dtype = type_id_map[type_id]
+
         dims_bytes = f.read(8 * n_dims)
         dims = struct.unpack("Q" * n_dims, dims_bytes)
         data_bytes = f.read()
@@ -78,6 +109,7 @@ def generate_data(n, n_peaks, dtype_name, halo_avg, output_path):
         sys.exit(1)
 
     target_dtype = dtype_map[dtype_name]
+    type_id = get_type_id_from_dtype(target_dtype)
     print(f"Generating data strictly in: {target_dtype}")
 
     dim = np.linspace(0, 1, n).astype(target_dtype)
@@ -99,7 +131,7 @@ def generate_data(n, n_peaks, dtype_name, halo_avg, output_path):
         output[:, 0] = avg
         output[:, -1] = avg
 
-    header = struct.pack(f"<{'Q' * (1 + len(output.shape))}", 2, n, n)
+    header = struct.pack(f"<{'Q' * (2 + len(output.shape))}", 2, type_id, n, n)
     with open(output_path, "wb") as outf:
         outf.write(header)
         output.tofile(outf)
@@ -126,7 +158,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.plot:
-        tensor = load_tensor(args.file, get_dtype_map()[args.type])
+        tensor = load_tensor(args.file)
         if args.halo_avg:
             print("WARNING: Halo averaging mode ignored when in plot mode.")
         if tensor is not None:

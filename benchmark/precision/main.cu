@@ -16,11 +16,12 @@
 #include <ozaki/core/stencil.hpp>
 #include <ozaki/cpu/ozi.hpp>
 #include <ozaki/gpu/ozi.cuh>
+#include <ozaki/utils/tensor.hpp>
 
 #include <boost/program_options.hpp>
 namespace po = boost::program_options;
 
-using Real = float;
+using Real = double;
 using AccumulatorType = double;
 using RealStencil = ozi::Stencil<Real, 3, 3>;
 using IntStencil = ozi::Stencil<int8_t, 3, 3>;
@@ -55,15 +56,6 @@ void invalidate_caches() {
   NVTX_POP();
 }
 
-template <typename T> struct Tensor {
-  std::vector<size_t> shape;
-  std::vector<T> data;
-
-  size_t size() const { return data.size(); }
-  size_t width() const { return shape.empty() ? 0 : shape[0]; }
-  size_t height() const { return shape.size() > 1 ? shape[1] : 1; }
-};
-
 template <typename T_Test, typename T_Ref>
 long double calculate_rmse(const std::vector<T_Test> &test, const std::vector<T_Ref> &ref) {
   if (test.size() != ref.size()) {
@@ -75,40 +67,6 @@ long double calculate_rmse(const std::vector<T_Test> &test, const std::vector<T_
     err += diff * diff;
   }
   return std::sqrt(err / static_cast<long double>(test.size()));
-}
-
-template <typename T> Tensor<T> read_tensor(const std::string &filepath) {
-  std::ifstream f(filepath, std::ios::in | std::ios::binary);
-  if (!f.is_open()) {
-    throw std::runtime_error(std::format("Could not open file at {}.", filepath));
-  }
-
-  size_t n_dims;
-  f.read(reinterpret_cast<char *>(&n_dims), sizeof(size_t));
-
-  std::vector<size_t> shape(n_dims);
-  f.read(reinterpret_cast<char *>(shape.data()), n_dims * sizeof(size_t));
-
-  size_t n_elems = 1;
-  for (const auto &dim : shape)
-    n_elems *= dim;
-
-  std::vector<T> data(n_elems);
-  f.read(reinterpret_cast<char *>(data.data()), n_elems * sizeof(T));
-
-  return {shape, data};
-}
-
-template <typename T> void write_tensor(const std::string &filepath, const Tensor<T> &tensor) {
-  std::ofstream f(filepath, std::ios::out | std::ios::binary);
-  if (!f.is_open()) {
-    throw std::runtime_error(std::format("Could not open file at {}.", filepath));
-  }
-
-  size_t n_dims = tensor.shape.size();
-  f.write(reinterpret_cast<const char *>(&n_dims), sizeof(size_t));
-  f.write(reinterpret_cast<const char *>(tensor.shape.data()), n_dims * sizeof(size_t));
-  f.write(reinterpret_cast<const char *>(tensor.data.data()), tensor.size() * sizeof(T));
 }
 
 std::tuple<RealStencil, IntStencil, Real> create_stencils(const std::vector<int> &args) {
