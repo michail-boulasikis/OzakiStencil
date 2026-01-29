@@ -93,54 +93,6 @@ std::tuple<RealStencil, IntStencil, Real> create_stencils(const std::vector<int>
   return {heat, heat_ozaki, scaling_factor};
 }
 
-struct RangeAnalyzer {
-  static void analyze(const Tensor<Real> &input, const RealStencil &stencil, const int32_t iterations,
-                      std::ofstream &outf) {
-    NVTX_PUSH("Range Analysis");
-    outf << "Time,Max_Exp,Min_Exp\n";
-
-    ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>> *d_desc = nullptr;
-    ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>> h_desc; // Host copy for reading back results
-    Real *d_data = nullptr;
-    size_t n_elems = input.size();
-
-    CUDA_CHECK(cudaMalloc(&d_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>)));
-    CUDA_CHECK(cudaMalloc(&d_data, n_elems * sizeof(Real)));
-
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-    const int32_t nThreads = Config::RDC_THREADS;
-    const int32_t nBlocks = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / Config::RDC_THREADS;
-
-    std::vector<Real> u_curr = input.data;
-    std::vector<Real> u_next = u_curr;
-
-    for (int32_t t = 0; t <= iterations; ++t) {
-      CUDA_CHECK(cudaMemcpy(d_data, u_curr.data(), n_elems * sizeof(Real), cudaMemcpyHostToDevice));
-
-      h_desc = ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>();
-      CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>),
-                            cudaMemcpyHostToDevice));
-
-      ozigpu::dyn_range<<<nBlocks, nThreads>>>(d_desc, d_data, n_elems);
-      CUDA_CHECK(cudaGetLastError());
-
-      CUDA_CHECK(cudaMemcpy(&h_desc, d_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>),
-                            cudaMemcpyDeviceToHost));
-
-      outf << std::format("{},{},{}\n", t, h_desc.e_max, h_desc.e_min);
-      if (t < iterations) {
-        stencil.template apply_to<Real>(u_curr, u_next, {input.width(), input.height()});
-        std::swap(u_curr, u_next);
-      }
-    }
-
-    cudaFree(d_desc);
-    cudaFree(d_data);
-    NVTX_POP();
-  }
-};
-
 struct ReferenceSolver {
   template <typename ComputeType>
   static std::vector<ComputeType> compute(const Tensor<Real> &input, const ozi::Stencil<Real, 3, 3> &stencil_def,
@@ -365,7 +317,6 @@ int main(int argc, char *argv[]) {
     ("help,h", "Produce help message")
     ("dir,d", po::value<std::string>(&output_dir)->default_value("./data/"), "Directory where output files will be created")
     ("prefix,p", po::value<std::string>(&output_prefix), "Output file prefix")
-    ("analysis,A", po::bool_switch(&run_analysis)->default_value(false), "Run dynamic range analysis")
     ("iters,N", po::value<int32_t>(&n_iters)->default_value(Config::STENCIL_ITERS_DEFAULT), "Number of stencil loop iterations")
     ("input,i", po::value<std::string>(&input_file)->required(), "Path to input file")
     ("stencil,S", po::value<std::vector<int32_t>>(&stencil_args)->multitoken(), "List of int8_t coefficients (e.g. -S 32 -56 ...)");
@@ -395,12 +346,6 @@ int main(int argc, char *argv[]) {
 
     auto [heat, heat_ozaki, scaling_factor] = create_stencils(stencil_args);
     NVTX_POP();
-
-    if (run_analysis) {
-      std::ofstream analysisf{std::format("{}{}_dyn.csv", output_dir, output_prefix), std::ios::out};
-      RangeAnalyzer::analyze(input, heat, n_iters, analysisf);
-      std::cout << "Analysis complete.\n";
-    }
 
     std::cout << "Running solvers...\n";
     std::ofstream errf{std::format("{}{}_err.csv", output_dir, output_prefix), std::ios::out};
