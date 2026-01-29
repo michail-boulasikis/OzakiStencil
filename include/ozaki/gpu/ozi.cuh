@@ -259,7 +259,7 @@ __global__ void dyn_range(OzakiDescriptor<O> *__restrict__ out, const typename O
       local_min_val = min(local_min_val, __shfl_down_sync(mask, local_min_val, offset));
     }
     if (LANE_ID == 0) {
-      int32_t block_partial_result = static_cast<int32_t>(floor(log2(local_max_val))) + 1;
+      int32_t block_partial_result = static_cast<int32_t>(ceil(log2(local_max_val)));
       atomicMax(&out->e_max, block_partial_result);
       atomicMin(&out->e_min, local_min_val);
     }

@@ -196,7 +196,7 @@ TYPED_TEST(OzakiTestGPU, ScaleExtraction) {
 
   int32_t hexp_real_max = std::numeric_limits<int32_t>::min();
   for (size_t i = 0; i < this->N; ++i) {
-    if (const int32_t e = static_cast<int32_t>(std::floor(std::log2(std::abs(this->h_data[i])))) + 1; e > hexp_real_max)
+    if (const int32_t e = static_cast<int32_t>(std::ceil(std::log2(std::abs(this->h_data[i])))); e > hexp_real_max)
       hexp_real_max = e;
   }
 
