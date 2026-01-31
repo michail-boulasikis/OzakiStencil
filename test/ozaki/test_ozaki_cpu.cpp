@@ -9,6 +9,7 @@
 #include <map>
 #include <random>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 namespace test_data {
@@ -41,7 +42,11 @@ template <typename T, typename InputContainer, size_t... Dims>
 std::vector<T> compute_gold_standard(const ozi::Stencil<T, Dims...> &stencil, const InputContainer &input,
                                      const std::array<size_t, sizeof...(Dims)> &shape) {
 
+#ifdef __GNUC__
+  using HighPrec = __float128;
+#else
   using HighPrec = long double;
+#endif
   ozi::Stencil<HighPrec, Dims...> s_high;
 
   s_high.offsets = stencil.offsets;
@@ -85,9 +90,13 @@ protected:
   }
 };
 
-using TestTypes = ::testing::Types<float, double>;
-TYPED_TEST_SUITE(OzakiTestCPU, TestTypes);
+#ifdef __GNUC__
+using TestTypes = ::testing::Types<float, double, long double, __float128>;
+#else
+using TestTypes = ::testing::Types<float, double, long double>
+#endif
 
+TYPED_TEST_SUITE(OzakiTestCPU, TestTypes);
 TYPED_TEST(OzakiTestCPU, SliceAndMendNormal) {
   using Scalar = TypeParam;
   auto tcase = this->generate_random(test_data::N);
@@ -284,22 +293,26 @@ TYPED_TEST(OzakiTestCPU, MatMulRectangular) {
 TYPED_TEST(OzakiTestCPU, StabilityCancellation) {
   using Scalar = TypeParam;
 
-  ozi::Stencil<Scalar, 3> sum_stencil({static_cast<Scalar>(1.0), static_cast<Scalar>(1.0), static_cast<Scalar>(1.0)});
+  if constexpr (std::is_same_v<Scalar, double>) { // test only valid when using double precision
+    ozi::Stencil<Scalar, 3> sum_stencil({static_cast<Scalar>(1.0), static_cast<Scalar>(1.0), static_cast<Scalar>(1.0)});
 
-  // Naive Math: (1e16 + 1.0) - 1e16  ->  1e16 - 1e16 -> 0.0 (The 1.0 is lost)
-  // Exact Math: 1e16 + 1.0 - 1e16 -> 1.0
-  Scalar huge = static_cast<Scalar>(1e16);
-  std::vector<Scalar> input = {huge, static_cast<Scalar>(1.0), -huge};
-  std::vector<Scalar> result_ozaki(3);
-  std::vector<Scalar> result_naive(3);
+    // Naive Math: (1e16 + 1.0) - 1e16  ->  1e16 - 1e16 -> 0.0 (The 1.0 is lost)
+    // Exact Math: 1e16 + 1.0 - 1e16 -> 1.0
+    Scalar huge = static_cast<Scalar>(1e16);
+    std::vector<Scalar> input = {huge, static_cast<Scalar>(1.0), -huge};
+    std::vector<Scalar> result_ozaki(3);
+    std::vector<Scalar> result_naive(3);
 
-  ozicpu::stencil<Scalar, 3>(result_ozaki, sum_stencil, input, {3});
-  sum_stencil.template apply_to<Scalar, std::vector<Scalar>, std::vector<Scalar>>(result_naive, input, {3});
+    ozicpu::stencil<Scalar, 3>(result_ozaki, sum_stencil, input, {3});
+    sum_stencil.template apply_to<Scalar, std::vector<Scalar>, std::vector<Scalar>>(result_naive, input, {3});
 
-  Scalar expected = static_cast<Scalar>(1.0);
-  ASSERT_NEAR(result_ozaki[1], expected, 1e-5) << "Ozaki failed to handle cancellation. Got " << result_ozaki[1];
-  EXPECT_NE(result_naive[1], expected)
+    Scalar expected = static_cast<Scalar>(1.0);
+    ASSERT_NEAR(result_ozaki[1], expected, 1e-5) << "Ozaki failed to handle cancellation.";
+    EXPECT_NE(result_naive[1], expected)
       << "Warning: Naive implementation accidentally got the right answer (likely due to FMA or compiler opts).";
+    } else {
+      GTEST_SKIP();
+    }
 }
 
 TYPED_TEST(OzakiTestCPU, SimpleStencil) {

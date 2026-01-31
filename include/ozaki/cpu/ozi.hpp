@@ -1,8 +1,8 @@
 #ifndef HEADER_OZAKI_HPP
 #define HEADER_OZAKI_HPP
 
-#include "../core/ozconcepts.hpp"
 #include "../core/stencil.hpp"
+#include "../core/oztraits.hpp"
 
 #include <algorithm>
 #include <climits>
@@ -16,16 +16,71 @@
 
 
 namespace ozicpu {
+template <typename T> struct OzakiFP_Int8 {
+static_assert(false, "Not implemented");
+};
+
 template <std::floating_point T>
   requires(sizeof(T) > 1)
-struct OzakiFP_Int8 {
+struct OzakiFP_Int8<T> {
   using data_type = T;
   using target_type = int8_t;
   using acc_type = int32_t;
 };
+
+#ifdef __GNUC__
+// Specialization for __float128 (not recognized by std::floating_point concept)
+template <>
+struct OzakiFP_Int8<__float128> {
+  using data_type = __float128;
+  using target_type = int8_t;
+  using acc_type = int32_t;
+};
+#endif
 } // namespace ozicpu
 
 namespace ozi {
+
+#ifdef __GNUC__
+// CPU-side OzakiPairTraits for __float128
+template <> struct OzakiPairTraits<ozicpu::OzakiFP_Int8<__float128>> {
+  using Data = __float128;
+  using Target = int8_t;
+  using Acc = int32_t;
+
+  static inline Target down_cast(Data a, int32_t scale) {
+    constexpr auto LO = static_cast<int64_t>(std::numeric_limits<Target>::min() + 1);
+    constexpr auto HI = static_cast<int64_t>(std::numeric_limits<Target>::max());
+    __float128 scaled = OzakiTraits<Data>::scalbn(a, OzakiTraits<Target>::scaling_factor(scale));
+    auto r = static_cast<int64_t>(llrintq(scaled));
+    if (r < LO)
+      r = LO;
+    if (r > HI)
+      r = HI;
+    return static_cast<Target>(r);
+  }
+
+  static inline Data up_cast(Target a, int32_t scale) {
+    return OzakiTraits<Data>::scalbn(static_cast<Data>(a), -OzakiTraits<Target>::scaling_factor(scale));
+  }
+
+  static inline Data up_cast_acc(Acc a, int32_t scale, int32_t n_mult) {
+    return OzakiTraits<Data>::scalbn(static_cast<Data>(a), -(n_mult * (CHAR_BIT * sizeof(Target) - 1) - scale));
+  }
+
+  static void matmul(Acc *__restrict C, const Target *__restrict A, const Target *__restrict B, size_t m, size_t n, size_t k) {
+    for (size_t mm = 0; mm < m; ++mm) {
+      for (size_t nn = 0; nn < n; ++nn) {
+        Acc res = 0;
+        for (size_t kk = 0; kk < k; ++kk) {
+          res += static_cast<Acc>(A[mm + m * kk]) * static_cast<Acc>(B[kk + nn * k]);
+        }
+        C[mm + m * nn] = res;
+      }
+    }
+  }
+};
+#endif
 
 template <std::floating_point T>
 struct OzakiPairTraits<ozicpu::OzakiFP_Int8<T>> {

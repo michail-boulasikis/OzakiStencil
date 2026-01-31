@@ -12,39 +12,11 @@ from stencil import (
 )
 
 if __name__ == "__main__":
-    stencils = {
-        "box2d1r": Stencil(np.random.rand(3, 3), np.ones(2)),
-        "box2d2r": Stencil(np.random.rand(5, 5), 2 * np.ones(2)),
-        "box2d3r": Stencil(np.random.rand(7, 7), 3 * np.ones(2)),
-        "heat2d1r": Stencil(
-            np.array([[0.0, 0.2, 0.0], [0.2, 0.4, 0.2], [0.0, 0.2, 0.0]]), np.ones(2)
-        ),
-        "heat2d2r": Stencil(
-            np.array(
-                [
-                    [0.0, 0.0, 0.1, 0.0, 0.0],
-                    [0.0, 0.0, 0.1, 0.0, 0.0],
-                    [0.1, 0.1, 0.4, 0.1, 0.1],
-                    [0.0, 0.0, 0.1, 0.0, 0.0],
-                    [0.0, 0.0, 0.1, 0.0, 0.0],
-                ]
-            ),
-            2 * np.ones(2),
-        ),
-        "heat2d3r": Stencil(
-            np.array(
-                [
-                    [0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0],
-                    [0.1, 0.1, 0.1, 0.4, 0.1, 0.1, 0.1],
-                    [0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0],
-                    [0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0],
-                ]
-            ),
-            3 * np.ones(2),
-        ),
+    # Dtype mapping from string to numpy dtype
+    dtype_map = {
+        "float32": np.float32,
+        "float64": np.float64,
+        "float128": np.longdouble,
     }
 
     # Argparse to select specific stencil
@@ -55,7 +27,7 @@ if __name__ == "__main__":
         "--stencil",
         type=str,
         required=True,
-        choices=stencils.keys(),
+        choices=["box2d1r", "box2d2r", "box2d3r", "heat2d1r", "heat2d2r", "heat2d3r"],
         help="Name of the stencil to run",
     )
     parser.add_argument(
@@ -68,12 +40,65 @@ if __name__ == "__main__":
     parser.add_argument(
         "--input-size", type=int, required=True, help="Input dimension size"
     )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float64",
+        choices=["float32", "float64", "float128"],
+        help="Data type for stencil coefficients",
+    )
     args = parser.parse_args()
+
+    # Select the data type and create stencils
+    dtype = dtype_map[args.dtype]
+
+    stencils = {
+        "box2d1r": Stencil(np.random.rand(3, 3).astype(dtype), np.ones(2, dtype=dtype)),
+        "box2d2r": Stencil(
+            np.random.rand(5, 5).astype(dtype), (2 * np.ones(2)).astype(dtype)
+        ),
+        "box2d3r": Stencil(
+            np.random.rand(7, 7).astype(dtype), (3 * np.ones(2)).astype(dtype)
+        ),
+        "heat2d1r": Stencil(
+            np.array([[0.0, 0.2, 0.0], [0.2, 0.4, 0.2], [0.0, 0.2, 0.0]], dtype=dtype),
+            np.ones(2, dtype=dtype),
+        ),
+        "heat2d2r": Stencil(
+            np.array(
+                [
+                    [0.0, 0.0, 0.1, 0.0, 0.0],
+                    [0.0, 0.0, 0.1, 0.0, 0.0],
+                    [0.1, 0.1, 0.4, 0.1, 0.1],
+                    [0.0, 0.0, 0.1, 0.0, 0.0],
+                    [0.0, 0.0, 0.1, 0.0, 0.0],
+                ],
+                dtype=dtype,
+            ),
+            (2 * np.ones(2)).astype(dtype),
+        ),
+        "heat2d3r": Stencil(
+            np.array(
+                [
+                    [0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0],
+                    [0.1, 0.1, 0.1, 0.4, 0.1, 0.1, 0.1],
+                    [0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0],
+                ],
+                dtype=dtype,
+            ),
+            (3 * np.ones(2)).astype(dtype),
+        ),
+    }
 
     # Select the requested stencil
     sname = args.stencil
     s = stencils[sname]
     input_shape = [args.input_size, args.input_size]
+    print(f"Using dtype: {args.dtype}")
 
     # 1. Generate Code
     print(f"Generating PTX for {sname}...")
@@ -85,7 +110,12 @@ if __name__ == "__main__":
     )
     # Add optimization flags if desired, e.g., ["-O3"]
     (err,) = nvrtc.nvrtcCompileProgram(
-        prog, 1, [f"--gpu-architecture=sm_{args.arch}".encode()]
+        prog,
+        2,
+        [
+            f"--gpu-architecture=sm_{args.arch}".encode(),
+            "--device-float128".encode(),
+        ],
     )
     # Check for compile errors
     if err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
@@ -103,4 +133,4 @@ if __name__ == "__main__":
     gen = StencilKernelGenerator(s, input_shape, kernel_name=sname)
     dtype = DTYPE_MAP[gen.c_type]  # Map back from C-string to numpy type
 
-    run_benchmark(ptx, sname, input_shape, dtype)
+    run_benchmark(ptx, sname, input_shape, dtype, profiled_steps=1000)

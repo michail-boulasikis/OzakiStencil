@@ -1,14 +1,26 @@
 #ifndef HEADER_OZI_CUH
 #define HEADER_OZI_CUH
 
-#include "../core/ozconcepts.hpp"
+#include "../core/oztraits.hpp"
 #include "../core/stencil.hpp"
 #include "gpu_checks.cuh"
 
 #include <concepts>
+#include <crt/device_fp128_functions.h>
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
 #include <limits>
 #include <type_traits>
+
+// Optional high-precision arithmetic for scale factor computation
+// Define OZAKI_USE_BOOST_MULTIPRECISION to enable (requires Boost headers)
+#ifdef OZAKI_USE_BOOST_MULTIPRECISION
+#include <boost/multiprecision/cpp_bin_float.hpp>
+#include <string>
+#ifdef __GNUC__
+#include <quadmath.h>
+#endif
+#endif
 
 #ifndef RDC_THREADS_PER_BLOCK
 #define RDC_THREADS_PER_BLOCK 512
@@ -16,7 +28,7 @@
 
 namespace ozigpu {
 
-template <std::floating_point T>
+template <typename T>
   requires(sizeof(T) > 1)
 struct OzakiFP_Int8 {
   using data_type = T;
@@ -41,94 +53,10 @@ template <ozi::OzakiPair O> struct alignas(256) OzakiDescriptor {
   int32_t carry_slice_index = 0;
 };
 
-namespace detail {
-
 // Vectorized load/store helper
 template <typename T> struct FourValues {
   T a[4];
 };
-
-template <size_t Bytes> struct UintByType;
-template <> struct UintByType<2> {
-  using type = uint16_t;
-};
-template <> struct UintByType<4> {
-  using type = uint32_t;
-};
-template <> struct UintByType<8> {
-  using type = uint64_t;
-};
-template <typename T> using RawInt = typename UintByType<sizeof(T)>::type;
-
-template <typename T> struct FloatTraits;
-template <> struct FloatTraits<__half> {
-  static constexpr int32_t MantissaBits = 10;
-  static constexpr int32_t ExponentBias = 15;
-};
-template <> struct FloatTraits<float> {
-  static constexpr int32_t MantissaBits = 23;
-  static constexpr int32_t ExponentBias = 127;
-};
-template <> struct FloatTraits<double> {
-  static constexpr int32_t MantissaBits = 52;
-  static constexpr int32_t ExponentBias = 1023;
-};
-#if __CUDA_ARCH__ >= 100
-template <> struct FloatTraits<__float128> {
-  static constexpr int32_t MantissaBits = 112;
-  static constexpr int32_t ExponentBias = 16383;
-};
-#endif
-
-template <typename To, typename From> __device__ __forceinline__ To bit_cast(const From &src) {
-  static_assert(sizeof(To) == sizeof(From), "Size mismatch in bit_cast");
-  To dst;
-  memcpy(&dst, &src, sizeof(To));
-  return dst;
-}
-
-template <typename T> __device__ __forceinline__ int32_t ffs(T val) {
-  if constexpr (sizeof(T) <= 4) {
-    return __ffs(static_cast<int32_t>(val));
-  } else if constexpr (sizeof(T) <= 8) {
-    return __ffsll(static_cast<int64_t>(val));
-  } else {
-    auto lo = static_cast<uint64_t>(val);
-    if (lo != 0)
-      return __ffsll(lo);
-    auto hi = static_cast<uint64_t>(val >> 64);
-    int hi_bit = __ffsll(hi);
-    return hi_bit ? hi_bit + 64 : 0;
-  }
-}
-
-/** Returns min(first_set_lsb(a), current_lsb) */
-template <typename T> __device__ __forceinline__ int32_t dyn_min_lsb(T a, int32_t current_lsb) {
-  using IntType = RawInt<T>;
-  using Traits = FloatTraits<T>;
-
-  if (a == static_cast<T>(0)) // zero does not count.
-    return current_lsb;
-
-  IntType raw = bit_cast<IntType>(a);
-
-  constexpr IntType One = 1;
-  constexpr int32_t M_Bits = Traits::MantissaBits;
-  constexpr IntType M_Mask = (One << M_Bits) - 1;
-  constexpr int32_t TotalBits = sizeof(T) * CHAR_BIT;
-  IntType exponent_bits = (raw >> M_Bits) & ((One << (TotalBits - 1 - M_Bits)) - 1);
-  IntType mantissa = raw & M_Mask;
-  if (exponent_bits != 0) {
-    mantissa |= (One << M_Bits);
-  } else {
-    exponent_bits = 1;
-  }
-  int32_t ffs_index = ffs(mantissa);
-  int32_t bit_exponent = (static_cast<int32_t>(exponent_bits) - Traits::ExponentBias) - (M_Bits - (ffs_index - 1));
-  return min(current_lsb, bit_exponent);
-}
-
-} // namespace detail
 } // namespace ozigpu
 
 namespace ozi {
@@ -158,30 +86,150 @@ template <std::floating_point T> struct OzakiPairTraits<ozigpu::OzakiFP_Int8<T>>
   }
 
   __host__ __device__ __forceinline__ static Data up_cast_acc(Acc a, int32_t scale, int32_t n_mult) {
-    return OzakiTraits<Data>::scalbn(static_cast<Data>(a), -(n_mult * OzakiTraits<Target>::scaling_factor(scale)));
+    return OzakiTraits<Data>::scalbn(static_cast<Data>(a), -(n_mult * (CHAR_BIT * sizeof(Target) - 1) - scale));
   }
 
-  // Stub matmul implementation (not used in stencil code but required by concept)
   static void matmul(Acc *C, const Target *A, const Target *B, size_t m, size_t n, size_t k) {
     // Not implemented for stencil operations
   }
 };
+
+#if __GNUC__ || __CUDA_ARCH__ >= 100
+template <> struct OzakiPairTraits<ozigpu::OzakiFP_Int8<__float128>> {
+  using Data = typename ozigpu::OzakiFP_Int8<__float128>::data_type;
+  using Target = typename ozigpu::OzakiFP_Int8<__float128>::target_type;
+  using Acc = typename ozigpu::OzakiFP_Int8<__float128>::acc_type;
+
+  static __host__ __device__ __forceinline__ Target down_cast(Data a, int32_t scale) {
+    __float128 a_scaled = OzakiTraits<Data>::scalbn(a, scale);
+#ifdef __CUDA_ARCH__
+    __float128 rounded = __nv_fp128_rint(a_scaled);
+    // Saturate to int8_t range to prevent wraparound
+    if (rounded > static_cast<__float128>(127))
+      return 127;
+    if (rounded < static_cast<__float128>(-128))
+      return -128;
+    return static_cast<Target>(rounded);
+#else
+    long long rounded = llrintq(a_scaled);
+    // Saturate to int8_t range
+    if (rounded > 127)
+      return 127;
+    if (rounded < -128)
+      return -128;
+    return static_cast<Target>(rounded);
+#endif
+  }
+
+  static __host__ __device__ __forceinline__ Data up_cast(Target a, int32_t scale) {
+    return OzakiTraits<Data>::scalbn(static_cast<Data>(a), -scale);
+  }
+
+  static __host__ __device__ __forceinline__ Data up_cast_acc(Acc a, int32_t scale, int32_t n_mult) {
+    return OzakiTraits<Data>::scalbn(static_cast<Data>(a), -(n_mult * (CHAR_BIT * sizeof(Target) - 1) - scale));
+  }
+
+  static __host__ __device__ __forceinline__ void matmul(Acc *A, const Target *B, const Target *C, size_t m, size_t n,
+                                                         size_t k) {}
+};
+#endif
 
 } // namespace ozi
 
 namespace ozigpu {
 using namespace ozi;
 
-template <OzakiPair O>
-__host__ typename O::data_type total_integration_scale_factor(typename O::data_type a, int64_t time_steps,
-                                                              int64_t shifts) {
-  using Data = typename O::data_type;
-  using Target = typename O::target_type;
+/** Helper to shuffle down any type, including __float128 which requires component-wise shuffling */
+template <typename T>
+__device__ __forceinline__ T shfl_down_sync_wrapper(uint32_t mask, T val, uint32_t offset, int32_t width = 32) {
+  if constexpr (sizeof(T) <= 8) {
+    // Native shuffle support for types up to 64 bits
+    return __shfl_down_sync(mask, val, offset, width);
+  } else if constexpr (std::is_same_v<T, __float128>) {
+    // For __float128, split into two 64-bit components, shuffle each, then reconstruct
+    RawInt<T> raw = bit_cast<RawInt<T>>(val);
+    raw.hi = __shfl_down_sync(mask, raw.hi, offset, width);
+    raw.lo = __shfl_down_sync(mask, raw.lo, offset, width);
+    return bit_cast<T>(raw);
+  } else {
+    static_assert(sizeof(T) <= 16, "Unsupported type size for warp shuffle");
+  }
+}
 
+/** Helper to compute ceil(log2(|val|)) for dynamic range analysis using frexp */
+template <typename T> __device__ __forceinline__ int32_t log2_ceil_abs(T val) {
+  T abs_val = OzakiTraits<T>::abs(val);
+  if (abs_val == static_cast<T>(0)) {
+    return std::numeric_limits<int32_t>::min();
+  }
   int32_t exp;
-  double frac = OzakiTraits<double>::frexp(static_cast<double>(a), &exp);
-  return static_cast<Data>(
-      OzakiTraits<double>::scalbn(pow(frac, time_steps), time_steps * exp + (CHAR_BIT * sizeof(Target) - 1) * shifts));
+  T frac = OzakiTraits<T>::frexp(abs_val, &exp);
+  return (frac == static_cast<T>(0.5)) ? (exp - 1) : exp;
+}
+
+template <ozi::OzakiPair O>
+__host__
+#ifdef __GNUC__
+    __float128
+#else
+    long double
+#endif
+    total_integration_scale_factor_quad(double a, int64_t time_steps, int64_t shifts) {
+  using Target = typename O::target_type;
+  constexpr int32_t slice_bits = CHAR_BIT * sizeof(Target) - 1;
+
+#ifdef OZAKI_USE_BOOST_MULTIPRECISION
+  using high_precision_float = boost::multiprecision::number<boost::multiprecision::backends::cpp_bin_float<512>>;
+
+  high_precision_float a_hp = static_cast<double>(a);
+  high_precision_float result = boost::multiprecision::pow(a_hp, -time_steps);
+
+  // Multiply by 2^(slice_bits * shifts)
+  int64_t exp_shift = static_cast<int64_t>(slice_bits) * shifts;
+  result *= boost::multiprecision::pow(high_precision_float(2), exp_shift);
+
+#ifdef __GNUC__
+  std::string str = result.str(128);
+  return strtoflt128(str.c_str(), nullptr);
+#else
+  return result.convert_to<long double>();
+#endif
+
+#else
+  // Fallback: original implementation using native quad precision
+  // Note: This has reduced accuracy for non-power-of-2 scaling factors
+
+#ifdef __GNUC__
+  // We compute: 2^(slice_bits * shifts) / a^time_steps
+  __float128 a_quad = static_cast<__float128>(a);
+  int exp;
+
+  __float128 frac = frexpq(a_quad, &exp);
+
+  __float128 pow_frac = powq(frac, static_cast<__float128>(time_steps));
+
+  __float128 inv_pow_frac = static_cast<__float128>(1.0) / pow_frac;
+
+  // Result = 2^(slice_bits * shifts) / (frac^time_steps * 2^(exp * time_steps))
+  //        = (1 / frac^time_steps) * 2^(slice_bits * shifts - exp * time_steps)
+  int64_t total_exp = static_cast<int64_t>(slice_bits) * shifts - static_cast<int64_t>(exp) * time_steps;
+
+  return scalbnq(inv_pow_frac, static_cast<int>(total_exp));
+
+#else
+  long double a_ld = static_cast<long double>(a);
+  int exp;
+
+  long double frac = std::frexp(a_ld, &exp);
+  long double pow_frac = std::pow(frac, static_cast<long double>(time_steps));
+
+  long double inv_pow_frac = static_cast<long double>(1.0) / pow_frac;
+
+  int64_t total_exp = static_cast<int64_t>(slice_bits) * shifts - static_cast<int64_t>(exp) * time_steps;
+
+  return std::scalbn(inv_pow_frac, static_cast<int>(total_exp));
+#endif
+#endif
 }
 
 template <typename T> __global__ void fill(T *__restrict__ in, const T val, size_t n) {
@@ -190,10 +238,10 @@ template <typename T> __global__ void fill(T *__restrict__ in, const T val, size
     in[tid] = val;
 }
 
-template <typename T> __global__ void scale(T *__restrict__ in, const double val, size_t n) {
+template <typename T, typename ScaleT = double> __global__ void scale(T *__restrict__ in, const ScaleT val, size_t n) {
   const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
   if (tid < n)
-    in[tid] = static_cast<T>(static_cast<double>(in[tid]) * val);
+    in[tid] = static_cast<T>(static_cast<ScaleT>(in[tid]) * val);
 }
 
 /** Finds the dynamic range [pos(MSB), pos(LSB)] of a set of numbers */
@@ -216,7 +264,7 @@ __global__ void dyn_range(OzakiDescriptor<O> *__restrict__ out, const typename O
 #pragma unroll 4
   while (4 * i < n) {
     const Data *src = in + 4 * i;
-    detail::FourValues<Data> vals = *reinterpret_cast<const detail::FourValues<Data> *>(src);
+    FourValues<Data> vals = *reinterpret_cast<const FourValues<Data> *>(src);
 
     Data abs0 = OzakiTraits<Data>::abs(vals.a[0]);
     Data abs1 = OzakiTraits<Data>::abs(vals.a[1]);
@@ -226,16 +274,15 @@ __global__ void dyn_range(OzakiDescriptor<O> *__restrict__ out, const typename O
     local_max_val = OzakiTraits<Data>::max(
         OzakiTraits<Data>::max(OzakiTraits<Data>::max(OzakiTraits<Data>::max(abs0, abs1), abs2), abs3), local_max_val);
 
-    local_min_val = detail::dyn_min_lsb(
-        vals.a[0],
-        detail::dyn_min_lsb(vals.a[1], detail::dyn_min_lsb(vals.a[2], detail::dyn_min_lsb(vals.a[3], local_min_val))));
+    local_min_val =
+        dyn_min_lsb(vals.a[0], dyn_min_lsb(vals.a[1], dyn_min_lsb(vals.a[2], dyn_min_lsb(vals.a[3], local_min_val))));
     i += GRID_SIZE;
   }
 
   constexpr uint32_t FULL_MASK = 0xFFFF'FFFF;
 #pragma unroll
   for (int32_t offset = 16; offset > 0; offset /= 2) {
-    local_max_val = OzakiTraits<Data>::max(local_max_val, __shfl_down_sync(FULL_MASK, local_max_val, offset));
+    local_max_val = OzakiTraits<Data>::max(local_max_val, shfl_down_sync_wrapper(FULL_MASK, local_max_val, offset));
     local_min_val = min(local_min_val, __shfl_down_sync(FULL_MASK, local_min_val, offset));
   }
 
@@ -254,11 +301,11 @@ __global__ void dyn_range(OzakiDescriptor<O> *__restrict__ out, const typename O
     local_min_val = smem_min[LANE_ID];
 #pragma unroll
     for (uint32_t offset = WARPS_PER_BLOCK / 2; offset > 0; offset /= 2) {
-      local_max_val = OzakiTraits<Data>::max(local_max_val, __shfl_down_sync(mask, local_max_val, offset));
+      local_max_val = OzakiTraits<Data>::max(local_max_val, shfl_down_sync_wrapper(mask, local_max_val, offset));
       local_min_val = min(local_min_val, __shfl_down_sync(mask, local_min_val, offset));
     }
     if (LANE_ID == 0) {
-      int32_t block_partial_result = static_cast<int32_t>(ceil(log2(local_max_val)));
+      int32_t block_partial_result = log2_ceil_abs(local_max_val);
       atomicMax(&out->e_max, block_partial_result);
       atomicMin(&out->e_min, local_min_val);
     }
@@ -281,12 +328,14 @@ __global__ void slice(typename O::target_type *__restrict__ out, const typename 
 
   if (desc->n_slices_input == 0) {
     total_slices = 2 + (desc->e_max - desc->e_min) / (CHAR_BIT * sizeof(Target) - 1);
-    if (tid == 0)
+    if (tid == 0) {
       desc->n_slices_input = total_slices;
+      __threadfence();
+    }
   }
 
-  detail::FourValues<Data> ins = reinterpret_cast<const detail::FourValues<Data> *>(in)[tid];
-  detail::FourValues<Target> outs{{0, 0, 0, 0}};
+  FourValues<Data> ins = reinterpret_cast<const FourValues<Data> *>(in)[tid];
+  FourValues<Target> outs{{0, 0, 0, 0}};
 
 #pragma unroll 2
   for (int32_t s = 0; s < total_slices; ++s) {
@@ -302,7 +351,7 @@ __global__ void slice(typename O::target_type *__restrict__ out, const typename 
         outs.a[v] = v_converted;
       }
     }
-    reinterpret_cast<detail::FourValues<Target> *>(out)[flat_offset] = outs;
+    reinterpret_cast<FourValues<Target> *>(out)[flat_offset] = outs;
   }
 }
 
@@ -317,15 +366,14 @@ __global__ void mend(OutputType *__restrict__ out, const typename O::target_type
   if (tid >= n / 4)
     return;
 
-  int32_t n_shifts = desc->n_shifts;
-  int32_t global_max_exp = desc->e_max + 1 * (CHAR_BIT * sizeof(Target) - 1);
+  int32_t global_max_exp = desc->e_max + (CHAR_BIT * sizeof(Target) - 1);
   int32_t total_slices = desc->n_slices_input;
   int32_t carry_idx = desc->carry_slice_index;
 
   constexpr int32_t SLICE_BITS = CHAR_BIT * sizeof(Target) - 1;
 
-  detail::FourValues<OutputType> outs{{0, 0, 0, 0}};
-  detail::FourValues<Target> ins{};
+  FourValues<OutputType> outs{{0, 0, 0, 0}};
+  FourValues<Target> ins{};
 
   for (int32_t logic_s = total_slices - 1; logic_s >= 0; --logic_s) {
     int32_t current_slice_exp = global_max_exp - (logic_s * SLICE_BITS);
@@ -333,14 +381,14 @@ __global__ void mend(OutputType *__restrict__ out, const typename O::target_type
 
     const int32_t physical_slice = (carry_idx + logic_s) % total_slices;
     const size_t flat_offset = physical_slice * (n / 4) + static_cast<size_t>(tid);
-    ins = reinterpret_cast<const detail::FourValues<Target> *>(in)[flat_offset];
+    ins = reinterpret_cast<const FourValues<Target> *>(in)[flat_offset];
 
 #pragma unroll
     for (int32_t v = 0; v < 4; ++v) {
       outs.a[v] += static_cast<OutputType>(OzakiPairTraits<O>::up_cast(ins.a[v], shift_amount));
     }
   }
-  reinterpret_cast<detail::FourValues<OutputType> *>(out)[tid] = outs;
+  reinterpret_cast<FourValues<OutputType> *>(out)[tid] = outs;
 }
 
 /** Computes S @ u, where u is the ozaki decomposition of a tensor, and S is a stencil */

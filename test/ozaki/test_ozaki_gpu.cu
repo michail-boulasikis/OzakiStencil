@@ -4,6 +4,7 @@
 #include <driver_types.h>
 #include <gtest/gtest.h>
 
+#include <ios>
 #include <ozaki/core/stencil.hpp>
 #include <ozaki/gpu/gpu_checks.cuh>
 #include <ozaki/gpu/ozi.cuh>
@@ -34,6 +35,27 @@ template <typename T> struct get_uint_same_size {
   // Ensure we actually found a match
   static_assert(!std::is_void_v<type>, "No uint type of same size found for this float");
 };
+
+template <typename T> int32_t get_slice_max_normal() {
+  if constexpr (std::is_same_v<T, float>) {
+    return 9;
+  } else if constexpr (std::is_same_v<T, double>) {
+    return 12;
+  } else {
+    return 24;
+  }
+}
+
+template <typename T> int32_t get_slice_max_beta() {
+  if constexpr (std::is_same_v<T, float>) {
+    return 24;
+  } else if constexpr (std::is_same_v<T, double>) {
+    return 48;
+  } else {
+    return 96;
+  }
+}
+
 template <typename T> using get_uint_same_size_t = typename get_uint_same_size<T>::type;
 template <typename T, typename InputContainer, size_t... Dims>
 std::vector<T> compute_gold_standard(const ozi::Stencil<T, Dims...> &stencil, const InputContainer &input,
@@ -164,7 +186,12 @@ protected:
   }
 };
 
+#if defined(__GNUC__) || __CUDA_ARCH__ >= 100
+using TestTypes = ::testing::Types<float, double, __float128>;
+#else
 using TestTypes = ::testing::Types<float, double>;
+#endif
+
 TYPED_TEST_SUITE(OzakiTestGPU, TestTypes);
 
 TYPED_TEST(OzakiTestGPU, Fill) {
@@ -196,8 +223,14 @@ TYPED_TEST(OzakiTestGPU, ScaleExtraction) {
 
   int32_t hexp_real_max = std::numeric_limits<int32_t>::min();
   for (size_t i = 0; i < this->N; ++i) {
-    if (const int32_t e = static_cast<int32_t>(std::ceil(std::log2(std::abs(this->h_data[i])))); e > hexp_real_max)
-      hexp_real_max = e;
+    if constexpr (std::is_same_v<Scalar, __float128>) {
+      if (const int32_t e = static_cast<int32_t>(ceilq(log2q(fabsq(this->h_data[i])))); e > hexp_real_max) {
+        hexp_real_max = e;
+      }
+    } else {
+      if (const int32_t e = static_cast<int32_t>(std::ceil(std::log2(std::abs(this->h_data[i])))); e > hexp_real_max)
+        hexp_real_max = e;
+    }
   }
 
   ASSERT_EQ(CUDA_SUCCESS, cudaDeviceSynchronize());
@@ -209,17 +242,25 @@ TYPED_TEST(OzakiTestGPU, ScaleExtraction) {
 }
 
 TYPED_TEST(OzakiTestGPU, SliceAndMendNormal) {
-  this->verify_slice_and_mend(12, false, [this]() { this->generate_normal(this->h_data, this->N); });
+  using Scalar = TypeParam;
+  this->verify_slice_and_mend(get_slice_max_normal<Scalar>(), false,
+                              [this]() { this->generate_normal(this->h_data, this->N); });
 }
 
 TYPED_TEST(OzakiTestGPU, SliceAndMendBeta) {
-  this->verify_slice_and_mend(36, false, [this]() { this->generate_beta(this->h_data, this->N); });
+  using Scalar = TypeParam;
+  this->verify_slice_and_mend(get_slice_max_beta<Scalar>(), false,
+                              [this]() { this->generate_beta(this->h_data, this->N); });
 }
 
 TYPED_TEST(OzakiTestGPU, SliceAndMendNormalDyn) {
-  this->verify_slice_and_mend(12, true, [this]() { this->generate_normal(this->h_data, this->N); });
+  using Scalar = TypeParam;
+  this->verify_slice_and_mend(get_slice_max_normal<Scalar>(), true,
+                              [this]() { this->generate_normal(this->h_data, this->N); });
 }
 
 TYPED_TEST(OzakiTestGPU, SliceAndMendBetaDyn) {
-  this->verify_slice_and_mend(36, true, [this]() { this->generate_beta(this->h_data, this->N); });
+  using Scalar = TypeParam;
+  this->verify_slice_and_mend(get_slice_max_beta<Scalar>(), true,
+                              [this]() { this->generate_beta(this->h_data, this->N); });
 }
