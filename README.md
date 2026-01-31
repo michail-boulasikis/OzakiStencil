@@ -30,6 +30,18 @@ Run `bash run.sh` to:
 
 For build options, run `bash run.sh -h`.
 
+#### High-Precision Scale Factor (Optional)
+
+At the end of the integration, we need to scale the result by `1/a^timesteps` where `a` is the stencil's L1 norm. When `a` is a power of 2, this is exact. When it's not (like the `random-box` stencil), computing this with `__float128` loses precision and becomes the main source of error.
+
+You can fix this by using Boost.Multiprecision to compute the scale factor with way more precision (500 bits instead of 128):
+
+```bash
+cmake -B build -DOZAKI_USE_BOOST_MULTIPRECISION=ON
+```
+
+This only needs Boost headers (already required for other parts), and the extra computation happens once on the CPU, so there's basically no slowdown. If you're running the precision benchmarks, turn this on to see the full convergence.
+
 ## How OzakiStencil Works
 
 ### The Basic Idea
@@ -64,3 +76,20 @@ So far I have proven that you can get FP64 or even higher precision using this s
 
 The GPU implementation is more experimental: it tracks slice shifts and overflow information as iterations progress, trying to maintain precision without exploding the number of slices needed.
 It also manages to avoid slicing and mending at every time step by carefully computing the slices by shifting and accumulating.
+
+### Binary Tensor Files
+
+This project makes use of a simple in-house binary tensor format for IO. The format is `[ndim, type, dim1, dim2, ... , dimn, v0, v1, v2, v3, ...]`.
+- `ndim` is the amount of dimensions (uint64t).
+- `type` is an enumeration describing the tensor type (uint64t).
+- `dimx` the number of elements on the x-th dimension (uint64t).
+- `vx` tensor values (their type depends on `type`).
+
+Binary tensor format type IDs:
+- `0` = `float` (32-bit)
+- `1` = `double` (64-bit)
+- `2` = `long double` (platform-dependent: 80/96/128-bit)
+- `3` = `__float128` (128-bit IEEE 754 quadruple precision)
+
+**Note**: __float128 support requires GCC (uses GNU extensions). The reference solver will fall back to `long double` on non-GCC compilers.
+

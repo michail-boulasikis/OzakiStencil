@@ -16,6 +16,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CUDA_COMPUTE_CAPABILITY "86" CACHE STRING "The CUDA Compute capability to target.")
 option(BUILD_TESTING "Build the project's tests" ON)
 option(OZAKI_NVTX_EVENTS "Whether to record NVTX events" ON)
+option(OZAKI_USE_BOOST_MULTIPRECISION "Use Boost.Multiprecision for high-precision scale factor computation" OFF)
 
 # dependencies
 include(cmake/Dependencies.cmake)
@@ -56,6 +57,11 @@ target_compile_options(ozaki_cuda_common INTERFACE
 
 if(OZAKI_NVTX_EVENTS)
   target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_NVTX_EVENTS)
+endif()
+
+if(OZAKI_USE_BOOST_MULTIPRECISION)
+  message(STATUS "Boost.Multiprecision enabled for high-precision scale factor computation")
+  target_compile_definitions(ozaki_common INTERFACE OZAKI_USE_BOOST_MULTIPRECISION)
 endif()
 
 # helpers for defining targets with shared boilerplate

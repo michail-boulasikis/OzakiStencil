@@ -76,6 +76,8 @@ def load_tensor(filepath):
             )
             raise e
         print(f"Loaded {os.path.basename(filepath)}: Shape={tensor.shape}")
+    if np.any(np.isnan(tensor)):
+        print("WARNING: input tensor has nans!")
     return tensor
 
 

@@ -9,6 +9,7 @@ import textwrap
 import numpy as np
 
 DTYPE_MAP = {
+    "__float128": np.longdouble,
     "double": np.float64,
     "float": np.float32,
     "int": np.int32,
@@ -188,6 +189,10 @@ class StencilKernelGenerator(object):
             coeff_str = f"{coeff}"
             if "float" in self.c_type and "." not in coeff_str:
                 coeff_str += ".0"
+            if "float" == self.c_type:
+                coeff_str += "f"
+            if "__float128" == self.c_type:
+                coeff_str += "Q"
 
             neighbor_idx = self._get_linear_index(offsets=index_tuple)
             terms.append(f"in[{neighbor_idx}] * ({coeff_str})")
@@ -236,7 +241,6 @@ def run_benchmark(
     kernel_name: str,
     input_shape: Tuple[int, ...],
     dtype: type,
-    warmup_steps: int = 10,
     profiled_steps: int = 128,
 ):
     # Cuda init stuff
@@ -251,17 +255,12 @@ def run_benchmark(
 
     try:
         # loading the kernel
+        print(ptx_code.decode("utf-8"))
         err, module = driver.cuModuleLoadData(ptx_code)
         check_cuda_err(err, "cuModuleLoadData")
 
         err, kernel = driver.cuModuleGetFunction(module, kernel_name.encode("utf-8"))
         check_cuda_err(err, "cuModuleGetFunction")
-
-        err, register_spills = driver.cuFuncGetAttribute(
-            driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel
-        )
-        check_cuda_err(err, "cuFuncGetAttribute")
-        print(f"REG_SPILL={register_spills}")
 
         # calculating sizes
         itemsize = np.dtype(dtype).itemsize
@@ -296,11 +295,6 @@ def run_benchmark(
         )
 
         print(f"Launching {kernel_name} | Grid: {grid_dim} | Block: {block_dim}")
-
-        # warmup launch
-        for _ in range(warmup_steps):
-            driver.cuLaunchKernel(kernel, *grid_dim, *block_dim, 0, 0, args_array, 0)
-            args_array[0], args_array[1] = args_array[1], args_array[0]
 
         # profiled launch
         for _ in range(profiled_steps):
