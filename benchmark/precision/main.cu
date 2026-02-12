@@ -1,3 +1,5 @@
+
+#include "ozaki/gpu/gpu_checks.cuh"
 #include <algorithm>
 #include <array>
 #include <climits>
@@ -8,13 +10,14 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <tuple>
 #include <vector>
 
-#include <ozaki/core/stencil.hpp>
 #include <ozaki/cpu/ozi.hpp>
+#include <ozaki/gpu/gpu_checks.cuh>
 #include <ozaki/gpu/ozi_stencil_plain.cuh>
 #include <ozaki/utils/tensor.hpp>
 
@@ -37,8 +40,8 @@ struct Config {
   static constexpr int RDC_THREADS = RDC_THREADS_PER_BLOCK;
 #endif
   static constexpr int STENCIL_ITERS_DEFAULT = 4096;
-  static constexpr size_t STENCIL_BLOCK_DIM_X = 16;
-  static constexpr size_t STENCIL_BLOCK_DIM_Y = 16;
+  static constexpr size_t STENCIL_BLOCK_DIM_X = 32;
+  static constexpr size_t STENCIL_BLOCK_DIM_Y = 8;
 };
 
 // Stencil configurations for testing
@@ -47,13 +50,12 @@ struct StencilConfig {
   std::array<int8_t, 9> coeffs_oz;
 };
 
-const std::array<StencilConfig, 3> STENCILS = {{{"Heat", {{0, 3, 0, 3, 4, 3, 0, 3, 0}}},
-                                                {"Advection Diffusion", {{0, 11, 0, 11, 15, 12, 0, 12, 0}}},
-                                                {"Box", {{-3, 2, 1, -8, 4, -5, -1, -1, 9}}}}};
+const std::array<StencilConfig, 4> STENCILS = {{{"Heat", {{0, 3, 0, 3, 4, 3, 0, 3, 0}}},
+                                                {"AdvectionDiffusion", {{0, 11, 0, 11, 15, 12, 0, 12, 0}}},
+                                                {"BoxOnes", {{1, 1, 1, 1, 1, 1, 1, 1, 1}}},
+                                                {"BoxRandom", {{-3, 2, 1, -8, 4, -5, -1, -1, 9}}}}};
 
-// Timesteps to test
-// const std::array<int32_t, 4> TIMESTEPS = {10, 100, 1000, 10000};
-const std::array<int32_t, 1> TIMESTEPS = {1000};
+// Timesteps to test (now configured via command line)
 
 int32_t *d_flush_buffer = nullptr;
 size_t flush_buffer_size = 0;
@@ -110,6 +112,14 @@ std::tuple<RealStencil, IntStencil, Real> create_stencils(const std::array<int8_
   return {heat, heat_ozaki, l1_norm};
 }
 
+// Computes S^3 by correlating the 3x3 stencil S three times to produce a 7x7 stencil
+// This represents applying S three times in sequence: 3+3-1 = 5, then 5+3-1 = 7
+ozi::Stencil<int8_t, 7, 7> compute_stencil_cubed(const ozi::Stencil<int8_t, 3, 3> &s) {
+  auto s2 = ozi::correlate(s, s);
+  auto s3 = ozi::correlate(s2, s);
+  return s3;
+}
+
 template <typename ComputeType>
 static ozi::Stencil<ComputeType, 3, 3> make_typed_stencil(const std::array<int8_t, 9> &coeffs_oz, double l1_norm) {
   ozi::Stencil<ComputeType, 3, 3> result;
@@ -150,7 +160,9 @@ struct ReferenceSolver {
   }
 };
 
-class OzakiRunner {
+// Base class for Ozaki stencil runners
+class OzakiRunnerBase {
+protected:
   int8_t *d_slices_1 = nullptr, *d_slices_2 = nullptr;
 
   ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>> *d_desc = nullptr;
@@ -166,31 +178,18 @@ class OzakiRunner {
   std::string file_prefix{"./data/"};
   Real scaling_factor = static_cast<Real>(1.0);
 
+  ozi::Stencil<int8_t, 3, 3> stencil_3x3;
+
 public:
-  OzakiRunner(const Tensor<Real> &input, const Real a) : host_input(input), n_elems(input.size()) {
-    allocate_resources();
-    compute_dynamic_range();
-  }
-
-  OzakiRunner(const Tensor<Real> &input, const int32_t iterations, const Real a)
-      : host_input(input), n_elems(input.size()), n_iterations(iterations), scaling_factor(a) {
-    allocate_resources();
-    compute_dynamic_range();
-  }
-  OzakiRunner(const Tensor<Real> &input, const int32_t iterations, const int32_t extra_msb, const int32_t extra_lsb,
-              const Real a)
-      : host_input(input), n_elems(input.size()), n_iterations(iterations), scaling_factor(a) {
-    allocate_resources();
-    compute_dynamic_range(extra_msb, extra_lsb);
-  }
-  OzakiRunner(const Tensor<Real> &input, const int32_t iterations, const int32_t extra_msb, const int32_t extra_lsb,
-              const std::string &prefix, const Real a)
-      : host_input(input), n_elems(input.size()), n_iterations(iterations), file_prefix(prefix), scaling_factor(a) {
+  OzakiRunnerBase(const Tensor<Real> &input, const int32_t iterations, const int32_t extra_msb, const int32_t extra_lsb,
+                  const std::string &prefix, const Real a, const ozi::Stencil<int8_t, 3, 3> &stencil)
+      : host_input(input), n_elems(input.size()), n_iterations(iterations), file_prefix(prefix), scaling_factor(a),
+        stencil_3x3(stencil) {
     allocate_resources();
     compute_dynamic_range(extra_msb, extra_lsb);
   }
 
-  ~OzakiRunner() {
+  virtual ~OzakiRunnerBase() {
     cudaFree(d_slices_1);
     cudaFree(d_slices_2);
     cudaFree(d_desc);
@@ -255,15 +254,27 @@ public:
     NVTX_POP();
   }
 
-  std::vector<AccumulatorType> run_experiment(int32_t active_slices, const ozi::Stencil<int8_t, 3, 3> &stencil_gpu,
-                                              const std::string &output_path) {
-    NVTX_PUSH(std::format("Run {} Slices", active_slices).c_str());
+  // Pure virtual function - implemented differently by subclasses
+  virtual std::vector<AccumulatorType> run_experiment(int32_t active_slices, const std::string &output_path,
+                                                      const bool save_tensors) = 0;
+
+  int get_max_slices() const { return num_slices_total; }
+};
+
+// Direct runner using stencil_v1 kernel
+class OzakiRunnerDirect : public OzakiRunnerBase {
+public:
+  using OzakiRunnerBase::OzakiRunnerBase;
+
+  std::vector<AccumulatorType> run_experiment(int32_t active_slices, const std::string &output_path,
+                                              const bool save_tensors) override {
+    NVTX_PUSH(std::format("Run {} Slices (Direct)", active_slices).c_str());
 
     h_desc.n_slices_input = active_slices;
     h_desc.shift_required = 0;
     h_desc.carry_slice_index = 0;
     h_desc.overflow_danger_threshold =
-        (std::numeric_limits<int8_t>::max() / static_cast<int8_t>(stencil_gpu.template l1_norm<double>())) - 1;
+        (std::numeric_limits<int8_t>::max() / static_cast<int8_t>(stencil_3x3.template l1_norm<double>())) - 1;
     h_desc.just_shifted = 1;
     h_desc.n_shifts = 0;
 
@@ -279,7 +290,7 @@ public:
     NVTX_PUSH("Integration Loop");
     for (size_t t = 0; t < n_iterations; ++t) {
       ozigpu::stencil_v1<ozigpu::OzakiFP_Int8<Real>, 3, 3>
-          <<<grid, block>>>(d_slices_2, d_slices_1, stencil_gpu, {host_input.width(), host_input.height()}, d_desc);
+          <<<grid, block>>>(d_slices_2, d_slices_1, stencil_3x3, {host_input.width(), host_input.height()}, d_desc);
 
       if (t < n_iterations - 1) {
         ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc);
@@ -314,15 +325,15 @@ public:
     std::vector<AccumulatorType> gpu_result(n_elems);
     CUDA_CHECK(cudaMemcpy(gpu_result.data(), d_res, n_elems * sizeof(AccumulatorType), cudaMemcpyDeviceToHost));
     NVTX_POP();
-    NVTX_PUSH("Storing Result");
-    write_tensor<AccumulatorType>(output_path, Tensor<AccumulatorType>{host_input.shape, gpu_result});
-    NVTX_POP();
+    if (save_tensors) {
+      NVTX_PUSH("Storing Result");
+      write_tensor<AccumulatorType>(output_path, Tensor<AccumulatorType>{host_input.shape, gpu_result});
+      NVTX_POP();
+    }
     NVTX_POP();
 
     return gpu_result;
   }
-
-  int get_max_slices() const { return num_slices_total; }
 };
 
 int main(int argc, char *argv[]) {
@@ -330,18 +341,30 @@ int main(int argc, char *argv[]) {
   std::string output_prefix;
   std::string input_file;
   int32_t slice_limit;
+  std::vector<size_t> timesteps;
+  bool compute_float_ref = false;
+  bool compute_double_ref = false;
+  bool compute_longdouble_ref = false;
+  bool save_tensors = false;
 
   po::options_description desc("Allowed options");
   // clang-format off
   desc.add_options()
     ("help,h", "Produce help message")
-    ("dir,d", po::value<std::string>(&output_dir)->default_value("./data/"),
+    ("dir", po::value<std::string>(&output_dir)->default_value("./data/"),
      "Directory where output tensor files will be created")
     ("prefix,p", po::value<std::string>(&output_prefix)->default_value("precision"),
      "Output file prefix")
     ("input,i", po::value<std::string>(&input_file)->required(), "Path to input tensor file")
-    ("slice-limit,s", po::value<int32_t>(&slice_limit)->default_value(16),
-     "Maximum slice count to test (starts from 2)");
+    ("slice-limit,s", po::value<int32_t>(&slice_limit)->default_value(24),
+     "Maximum slice count to test (starts from 2).")
+    ("timesteps,T", po::value<std::vector<size_t>>(&timesteps)->multitoken(),
+     "Timesteps to test (e.g., -T 10 100 1000)")
+    ("save-tensors,S", "Save every output tensor for further analysis")
+    ("float-ref,f", "Compute float reference solution")
+    ("double-ref,d", "Compute double reference solution")
+    ("longdouble-ref,l", "Compute long double reference solution")
+    ;
   // clang-format on
 
   po::variables_map vm;
@@ -355,6 +378,17 @@ int main(int argc, char *argv[]) {
     }
 
     po::notify(vm);
+
+    // Set reference computation flags
+    compute_float_ref = vm.count("float-ref") > 0;
+    compute_double_ref = vm.count("double-ref") > 0;
+    compute_longdouble_ref = vm.count("longdouble-ref") > 0;
+    save_tensors = vm.count("save-tensors") > 0;
+
+    // Default timesteps if not provided
+    if (timesteps.empty()) {
+      timesteps = {1000};
+    }
 
   } catch (const po::error &e) {
     std::cerr << "Command Line Error: " << e.what() << "\n";
@@ -376,71 +410,82 @@ int main(int argc, char *argv[]) {
       // Create stencils once per configuration
       auto [heat, heat_ozaki, l1_norm] = create_stencils(stencil_config.coeffs_oz);
 
-      for (int32_t timestep : TIMESTEPS) {
-        NVTX_PUSH(std::format("Timestep {}", timestep).c_str());
+      for (size_t timestep : timesteps) {
+        NVTX_PUSH(std::format("{} Timesteps", timestep).c_str());
 
         // Compute gold reference solution (highest precision available)
         // Use integer coefficients to avoid double-precision rounding errors
 #ifdef __GNUC__
         auto gold_result = ReferenceSolver::compute<__float128>(
             input, stencil_config.coeffs_oz, l1_norm, std::format("{} Gold (fp128)", stencil_config.name), timestep);
-        write_tensor(std::format("{}{}_{}_{}_gold_fp128.dat", output_dir, output_prefix, stencil_config.name, timestep),
-                     Tensor<__float128>{input.shape, gold_result});
+        if (save_tensors)
+          write_tensor(
+              std::format("{}{}_{}_{}_gold_fp128.dat", output_dir, output_prefix, stencil_config.name, timestep),
+              Tensor<__float128>{input.shape, gold_result});
 #else
         auto gold_result =
             ReferenceSolver::compute<long double>(input, stencil_config.coeffs_oz, l1_norm,
                                                   std::format("{} Gold (long double)", stencil_config.name), timestep);
-        write_tensor(
-            std::format("{}{}_{}_{}_gold_longdouble.dat", output_dir, output_prefix, stencil_config.name, timestep),
-            Tensor<long double>{input.shape, gold_result});
+        if (save_tensors)
+          write_tensor(
+              std::format("{}{}_{}_{}_gold_longdouble.dat", output_dir, output_prefix, stencil_config.name, timestep),
+              Tensor<long double>{input.shape, gold_result});
 #endif
 
-        // Compute float reference
-        {
+        // Compute float reference (if requested)
+        if (compute_float_ref) {
           auto res = ReferenceSolver::compute<float>(input, stencil_config.coeffs_oz, l1_norm,
                                                      std::format("{} Ref (float)", stencil_config.name), timestep);
-          write_tensor(
-              std::format("{}{}_{}_{}_ref_float.dat", output_dir, output_prefix, stencil_config.name, timestep),
-              Tensor<float>{input.shape, res});
+          if (save_tensors)
+            write_tensor(
+                std::format("{}{}_{}_{}_ref_float.dat", output_dir, output_prefix, stencil_config.name, timestep),
+                Tensor<float>{input.shape, res});
           long double error = calculate_rmse(res, gold_result);
           std::cout << std::format("{},float_ref,0,{},{}\n", stencil_config.name, timestep, error);
         }
 
-        // Compute double reference
-        {
+        // Compute double reference (if requested)
+        if (compute_double_ref) {
           auto res = ReferenceSolver::compute<double>(input, stencil_config.coeffs_oz, l1_norm,
                                                       std::format("{} Ref (double)", stencil_config.name), timestep);
-          write_tensor(
-              std::format("{}{}_{}_{}_ref_double.dat", output_dir, output_prefix, stencil_config.name, timestep),
-              Tensor<double>{input.shape, res});
+          if (save_tensors)
+            write_tensor(
+                std::format("{}{}_{}_{}_ref_double.dat", output_dir, output_prefix, stencil_config.name, timestep),
+                Tensor<double>{input.shape, res});
           long double error = calculate_rmse(res, gold_result);
           std::cout << std::format("{},double_ref,0,{},{}\n", stencil_config.name, timestep, error);
         }
 
-        // Compute long double reference
-        {
+        // Compute long double reference (if requested)
+        if (compute_longdouble_ref) {
           auto res =
               ReferenceSolver::compute<long double>(input, stencil_config.coeffs_oz, l1_norm,
                                                     std::format("{} Ref (long double)", stencil_config.name), timestep);
-          write_tensor(
-              std::format("{}{}_{}_{}_ref_longdouble.dat", output_dir, output_prefix, stencil_config.name, timestep),
-              Tensor<long double>{input.shape, res});
+          if (save_tensors)
+            write_tensor(
+                std::format("{}{}_{}_{}_ref_longdouble.dat", output_dir, output_prefix, stencil_config.name, timestep),
+                Tensor<long double>{input.shape, res});
           long double error = calculate_rmse(res, gold_result);
           std::cout << std::format("{},longdouble_ref,0,{},{}\n", stencil_config.name, timestep, error);
         }
 
-        // Create runner for this timestep
-        OzakiRunner runner(input, timestep, 0, 8, l1_norm);
+        // Create runner for this timestep (choose implementation based on flag)
+        std::unique_ptr<OzakiRunnerBase> runner;
+        std::string runner_type;
+        runner = std::make_unique<OzakiRunnerDirect>(input, timestep, 0, 8, output_dir, l1_norm, heat_ozaki);
+        runner_type = "ozaki_direct";
 
         // Test slice counts from 2 to slice_limit
-        for (int32_t s = 2; s <= slice_limit && s < runner.get_max_slices(); ++s) {
+        for (int32_t s = 2; s <= slice_limit && s < runner->get_max_slices(); ++s) {
           std::string output_path =
               std::format("{}{}_{}_{}_oz_{}.dat", output_dir, output_prefix, stencil_config.name, timestep, s);
-          auto gpu_result = runner.run_experiment(s, heat_ozaki, output_path);
+          auto gpu_result = runner->run_experiment(s, output_path, save_tensors);
+          NVTX_PUSH("Error Calculation");
           long double error = calculate_rmse(gpu_result, gold_result);
 
           // Output CSV row: stencil,type,slice_count,timesteps,error
-          std::cout << std::format("{},ozaki,{},{},{}\n", stencil_config.name, s, timestep, error);
+          std::cout << std::format("{},{},{},{},{}\n", stencil_config.name, runner_type, s, timestep, error);
+          NVTX_POP();
         }
 
         NVTX_POP();
