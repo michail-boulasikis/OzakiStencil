@@ -1,12 +1,12 @@
-#include "gtest/gtest.h"
+#include <gtest/gtest.h>
 #include <concepts>
 #include <cuda_runtime_api.h>
 #include <driver_types.h>
-#include <gtest/gtest.h>
 
 #include <ios>
 #include <ozaki/core/stencil.hpp>
 #include <ozaki/gpu/ozi_kernels.cuh>
+#include "test_utils.hpp"
 
 #include <bit>
 #include <cstdint>
@@ -56,30 +56,6 @@ template <typename T> int32_t get_slice_max_beta() {
 }
 
 template <typename T> using get_uint_same_size_t = typename get_uint_same_size<T>::type;
-template <typename T, typename InputContainer, size_t... Dims>
-std::vector<T> compute_gold_standard(const ozi::Stencil<T, Dims...> &stencil, const InputContainer &input,
-                                     const std::array<size_t, sizeof...(Dims)> &shape) {
-
-  using HighPrec = long double;
-  ozi::Stencil<HighPrec, Dims...> s_high;
-
-  s_high.offsets = stencil.offsets;
-  for (size_t i = 0; i < stencil.coeffs.size(); ++i) {
-    s_high.coeffs[i] = static_cast<HighPrec>(stencil.coeffs[i]);
-  }
-
-  std::vector<HighPrec> in_high(input.begin(), input.end());
-  std::vector<HighPrec> out_high(input.size());
-
-  s_high.template apply_to<HighPrec>(out_high, in_high, shape);
-
-  std::vector<T> result(out_high.size());
-  for (size_t i = 0; i < out_high.size(); ++i) {
-    result[i] = static_cast<T>(out_high[i]);
-  }
-
-  return result;
-}
 
 template <typename T> class OzakiTestGPU : public ::testing::Test {
 public:

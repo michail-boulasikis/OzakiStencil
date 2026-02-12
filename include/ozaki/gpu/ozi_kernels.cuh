@@ -109,8 +109,7 @@ __global__ void dyn_range(OzakiDescriptor<O> *__restrict__ out, const typename O
 
   // thread coarsening reduction
 #pragma unroll 4
-  while (ELEMENTS_PER_VECTORIZED_LOAD * i <
-         n) { // this assumes that the input's total size is a multiple of 16 bytes. I am okay with this limitation.
+  while (ELEMENTS_PER_VECTORIZED_LOAD * i < n) { // this assumes that the input's total size is a multiple of 16 bytes.
     const Data *src = in + ELEMENTS_PER_VECTORIZED_LOAD * i;
     VectorizedData vals = *reinterpret_cast<const VectorizedData *>(src);
 #pragma unroll

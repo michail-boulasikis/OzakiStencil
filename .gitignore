@@ -11,6 +11,8 @@ data/
 
 presentation/node_modules/
 
+CLAUDE.md
+
 *.csv
 *.dat
 *.nsys-rep

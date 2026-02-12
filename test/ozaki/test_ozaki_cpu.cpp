@@ -3,6 +3,7 @@
 
 #include <ozaki/core/stencil.hpp>
 #include <ozaki/cpu/ozi.hpp>
+#include "test_utils.hpp"
 
 #include <cmath>
 #include <limits>
@@ -37,35 +38,6 @@ template <typename T>
 const ozi::Stencil<T, 3> d2x{{static_cast<T>(1.0), static_cast<T>(-2.0), static_cast<T>(1.0)}, {1}};
 
 } // namespace test_data
-
-template <typename T, typename InputContainer, size_t... Dims>
-std::vector<T> compute_gold_standard(const ozi::Stencil<T, Dims...> &stencil, const InputContainer &input,
-                                     const std::array<size_t, sizeof...(Dims)> &shape) {
-
-#ifdef __GNUC__
-  using HighPrec = __float128;
-#else
-  using HighPrec = long double;
-#endif
-  ozi::Stencil<HighPrec, Dims...> s_high;
-
-  s_high.offsets = stencil.offsets;
-  for (size_t i = 0; i < stencil.coeffs.size(); ++i) {
-    s_high.coeffs[i] = static_cast<HighPrec>(stencil.coeffs[i]);
-  }
-
-  std::vector<HighPrec> in_high(input.begin(), input.end());
-  std::vector<HighPrec> out_high(input.size());
-
-  s_high.template apply_to<HighPrec>(out_high, in_high, shape);
-
-  std::vector<T> result(out_high.size());
-  for (size_t i = 0; i < out_high.size(); ++i) {
-    result[i] = static_cast<T>(out_high[i]);
-  }
-
-  return result;
-}
 
 template <typename T> class OzakiTestCPU : public ::testing::Test {
 protected:
@@ -324,7 +296,7 @@ TYPED_TEST(OzakiTestCPU, SimpleStencil) {
 
   ozicpu::stencil<Scalar, 3>(result_ozaki, stencil, u, {test_data::N});
 
-  auto result_gold = compute_gold_standard(stencil, u, {test_data::N});
+  auto result_gold = test_utils::compute_gold_standard(stencil, u, {test_data::N});
 
   // we expect Ozaki to be bit-identical or within 1 ULP of the gold Standard
   for (size_t j = 0; j < test_data::N; ++j) {
