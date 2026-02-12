@@ -6,8 +6,7 @@
 
 #include <ios>
 #include <ozaki/core/stencil.hpp>
-#include <ozaki/gpu/gpu_checks.cuh>
-#include <ozaki/gpu/ozi.cuh>
+#include <ozaki/gpu/ozi_kernels.cuh>
 
 #include <bit>
 #include <cstdint>

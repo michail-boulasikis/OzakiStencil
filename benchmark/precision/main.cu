@@ -15,7 +15,7 @@
 
 #include <ozaki/core/stencil.hpp>
 #include <ozaki/cpu/ozi.hpp>
-#include <ozaki/gpu/ozi.cuh>
+#include <ozaki/gpu/ozi_stencil_plain.cuh>
 #include <ozaki/utils/tensor.hpp>
 
 #ifdef __GNUC__
