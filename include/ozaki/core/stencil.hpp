@@ -283,6 +283,22 @@ HD constexpr auto correlate(const Stencil<T1, A...> &a, const Stencil<T2, B...> 
 
   return out;
 }
+
+template <typename StencilType, int32_t N> struct StencilSlices {
+  StencilType slices[N];
+};
+
+template <typename StencilType, typename NewT>
+struct RebindStencil;
+
+template <typename T, size_t... Dims, typename NewT>
+struct RebindStencil<Stencil<T, Dims...>, NewT> {
+  using type = Stencil<NewT, Dims...>;
+};
+
+template <typename StencilType, typename NewT>
+using RebindStencil_t = typename RebindStencil<StencilType, NewT>::type;
+
 } // namespace ozi
 
 #endif // HEADER_STENCIL_HPP

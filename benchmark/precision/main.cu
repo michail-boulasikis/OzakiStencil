@@ -41,7 +41,7 @@ struct Config {
 #endif
   static constexpr int STENCIL_ITERS_DEFAULT = 4096;
   static constexpr size_t STENCIL_BLOCK_DIM_X = 32;
-  static constexpr size_t STENCIL_BLOCK_DIM_Y = 8;
+  static constexpr size_t STENCIL_BLOCK_DIM_Y = 16;
 };
 
 // Stencil configurations for testing
@@ -55,25 +55,31 @@ const std::array<StencilConfig, 4> STENCILS = {{{"Heat", {{0, 3, 0, 3, 4, 3, 0, 
                                                 {"BoxOnes", {{1, 1, 1, 1, 1, 1, 1, 1, 1}}},
                                                 {"BoxRandom", {{-3, 2, 1, -8, 4, -5, -1, -1, 9}}}}};
 
-// Timesteps to test (now configured via command line)
+struct L2CacheInvalidator {
+  int32_t *d_buffer = nullptr;
+  size_t buffer_size = 0;
 
-int32_t *d_flush_buffer = nullptr;
-size_t flush_buffer_size = 0;
-
-void invalidate_caches() {
-  NVTX_PUSH("Flushing L2")
-  if (d_flush_buffer == nullptr) {
+  L2CacheInvalidator() {
     int device_id;
     int l2_cache_size;
     CUDA_CHECK(cudaGetDevice(&device_id));
     CUDA_CHECK(cudaDeviceGetAttribute(&l2_cache_size, cudaDevAttrL2CacheSize, device_id));
-    flush_buffer_size = l2_cache_size * 2;
-    CUDA_CHECK(cudaMalloc(&d_flush_buffer, flush_buffer_size));
+    buffer_size = static_cast<size_t>(l2_cache_size) * 2;
+    CUDA_CHECK(cudaMalloc(&d_buffer, buffer_size));
   }
-  CUDA_CHECK(cudaMemset(d_flush_buffer, 0, flush_buffer_size));
-  CUDA_CHECK(cudaDeviceSynchronize());
-  NVTX_POP();
-}
+
+  ~L2CacheInvalidator() { cudaFree(d_buffer); }
+
+  L2CacheInvalidator(const L2CacheInvalidator &) = delete;
+  L2CacheInvalidator &operator=(const L2CacheInvalidator &) = delete;
+
+  void invalidate() {
+    NVTX_PUSH("Flushing L2")
+    CUDA_CHECK(cudaMemset(d_buffer, 0, buffer_size));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    NVTX_POP();
+  }
+};
 
 template <typename T_Test, typename T_Ref>
 long double calculate_rmse(const std::vector<T_Test> &test, const std::vector<T_Ref> &ref) {
@@ -179,6 +185,7 @@ protected:
   Real scaling_factor = static_cast<Real>(1.0);
 
   ozi::Stencil<int8_t, 3, 3> stencil_3x3;
+  L2CacheInvalidator cache_invalidator;
 
 public:
   OzakiRunnerBase(const Tensor<Real> &input, const int32_t iterations, const int32_t extra_msb, const int32_t extra_lsb,
@@ -282,15 +289,19 @@ public:
                           cudaMemcpyHostToDevice));
 
     prepare_slices();
-    invalidate_caches();
+    cache_invalidator.invalidate();
 
     const dim3 block(Config::STENCIL_BLOCK_DIM_X, Config::STENCIL_BLOCK_DIM_Y);
     const dim3 grid((host_input.width() + block.x - 1) / block.x, (host_input.height() + block.y - 1) / block.y);
 
+    constexpr int32_t M_STENCIL = 1;
+    auto stencil_slices =
+        ozicpu::slice_stencil<ozicpu::OzakiFP_Int8<Real>, IntStencil, M_STENCIL>(stencil_3x3, HighPrecType{1});
+
     NVTX_PUSH("Integration Loop");
     for (size_t t = 0; t < n_iterations; ++t) {
-      ozigpu::stencil_v1<ozigpu::OzakiFP_Int8<Real>, 3, 3>
-          <<<grid, block>>>(d_slices_2, d_slices_1, stencil_3x3, {host_input.width(), host_input.height()}, d_desc);
+      ozigpu::stencil_v1<ozigpu::OzakiFP_Int8<Real>, M_STENCIL, 3, 3>
+          <<<grid, block>>>(d_slices_2, d_slices_1, stencil_slices, {host_input.width(), host_input.height()}, d_desc);
 
       if (t < n_iterations - 1) {
         ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc);
