@@ -24,9 +24,13 @@ static int32_t expected_p_max(const std::vector<int64_t> &int_coeffs) {
   return 63 - range_msb;
 }
 
-// Returns the right-shift used for the k-th slice.
+// Returns the shift used for the k-th slice.
+// k=0 is clamped to non-negative (matching slice_stencil); k>0 can be negative.
 static int32_t expected_shift(int32_t p_max, int32_t target_bits, int32_t k) {
-  return std::max(0, p_max - (target_bits - 1) - target_bits * k);
+  int32_t shift = p_max - (target_bits - 1) - target_bits * k;
+  if (k == 0)
+    shift = std::max(0, shift);
+  return shift;
 }
 
 // Verifies that Sum_k  slice_k[i] * 2^shift_k  ==  int_coeff[i]  for every i.
@@ -41,7 +45,10 @@ void assert_reconstruction(const ozi::StencilSlices<IntStencilType, N> &result,
     int64_t reconstructed = 0;
     for (int32_t k = 0; k < N; ++k) {
       int32_t shift = expected_shift(p_max, target_bits, k);
-      reconstructed += static_cast<int64_t>(result.slices[k].coeffs[i]) << shift;
+      if (shift >= 0)
+        reconstructed += static_cast<int64_t>(result.slices[k].coeffs[i]) << shift;
+      else
+        reconstructed += static_cast<int64_t>(result.slices[k].coeffs[i]) >> (-shift);
     }
     EXPECT_EQ(reconstructed, int_coeffs[i]) << "Reconstruction mismatch at coefficient index " << i;
   }
@@ -190,9 +197,9 @@ TYPED_TEST(SliceStencilTest, FourthOrderFDPhysicalNormalization) {
 //   |511| = 0x1FF (9 bits) -> p_max = 8, shift_0 = max(0, 8-6) = 2
 //   Slice 0:  100>>2 = 25,  (-511)>>2 = -128 -> clamped -127,  100>>2 = 25
 //             residuals:      0,                -511+508 = -3,         0
-//   shift_1 = max(0, 8-6-7) = 0
-//   Slice 1:   0, -3, 0   (residuals pass through unchanged)
-//   Reconstruction: 25*4+0 = 100, -127*4-3 = -511, 25*4+0 = 100
+//   shift_1 = 8-6-7 = -5  (left-shift residual by 5)
+//   Slice 1:   0, -3<<5 = -96, 0
+//   Reconstruction: 25*4+0 = 100, -127*4+(-96>>5) = -127*4-3 = -511, 25*4+0 = 100
 TYPED_TEST(SliceStencilTest, TwoSliceCoefficients) {
   using Scalar = TypeParam;
   using Traits = ozicpu::OzakiFP_Int8<Scalar>;
@@ -212,10 +219,10 @@ TYPED_TEST(SliceStencilTest, TwoSliceCoefficients) {
   EXPECT_EQ(slices.slices[0].coeffs[1], int8_t(-127));
   EXPECT_EQ(slices.slices[0].coeffs[2], int8_t(  25));
 
-  // Least-significant slice (shift = 0)
-  EXPECT_EQ(slices.slices[1].coeffs[0], int8_t( 0));
-  EXPECT_EQ(slices.slices[1].coeffs[1], int8_t(-3));
-  EXPECT_EQ(slices.slices[1].coeffs[2], int8_t( 0));
+  // Least-significant slice (shift = -5, i.e. left-shift by 5)
+  EXPECT_EQ(slices.slices[1].coeffs[0], int8_t(  0));
+  EXPECT_EQ(slices.slices[1].coeffs[1], int8_t(-96));
+  EXPECT_EQ(slices.slices[1].coeffs[2], int8_t(  0));
 
   // Offsets must be preserved in both slices.
   EXPECT_EQ(slices.slices[0].offsets, s.offsets);

@@ -2,6 +2,7 @@
 #define HEADER_OZI_CUH
 
 #include "../core/oztraits.hpp"
+#include "../cpu/ozi.hpp"
 
 #include <climits>
 #include <concepts>
@@ -170,7 +171,7 @@ __host__
 #else
     long double
 #endif
-    total_integration_scale_factor_quad(double a, int64_t time_steps, int64_t shifts) {
+    total_integration_scale_factor_quad(HighPrecType a, int64_t time_steps, int64_t shifts) {
   using Target = typename O::target_type;
   constexpr int32_t slice_bits = CHAR_BIT * sizeof(Target) - 1;
 
@@ -197,10 +198,9 @@ __host__
 
 #ifdef __GNUC__
   // We compute: 2^(slice_bits * shifts) / a^time_steps
-  __float128 a_quad = static_cast<__float128>(a);
   int exp;
 
-  __float128 frac = frexpq(a_quad, &exp);
+  __float128 frac = frexpq(a, &exp);
 
   __float128 pow_frac = powq(frac, static_cast<__float128>(time_steps));
 
@@ -213,10 +213,9 @@ __host__
   return scalbnq(inv_pow_frac, static_cast<int>(total_exp));
 
 #else
-  long double a_ld = static_cast<long double>(a);
   int exp;
 
-  long double frac = std::frexp(a_ld, &exp);
+  long double frac = std::frexp(a, &exp);
   long double pow_frac = std::pow(frac, static_cast<long double>(time_steps));
 
   long double inv_pow_frac = static_cast<long double>(1.0) / pow_frac;

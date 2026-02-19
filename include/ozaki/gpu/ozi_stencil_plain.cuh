@@ -68,25 +68,19 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
     in_bounds = in_bounds && check_dim(i, 2);
   }
 
-  bool valid_thread = (i < input_shape[0]);
-  if constexpr (sizeof...(Dims) > 1)
-    valid_thread &= (j < input_shape[1]);
-  if constexpr (sizeof...(Dims) > 2)
-    valid_thread &= (k < input_shape[2]);
+  bool valid_thread;
+  if constexpr (sizeof...(Dims) == 1)
+    valid_thread = (i < input_shape[0]);
+  else if constexpr (sizeof...(Dims) == 2)
+    valid_thread = (j < input_shape[0]) && (i < input_shape[1]);
+  else
+    valid_thread = (k < input_shape[0]) && (j < input_shape[1]) && (i < input_shape[2]);
 
   size_t slice_stride = 1;
   for (auto d : input_shape) {
     slice_stride *= d;
   }
 
-  // Per-slice stencil gains (L1 norms) for boundary handling
-  Acc stencil_gain[M];
-  for (int32_t si = 0; si < M; ++si) {
-    stencil_gain[si] = 0;
-    for (const auto &c : s.slices[si].coeffs) {
-      stencil_gain[si] += abs(static_cast<Acc>(c));
-    }
-  }
   const auto input_strides = ozi::make_strides_from_shape(input_shape);
 
   // M accumulators for the sliding window of result positions.
@@ -102,9 +96,9 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
     if constexpr (sizeof...(Dims) == 1)
       out_offset = i;
     else if constexpr (sizeof...(Dims) == 2)
-      out_offset = i + j * input_shape[0];
+      out_offset = i + j * input_shape[1];
     else if constexpr (sizeof...(Dims) == 3)
-      out_offset = i + j * input_shape[1] + k * input_shape[0] * input_shape[1];
+      out_offset = i + j * input_shape[2] + k * input_shape[1] * input_shape[2];
 
     // ---- Main loop: process data slices from LSB to MSB ----
     // Each iteration loads one data slice and applies all M stencil slices to
@@ -146,7 +140,7 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
             else if constexpr (sizeof...(Dims) == 3)
               partial = s.slices[si].template apply_at_as<Acc>(current_slice_input, input_strides, k, j, i);
           } else {
-            partial = static_cast<Acc>(current_slice_input[out_offset]) * stencil_gain[si];
+            partial = static_cast<Acc>(current_slice_input[out_offset]) * static_cast<Acc>(s.boundary_gain[si]);
           }
         }
         acc[si] += partial;

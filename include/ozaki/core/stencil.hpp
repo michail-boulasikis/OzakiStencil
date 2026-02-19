@@ -243,8 +243,9 @@ public:
   template <typename AccType = value_type>
   AccType l1_norm() const {
     AccType norm = static_cast<AccType>(0);
-    for (const auto& coeff : coeffs) {
-      norm += std::abs(coeff);
+    for (const auto &coeff : coeffs) {
+      AccType val = static_cast<AccType>(coeff);
+      norm += (val < AccType(0)) ? -val : val;
     }
     return norm;
   }
@@ -286,6 +287,11 @@ HD constexpr auto correlate(const Stencil<T1, A...> &a, const Stencil<T2, B...> 
 
 template <typename StencilType, int32_t N> struct StencilSlices {
   StencilType slices[N];
+  // Per-slice boundary gains: the L1 norm of the combined integer stencil
+  // decomposed into N base-128 digits (MSB first). Used by the GPU kernel
+  // to scale boundary cells so that the effective gain matches the scale
+  // factor base exactly, producing frozen boundaries after rescaling.
+  typename StencilType::value_type boundary_gain[N];
 };
 
 template <typename StencilType, typename NewT>

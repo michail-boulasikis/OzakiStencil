@@ -193,7 +193,7 @@ template <OzakiPair O> OzakiSlices<O> slice(std::span<const typename O::data_typ
 
 template <OzakiPair O, typename StencilType, int32_t N = 1, typename HighPrec = HighPrecType>
 StencilSlices<RebindStencil_t<StencilType, typename O::target_type>, N>
-slice_stencil(StencilType s, HighPrec a) {
+slice_stencil(StencilType s, HighPrec a, int32_t extra_msb_shift = 0) {
   using Target = typename O::target_type;
   using IntStencilType = RebindStencil_t<StencilType, Target>;
 
@@ -227,22 +227,51 @@ slice_stencil(StencilType s, HighPrec a) {
   std::array<int64_t, StencilType::size> residual = high_prec_int_coeffs;
 
   for (int32_t k = 0; k < N; ++k) {
-    // Arithmetic right-shift that aligns the k-th window of target_bits bits
+    // Arithmetic shift that aligns the k-th window of target_bits bits
     // to positions [target_bits-1 : 0].  Consecutive slices are target_bits
     // apart, matching the carry step (>> target_bits) in the GPU kernel.
-    int32_t shift = std::max(0, p_max - (target_bits - 1) - target_bits * k);
+    // For k=0 the shift is always non-negative when M>=2 (p_max >= 7);
+    // max(0,...) protects the M=1 case where p_max < target_bits.
+    // For k>0 the shift can be negative, meaning the residual has fewer
+    // bits than target_bits and must be left-shifted into the window.
+    int32_t shift = p_max - (target_bits - 1) + extra_msb_shift - target_bits * k;
+    if (k == 0)
+      shift = std::max(0, shift);
 
     result.slices[k].offsets = s.offsets;
 
     for (size_t i = 0; i < StencilType::size; ++i) {
-      int64_t val = (shift > 0) ? (residual[i] >> shift) : residual[i];
+      int64_t val = (shift >= 0) ? (residual[i] >> shift) : (residual[i] << (-shift));
       // Clamp to the symmetric int8 range [-127, 127] to keep multiplication
       // well-behaved and to avoid the prohibited INT8_MIN value.
       val = std::max(LO, std::min(HI, val));
       result.slices[k].coeffs[i] = static_cast<Target>(val);
       // Subtract this slice's exact contribution so the residual carries only
       // the bits not yet captured.
-      residual[i] -= static_cast<int64_t>(result.slices[k].coeffs[i]) << shift;
+      residual[i] -= (shift >= 0)
+          ? (static_cast<int64_t>(result.slices[k].coeffs[i]) << shift)
+          : (static_cast<int64_t>(result.slices[k].coeffs[i]) >> (-shift));
+    }
+  }
+
+  // Compute boundary gains: L1 norm of combined integer stencil decomposed
+  // into N base-128 digits. This ensures boundary scaling matches the scale
+  // factor base exactly for any sign pattern and any M.
+  {
+    constexpr int64_t base = int64_t(1) << target_bits; // 128
+    int64_t combined_l1 = 0;
+    for (size_t i = 0; i < StencilType::size; ++i) {
+      int64_t combined = 0;
+      int64_t weight = 1;
+      for (int32_t si = N - 1; si >= 0; --si) {
+        combined += static_cast<int64_t>(result.slices[si].coeffs[i]) * weight;
+        weight *= base;
+      }
+      combined_l1 += (combined < 0) ? -combined : combined;
+    }
+    for (int32_t si = N - 1; si >= 0; --si) {
+      result.boundary_gain[si] = static_cast<Target>(combined_l1 % base);
+      combined_l1 /= base;
     }
   }
 
