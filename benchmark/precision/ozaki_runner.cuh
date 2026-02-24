@@ -188,13 +188,33 @@ public:
     for (size_t d = 0; d < ndims && d < host_input.shape.size(); ++d)
       input_shape[d] = host_input.shape[d];
 
+    // Proactive shift schedule: for scaling_factor > 1, each iteration
+    // grows the integer domain by ~log2(sf) bits. Every 7 bits of growth
+    // requires one shift. Distributing shifts evenly prevents both
+    // under-shifting (MSB overflow) and over-shifting (data loss).
+    double log2_sf = (this->scaling_factor > HighPrecType(1))
+        ? std::log2(static_cast<double>(this->scaling_factor))
+        : 0.0;
+    int32_t total_shifts_needed = static_cast<int32_t>(
+        std::ceil(n_iterations * log2_sf / 7.0));
+
     NVTX_PUSH("Integration Loop");
     for (int32_t t = 0; t < n_iterations; ++t) {
       ozigpu::stencil_v1<ozigpu::OzakiFP_Int8<Real>, M, Dims...>
           <<<grid, block>>>(d_slices_2, d_slices_1, stencil_slices_, input_shape, d_desc);
 
       if (t < n_iterations - 1) {
-        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc);
+        // At the penultimate iteration, require ALL shifts so the final
+        // stencil application operates on a fully-shifted representation.
+        int32_t min_shifts_now;
+        if (t == n_iterations - 2) {
+          min_shifts_now = total_shifts_needed;
+        } else {
+          min_shifts_now = static_cast<int32_t>(
+              std::ceil((t + 1) * log2_sf / 7.0));
+        }
+        if (min_shifts_now < 0) min_shifts_now = 0;
+        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
       }
 
       std::swap(d_slices_1, d_slices_2);
@@ -224,6 +244,33 @@ public:
         this->scaling_factor, n_iterations, h_desc.n_shifts);
     ozigpu::scale<AccumulatorType, long double><<<nBlocksScale, nThreadsScale>>>(d_res, factor, n_elems);
 #endif
+
+    // Correct the systematic scaling error at boundary points introduced by
+    // integer rounding of boundary_gain.  After mend+scale, each boundary
+    // value equals u * bg_ratio^T instead of u; multiplying by 1/bg_ratio^T
+    // recovers the exact answer.
+    {
+      constexpr size_t ndims = sizeof...(Dims);
+      const auto &s0 = stencil_slices_.slices[0];
+
+#ifdef __GNUC__
+      __float128 bg_ratio_hp = static_cast<__float128>(stencil_slices_.bg_ratio);
+      __float128 boundary_correction = __float128(1);
+      for (int32_t t = 0; t < n_iterations; ++t)
+        boundary_correction /= bg_ratio_hp;
+      ozigpu::correct_boundary<AccumulatorType, __float128, ndims>
+          <<<grid, block>>>(d_res, boundary_correction, input_shape,
+                            s0.offsets, s0.get_shape());
+#else
+      long double bg_ratio_hp = static_cast<long double>(stencil_slices_.bg_ratio);
+      long double boundary_correction = 1.0L;
+      for (int32_t t = 0; t < n_iterations; ++t)
+        boundary_correction /= bg_ratio_hp;
+      ozigpu::correct_boundary<AccumulatorType, long double, ndims>
+          <<<grid, block>>>(d_res, boundary_correction, input_shape,
+                            s0.offsets, s0.get_shape());
+#endif
+    }
 
     std::vector<AccumulatorType> gpu_result(n_elems);
     CUDA_CHECK(cudaMemcpy(gpu_result.data(), d_res, n_elems * sizeof(AccumulatorType), cudaMemcpyDeviceToHost));

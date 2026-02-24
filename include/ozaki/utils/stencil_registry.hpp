@@ -159,7 +159,7 @@ inline int compute_m_needed(const StencilSpec &spec, CoeffStorageType a) {
 struct StencilParams {
   CoeffStorageType a_coeff;        // Integer basis: all coeffs / a_coeff are integers (exact or approx)
   int32_t          m;              // Number of int8 slices required to represent the integer stencil
-  CoeffStorageType scaling_factor; // L1-norm(coeffs) / a_coeff; used to undo integer scaling after convolution
+  CoeffStorageType scaling_factor; // 1 / effective_a; used to undo integer scaling after convolution
   bool             exact_basis;    // true if a_coeff is exact; false if the fallback approximation was used
   int32_t          extra_msb_shift = 0; // Right-shift for MSB slice to keep L1 < 127
 };
@@ -226,13 +226,15 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
         int32_t shift = std::max(0, p_max + extra_shift - (target_bits - 1));
         int64_t l1 = 0;
         for (size_t i = 0; i < int_coeffs.size(); ++i) {
-          int64_t val = (shift > 0) ? (int_coeffs[i] >> shift) : int_coeffs[i];
-          l1 += (val < 0) ? -val : val;
+          uint64_t abs_val = (int_coeffs[i] < 0)
+            ? static_cast<uint64_t>(-int_coeffs[i])
+            : static_cast<uint64_t>(int_coeffs[i]);
+          l1 += static_cast<int64_t>(abs_val >> shift);
         }
         return l1;
       };
 
-      while (compute_msb_l1(p.extra_msb_shift) >= 127) {
+      while (compute_msb_l1(p.extra_msb_shift) >= 63) {
         p.extra_msb_shift++;
       }
 
@@ -244,14 +246,9 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
   }
 
   // Step 3: compute the scaling factor.
-  // The digit-domain stencil has per-iteration growth = L1 / (a_coeff * 2^shift0),
-  // where shift0 is the right-shift applied to the MSB stencil slice.
+  // The digit-domain stencil has per-iteration growth = 1 / effective_a,
+  // where effective_a = a_coeff * 2^shift0.
   // total_integration_scale_factor_quad(scaling_factor, N, shifts) = 2^(7*shifts) / scaling_factor^N
-  CoeffStorageType l1 = CoeffStorageType(0);
-  for (const auto &c : spec.coeffs) {
-    CoeffStorageType ac = (c >= CoeffStorageType(0)) ? c : -c;
-    l1 += ac;
-  }
   CoeffStorageType effective_a = p.a_coeff;
   if (p.m > 1) {
     int32_t shift0 = std::max(0, p_max - (target_bits - 1) + p.extra_msb_shift);
@@ -261,7 +258,28 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
     effective_a = std::scalbn(p.a_coeff, shift0);
 #endif
   }
-  p.scaling_factor = (l1 > CoeffStorageType(1e-30)) ? (l1 / effective_a) : CoeffStorageType(1);
+  p.scaling_factor = (effective_a > CoeffStorageType(0))
+      ? (CoeffStorageType(1) / effective_a)
+      : CoeffStorageType(1);
+
+  // Ensure boundary_gain's most-significant digit fits in int8_t (values in [-127, 127]).
+  // boundary_gain encodes round(1/effective_a) in base-128; the MSB digit equals
+  // floor(scaling_factor). When scaling_factor >= 128 that digit overflows int8_t
+  // and gets silently truncated (mod 128).
+  // Each extra_msb_shift increment doubles effective_a and halves scaling_factor until < 128.
+  while (p.m > 1 && p.scaling_factor >= CoeffStorageType(128)) {
+    p.extra_msb_shift++;
+    int32_t new_shift0 = std::max(0, p_max - (target_bits - 1) + p.extra_msb_shift);
+#ifdef __GNUC__
+    effective_a = scalbnq(p.a_coeff, new_shift0);
+#else
+    effective_a = std::scalbn(p.a_coeff, new_shift0);
+#endif
+    p.m = (p_max + p.extra_msb_shift) / target_bits + 1;
+    p.scaling_factor = (effective_a > CoeffStorageType(0))
+        ? (CoeffStorageType(1) / effective_a)
+        : CoeffStorageType(1);
+  }
 
   return p;
 }
@@ -280,7 +298,7 @@ inline const std::vector<StencilSpec> &default_stencils() {
        {CoeffStorageType(0), CoeffStorageType(11.0/61), CoeffStorageType(0), CoeffStorageType(11.0/61), CoeffStorageType(15.0/61),
         CoeffStorageType(12.0/61), CoeffStorageType(0), CoeffStorageType(12.0/61), CoeffStorageType(0)},
       OriginalPrecision::Double},
-      {"BoxOnes",
+      {"BoxAvg",
        {3, 3},
        {1, 1},
        {CoeffStorageType(1.0/9), CoeffStorageType(1.0/9), CoeffStorageType(1.0/9), CoeffStorageType(1.0/9), CoeffStorageType(1.0/9),

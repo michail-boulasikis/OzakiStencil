@@ -54,7 +54,8 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
   bool in_bounds = true;
   const auto &s_shape = s.slices[0].get_shape();
   auto check_dim = [&] __device__(int32_t idx, size_t dim_idx) {
-    return (idx >= s.slices[0].offsets[dim_idx] && idx <= input_shape[dim_idx] - (s_shape[dim_idx] - s.slices[0].offsets[dim_idx]));
+    return (idx >= s.slices[0].offsets[dim_idx] &&
+            idx <= input_shape[dim_idx] - (s_shape[dim_idx] - s.slices[0].offsets[dim_idx]));
   };
 
   if constexpr (sizeof...(Dims) == 1) {
@@ -168,7 +169,12 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
     // After the main loop, positions 0 through min(M-2, total_slices-1) have
     // not yet been output. They reside in the accumulators and only need
     // shift + carry propagation (no new stencil applications).
-    const int32_t cleanup_start = (M - 2 < total_slices - 1) ? M - 2 : total_slices - 1;
+    // When total_slices < M-1, the main loop produced no output at all.
+    // result_p lives in acc[p] after the main loop. We need M-total_slices
+    // extra shifts to bring result_{total_slices-1} up to acc[M-1] before
+    // the first real output. Always start cleanup_start at M-2; skip
+    // writing to positions p >= total_slices (they are out-of-range).
+    const int32_t cleanup_start = M - 2;
     for (int32_t p = cleanup_start; p >= 0; --p) {
       for (int32_t si = M - 1; si > 0; --si) {
         acc[si] = acc[si - 1];
@@ -177,16 +183,18 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
       acc[M - 1] += carry;
       carry = static_cast<Acc>(0);
 
-      int32_t out_phys = (carry_idx + p) % total_slices;
-      Target *current_slice_output = out + slice_stride * out_phys;
+      if (p < total_slices) {
+        int32_t out_phys = (carry_idx + p) % total_slices;
+        Target *current_slice_output = out + slice_stride * out_phys;
 
-      if (p != 0) {
-        Target slice_val = static_cast<Target>(acc[M - 1]);
-        current_slice_output[out_offset] = slice_val;
-        carry = (acc[M - 1] - static_cast<Acc>(slice_val)) >> (CHAR_BIT * sizeof(Target) - 1);
-      } else {
-        // MSB result: store directly
-        current_slice_output[out_offset] = static_cast<Target>(acc[M - 1]);
+        if (p != 0) {
+          Target slice_val = static_cast<Target>(acc[M - 1]);
+          current_slice_output[out_offset] = slice_val;
+          carry = (acc[M - 1] - static_cast<Acc>(slice_val)) >> (CHAR_BIT * sizeof(Target) - 1);
+        } else {
+          // MSB result: store directly
+          current_slice_output[out_offset] = static_cast<Target>(acc[M - 1]);
+        }
       }
     }
   }

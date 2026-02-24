@@ -33,6 +33,71 @@ template <typename T, typename ScaleT = double> __global__ void scale(T *__restr
     in[tid] = static_cast<T>(static_cast<ScaleT>(in[tid]) * val);
 }
 
+// Applies a scalar correction to boundary points only.
+// A point is a boundary point when its thread index falls outside the
+// interior region defined by the stencil offsets and shape — matching the
+// same check_dim predicate used in stencil_v1.
+// Interior points (in_bounds == true) are left unchanged.
+template <typename T, typename ScaleT, size_t D>
+  requires(D >= 1 && D <= 3)
+__global__ void correct_boundary(T *__restrict__ data, ScaleT correction,
+                                 std::array<size_t, D> input_shape,
+                                 std::array<size_t, D> stencil_offsets,
+                                 std::array<size_t, D> stencil_shape) {
+  int32_t i = static_cast<int32_t>(threadIdx.x + blockDim.x * blockIdx.x);
+  int32_t j = 0, k = 0;
+  if constexpr (D > 1)
+    j = static_cast<int32_t>(threadIdx.y + blockDim.y * blockIdx.y);
+  if constexpr (D > 2)
+    k = static_cast<int32_t>(threadIdx.z + blockDim.z * blockIdx.z);
+
+  bool valid_thread;
+  if constexpr (D == 1)
+    valid_thread = (i < static_cast<int32_t>(input_shape[0]));
+  else if constexpr (D == 2)
+    valid_thread = (j < static_cast<int32_t>(input_shape[0])) &&
+                   (i < static_cast<int32_t>(input_shape[1]));
+  else
+    valid_thread = (k < static_cast<int32_t>(input_shape[0])) &&
+                   (j < static_cast<int32_t>(input_shape[1])) &&
+                   (i < static_cast<int32_t>(input_shape[2]));
+
+  if (!valid_thread)
+    return;
+
+  // Mirror the check_dim predicate from stencil_v1: a thread is in_bounds iff
+  // its index is in [offset, input_size - (stencil_size - offset)] for each dim.
+  auto check_dim = [&](int32_t idx, size_t d) -> bool {
+    return idx >= static_cast<int32_t>(stencil_offsets[d]) &&
+           idx <= static_cast<int32_t>(input_shape[d] -
+                                       (stencil_shape[d] - stencil_offsets[d]));
+  };
+
+  bool in_bounds;
+  if constexpr (D == 1)
+    in_bounds = check_dim(i, 0);
+  else if constexpr (D == 2)
+    in_bounds = check_dim(j, 0) && check_dim(i, 1);
+  else
+    in_bounds = check_dim(k, 0) && check_dim(j, 1) && check_dim(i, 2);
+
+  if (in_bounds)
+    return; // interior point: no correction needed
+
+  size_t out_offset;
+  if constexpr (D == 1)
+    out_offset = static_cast<size_t>(i);
+  else if constexpr (D == 2)
+    out_offset = static_cast<size_t>(i) +
+                 static_cast<size_t>(j) * input_shape[1];
+  else
+    out_offset = static_cast<size_t>(i) +
+                 static_cast<size_t>(j) * input_shape[2] +
+                 static_cast<size_t>(k) * input_shape[1] * input_shape[2];
+
+  data[out_offset] = static_cast<T>(static_cast<ScaleT>(data[out_offset]) * correction);
+}
+
 template <typename T, typename Dst = T, typename Acc = T>
   requires(!std::is_same_v<Dst, __float128>) // atomic operations not supported for FP128
 __global__ void mse(Dst *__restrict__ out, const T *__restrict__ x, const T *__restrict__ y, size_t n) {
@@ -235,16 +300,19 @@ __global__ void mend(OutputType *__restrict__ out, const typename O::target_type
 }
 
 /** State update kernel for integration */
-template <OzakiPair O> __global__ void update_ozaki_desc(OzakiDescriptor<O> *__restrict__ desc) {
+template <OzakiPair O>
+__global__ void update_ozaki_desc(OzakiDescriptor<O> *__restrict__ desc,
+                                  int32_t min_shifts = 0) {
   if (threadIdx.x == 0) {
-    int32_t perform_shift = desc->shift_required;
-    if (perform_shift) {
+    bool should_shift = (desc->shift_required != 0) ||
+                        (desc->n_shifts < min_shifts);
+    if (should_shift) {
       int32_t total = desc->n_slices_input;
       desc->carry_slice_index = (desc->carry_slice_index + total - 1) % total;
       desc->n_shifts += 1;
       desc->shift_required = 0;
     }
-    desc->just_shifted = perform_shift;
+    desc->just_shifted = should_shift ? 1 : 0;
   }
 }
 } // namespace ozigpu

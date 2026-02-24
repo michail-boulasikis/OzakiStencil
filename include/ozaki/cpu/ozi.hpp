@@ -254,24 +254,59 @@ slice_stencil(StencilType s, HighPrec a, int32_t extra_msb_shift = 0) {
     }
   }
 
-  // Compute boundary gains: L1 norm of combined integer stencil decomposed
-  // into N base-128 digits. This ensures boundary scaling matches the scale
-  // factor base exactly for any sign pattern and any M.
+  // Compute boundary gain: encode round(128^(N-1) / effective_a) in base-128.
+  //
+  // The GPU kernel's multi-digit multiplication of data (N digits) by
+  // boundary_gain (N digits) produces a 2N-1 digit product, but only the
+  // upper N digits are stored — the lower N-1 digits are truncated. This
+  // implicit division by 128^(N-1) means the effective per-iteration
+  // boundary scaling is: boundary_gain_combined / 128^(N-1).
+  //
+  // For boundaries and interior to share the same rescaling factor
+  // (scaling_factor = 1/effective_a), we need:
+  //   boundary_gain_combined / 128^(N-1) = 1/effective_a
+  //   boundary_gain_combined = 128^(N-1) / effective_a
   {
-    constexpr int64_t base = int64_t(1) << target_bits; // 128
-    int64_t combined_l1 = 0;
-    for (size_t i = 0; i < StencilType::size; ++i) {
-      int64_t combined = 0;
-      int64_t weight = 1;
-      for (int32_t si = N - 1; si >= 0; --si) {
-        combined += static_cast<int64_t>(result.slices[si].coeffs[i]) * weight;
-        weight *= base;
-      }
-      combined_l1 += (combined < 0) ? -combined : combined;
+    constexpr unsigned __int128 base = static_cast<unsigned __int128>(1) << target_bits; // 128
+
+    // Compute shift0 (same formula as the k=0 slice shift above)
+    int32_t shift0 = std::max(0, p_max - (target_bits - 1) + extra_msb_shift);
+
+    // bg_value = 128^(N-1) / effective_a = 128^(N-1) / (a * 2^shift0)
+    // Compute in high precision, then round to nearest integer.
+    HighPrec eff_a = OzakiTraits<HighPrec>::scalbn(a, shift0);
+    HighPrec bg_real = HighPrec(1) / eff_a;
+    // Multiply by 128^(N-1) to account for the kernel's implicit LSB truncation
+    for (int32_t k = 0; k < N - 1; ++k)
+      bg_real *= static_cast<HighPrec>(base);
+
+    // Round to nearest integer using HighPrec arithmetic
+    unsigned __int128 bg_value;
+    if (bg_real >= HighPrec(0)) {
+      bg_value = static_cast<unsigned __int128>(bg_real + HighPrec(0.5));
+    } else {
+      bg_value = 0; // defensive: should always be positive
     }
+
+    // Save bg_combined before the base-128 decomposition loop consumes it.
+    // bg_ratio = bg_combined * effective_a / 128^(N-1) — ideally exactly 1.0,
+    // deviates by rounding in the step above.
+    const unsigned __int128 bg_combined = bg_value;
+
+    // Decompose into N base-128 digits (LSB first extraction, MSB-first storage)
     for (int32_t si = N - 1; si >= 0; --si) {
-      result.boundary_gain[si] = static_cast<Target>(combined_l1 % base);
-      combined_l1 /= base;
+      result.boundary_gain[si] = static_cast<Target>(bg_value % base);
+      bg_value /= base;
+    }
+
+    // Compute bg_ratio in high precision, then store as double.
+    // double is sufficient: bg_ratio ≈ 1 + O(1e-5), and double has ~1e-15
+    // relative precision, which is far better than the boundary_gain rounding.
+    {
+      HighPrec ratio = static_cast<HighPrec>(bg_combined) * eff_a;
+      for (int32_t k = 0; k < N - 1; ++k)
+        ratio /= static_cast<HighPrec>(base);
+      result.bg_ratio = static_cast<double>(ratio);
     }
   }
 

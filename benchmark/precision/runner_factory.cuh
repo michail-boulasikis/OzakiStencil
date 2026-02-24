@@ -82,6 +82,17 @@ inline std::unique_ptr<OzakiRunnerBase> make_ozaki_runner(const StencilSpec &spe
   auto params = ozi::compute_stencil_params(spec);
   auto variant = ozi::make_stencil(spec);
 
+  // Validate that stencil dimensionality matches input tensor dimensionality
+  std::visit(
+      [&](const auto &s) {
+        constexpr size_t stencil_ndims = std::decay_t<decltype(s)>::dims;
+        if (stencil_ndims != input.shape.size())
+          throw std::invalid_argument(
+              std::format("Stencil '{}' has {} dimensions but input tensor has {} dimensions",
+                          spec.name, stencil_ndims, input.shape.size()));
+      },
+      variant);
+
   std::cout << std::format("  Using stencil {}: #Slices = {}, a = {}, extra_msb_shift = {}\n", spec.name, params.m,
                            params.a_coeff, params.extra_msb_shift);
 

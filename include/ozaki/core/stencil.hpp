@@ -292,6 +292,11 @@ template <typename StencilType, int32_t N> struct StencilSlices {
   // to scale boundary cells so that the effective gain matches the scale
   // factor base exactly, producing frozen boundaries after rescaling.
   typename StencilType::value_type boundary_gain[N];
+  // Exact boundary scaling ratio: bg_combined * effective_a / 128^(N-1).
+  // Equals 1.0 exactly when boundary_gain has infinite precision; in practice
+  // deviates by ~0.5 * effective_a / 128^(N-1) due to integer rounding.
+  // Used by the host to compute the post-integration boundary correction.
+  double bg_ratio = 1.0;
 };
 
 template <typename StencilType, typename NewT>
