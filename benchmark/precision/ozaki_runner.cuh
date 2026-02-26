@@ -140,9 +140,12 @@ public:
                     HighPrecType a_coeff, int32_t extra_msb_shift = 0)
       : OzakiRunnerBase(input, iterations, extra_msb, extra_lsb, prefix, a) {
     // Compute int8_t stencil slices: divide coefficients by a_coeff to get integer stencil.
+    // Pass num_slices_total as n_emulated so that emulated_gain has data-width precision,
+    // eliminating per-iteration boundary quantization error.
     stencil_slices_ =
         ozicpu::slice_stencil<ozicpu::OzakiFP_Int8<Real>, ozi::Stencil<CoeffT, Dims...>, M>(stencil, a_coeff,
-                                                                                             extra_msb_shift);
+                                                                                             extra_msb_shift,
+                                                                                             num_slices_total);
   }
 
   std::vector<AccumulatorType> run_experiment(int32_t active_slices, const std::string &output_path,
@@ -244,33 +247,6 @@ public:
         this->scaling_factor, n_iterations, h_desc.n_shifts);
     ozigpu::scale<AccumulatorType, long double><<<nBlocksScale, nThreadsScale>>>(d_res, factor, n_elems);
 #endif
-
-    // Correct the systematic scaling error at boundary points introduced by
-    // integer rounding of boundary_gain.  After mend+scale, each boundary
-    // value equals u * bg_ratio^T instead of u; multiplying by 1/bg_ratio^T
-    // recovers the exact answer.
-    {
-      constexpr size_t ndims = sizeof...(Dims);
-      const auto &s0 = stencil_slices_.slices[0];
-
-#ifdef __GNUC__
-      __float128 bg_ratio_hp = static_cast<__float128>(stencil_slices_.bg_ratio);
-      __float128 boundary_correction = __float128(1);
-      for (int32_t t = 0; t < n_iterations; ++t)
-        boundary_correction /= bg_ratio_hp;
-      ozigpu::correct_boundary<AccumulatorType, __float128, ndims>
-          <<<grid, block>>>(d_res, boundary_correction, input_shape,
-                            s0.offsets, s0.get_shape());
-#else
-      long double bg_ratio_hp = static_cast<long double>(stencil_slices_.bg_ratio);
-      long double boundary_correction = 1.0L;
-      for (int32_t t = 0; t < n_iterations; ++t)
-        boundary_correction /= bg_ratio_hp;
-      ozigpu::correct_boundary<AccumulatorType, long double, ndims>
-          <<<grid, block>>>(d_res, boundary_correction, input_shape,
-                            s0.offsets, s0.get_shape());
-#endif
-    }
 
     std::vector<AccumulatorType> gpu_result(n_elems);
     CUDA_CHECK(cudaMemcpy(gpu_result.data(), d_res, n_elems * sizeof(AccumulatorType), cudaMemcpyDeviceToHost));

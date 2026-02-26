@@ -14,9 +14,6 @@
 #include <variant>
 #include <vector>
 
-#include <format>
-#include <iostream>
-
 namespace ozi {
 
 static constexpr int32_t MAX_STENCIL_SLICE_INT = (1 << 21);
@@ -250,7 +247,7 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
   // where effective_a = a_coeff * 2^shift0.
   // total_integration_scale_factor_quad(scaling_factor, N, shifts) = 2^(7*shifts) / scaling_factor^N
   CoeffStorageType effective_a = p.a_coeff;
-  if (p.m > 1) {
+  {
     int32_t shift0 = std::max(0, p_max - (target_bits - 1) + p.extra_msb_shift);
 #ifdef __GNUC__
     effective_a = scalbnq(p.a_coeff, shift0);
@@ -267,7 +264,7 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
   // floor(scaling_factor). When scaling_factor >= 128 that digit overflows int8_t
   // and gets silently truncated (mod 128).
   // Each extra_msb_shift increment doubles effective_a and halves scaling_factor until < 128.
-  while (p.m > 1 && p.scaling_factor >= CoeffStorageType(128)) {
+  while (p.scaling_factor >= CoeffStorageType(128)) {
     p.extra_msb_shift++;
     int32_t new_shift0 = std::max(0, p_max - (target_bits - 1) + p.extra_msb_shift);
 #ifdef __GNUC__

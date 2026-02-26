@@ -286,17 +286,19 @@ HD constexpr auto correlate(const Stencil<T1, A...> &a, const Stencil<T2, B...> 
 }
 
 template <typename StencilType, int32_t N> struct StencilSlices {
+  static constexpr int32_t MAX_DATA_SLICES = 24;
+
   StencilType slices[N];
   // Per-slice boundary gains: the L1 norm of the combined integer stencil
-  // decomposed into N base-128 digits (MSB first). Used by the GPU kernel
-  // to scale boundary cells so that the effective gain matches the scale
-  // factor base exactly, producing frozen boundaries after rescaling.
+  // decomposed into N base-128 digits (MSB first). Used as fallback when
+  // emulated_gain is not available (n_emulated_gain_slices == 0).
   typename StencilType::value_type boundary_gain[N];
-  // Exact boundary scaling ratio: bg_combined * effective_a / 128^(N-1).
-  // Equals 1.0 exactly when boundary_gain has infinite precision; in practice
-  // deviates by ~0.5 * effective_a / 128^(N-1) due to integer rounding.
-  // Used by the host to compute the post-integration boundary correction.
-  double bg_ratio = 1.0;
+  // Data-width emulated boundary gain: encodes 1/effective_a in as many
+  // base-128 digits as there are data slices, giving precision ~1/128^(N_data-1).
+  // This eliminates per-iteration quantization error at boundary cells,
+  // making post-hoc boundary correction unnecessary.
+  typename StencilType::value_type emulated_gain[MAX_DATA_SLICES];
+  int32_t n_emulated_gain_slices = 0;
 };
 
 template <typename StencilType, typename NewT>

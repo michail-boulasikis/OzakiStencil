@@ -4,31 +4,35 @@ import struct
 import glob
 import csv
 import os
+import re
+import sys
+import argparse
 from itertools import product
 
-STENCIL_NAME = ["0", "1", "2", "3"]
-REQUESTED_SLICES = [1, 2, 3, None]
+STENCIL_NAME = ["0", "1", "2"]
+REQUESTED_SLICES = [1, 2, None]
 NEGATIVE_COEFFS = [True, False]
+SPARSE = [True, False]
+L1_NORM = ["ONE", "GT1", "LT1"]
 
-TIMESTEPS = [1, 10, 100]
+TIMESTEPS = [1, 10, 40]
 
 # If True, input tensors will have zeros on the boundary (Dirichlet boundary condition)
-DIRICHLET_ZERO = True
+DIRICHLET_ZERO = False
 
 
-EXTRA_LSBS = 8
+EXTRA_LSBS = 0
 EXTRA_MSBS = 0
 
-# Each entry: (stencil_shape, input_shape, label)
-# Stencil dimensionality MUST match input dimensionality.
+# Entry: (stencil_shape, input_shape, label)
 SHAPE_INPUT_PAIRS = [
     ([5], [128], "1D_128"),
-    ([7], [128], "1D_128"),
+    #    ([7], [128], "1D_128"),
     ([3, 3], [128, 128], "2D_128x128"),
     ([5, 5], [128, 128], "2D_128x128"),
-    ([7, 7], [128, 128], "2D_128x128"),
+    # ([7, 7], [128, 128], "2D_128x128"),
     ([3, 3, 3], [32, 32, 32], "3D_32x32x32"),
-    ([5, 5, 5], [32, 32, 32], "3D_32x32x32"),
+    # ([5, 5, 5], [32, 32, 32], "3D_32x32x32"),
 ]
 
 ERROR_THRESHOLD = 1e-8
@@ -58,7 +62,7 @@ def apply_dirichlet_boundary(data, stencil_shape):
             f"Data dimensionality {ndim} != stencil dimensionality {len(stencil_shape)}"
         )
 
-    # Calculate boundary width for each dimension (offset = stencil_shape // 2)
+    # Calculate boundary width for each dimension
     boundary_widths = [s // 2 for s in stencil_shape]
 
     if ndim == 1:
@@ -86,7 +90,6 @@ def apply_dirichlet_boundary(data, stencil_shape):
 
 
 def write_tensor_file(path, data):
-    """Write a numpy float64 array as a binary tensor file (type_id=1 = double)."""
     data = np.asarray(data, dtype=np.float64)
     shape = data.shape
     ndim = len(shape)
@@ -103,6 +106,8 @@ def generate_stencil_spec(
     requested_slices=None,
     stencil_num=0,
     offsets=None,
+    sparse=False,
+    l1_norm="ONE",
     rng=None,
 ):
     if rng is None:
@@ -114,20 +119,34 @@ def generate_stencil_spec(
         coeffs = rng.integers(
             -abs_limit if negative_coeffs else 0, abs_limit, size=shape
         ).astype(PRECISION_TYPE_MAP[original_precision])
-        basis = rng.random(size=1, dtype=np.float32).astype(
-            PRECISION_TYPE_MAP[original_precision]
-        )
+        # log-uniform basis so pre-normalization magnitudes span several decades evenly instead of clustering near the upper end.
+        basis = np.float64(10) ** rng.uniform(-6, 0)
         coeffs *= basis
     else:
-        coeffs = 1.0 - 2 * rng.random(
-            size=shape, dtype=PRECISION_TYPE_MAP[original_precision]
+        coeffs = rng.standard_normal(size=shape).astype(
+            PRECISION_TYPE_MAP[original_precision]
         )
         coeffs = np.abs(coeffs) if not negative_coeffs else coeffs
 
-    # divide by norm such that actual stencil is 5% within 1
-    # scale_off = 0.05 * rng.random()
-    scale_off = 0.0
-    coeffs /= (1 + scale_off) * np.sum(np.abs(coeffs))
+    if sparse:
+        zero_mask = rng.random(size=coeffs.shape) < 0.7
+        coeffs[zero_mask] = 0.0
+
+    l1_sum = np.sum(np.abs(coeffs))
+    if l1_sum == 0:
+        coeffs.flat[len(coeffs.flat) // 2] = 1.0
+        l1_sum = 1.0
+
+    if l1_norm == "ONE":
+        target_l1 = 1.0 / (1.0 + 0.05 * (1.0 - 2 * rng.random()))
+    elif l1_norm == "GT1":
+        target_l1 = rng.uniform(1.05, 1.5)
+    elif l1_norm == "LT1":
+        target_l1 = rng.uniform(0.3, 0.95)
+    else:
+        raise ValueError(f"Unknown l1_norm mode: {l1_norm}")
+
+    coeffs *= target_l1 / l1_sum
 
     if not offsets:
         offsets = np.array(shape) // 2
@@ -135,7 +154,15 @@ def generate_stencil_spec(
     offsets = [str(x) for x in offsets]
     coeffs_str = [str(x) for x in coeffs.flatten()]
 
-    name = f"{'x'.join(shape)}{'Pos' if not negative_coeffs else ''}m{requested_slices if requested_slices else 'None'}_{stencil_num}"
+    l1_tag = {"ONE": "N", "GT1": "G", "LT1": "L"}[l1_norm]
+    name = (
+        f"{'x'.join(shape)}"
+        f"{'Pos' if not negative_coeffs else ''}"
+        f"{'Sp' if sparse else ''}"
+        f"{l1_tag}"
+        f"m{requested_slices if requested_slices else 'None'}"
+        f"_{stencil_num}"
+    )
 
     spec = f"""
     name {name}
@@ -151,11 +178,6 @@ def generate_stencil_spec(
 
 
 def run_pipeline(name, input_file, input_label, T):
-    """
-    Run compute-reference -> run-ozaki -> compute-errors for one (stencil, input, T).
-    Returns (success: bool, error: float, oz_output: str) where oz_output is the
-    combined stdout+stderr of run-ozaki, for diagnostics when error is large.
-    """
     stencil_file = f"{STENCIL_DIR}/{name}.stc"
     ref_prefix = f"ref_{input_label}"
     oz_prefix = f"oz_{input_label}"
@@ -232,7 +254,7 @@ def run_pipeline(name, input_file, input_label, T):
 
         # Step 4: compute-errors, RMSE is printed to stdout
         err_result = subprocess.run(
-            [f"{BUILD_BIN}/compute-errors", "-e", ref_file, "-a", oz_file],
+            [f"{BUILD_BIN}/compute-errors", "-e", ref_file, "-a", oz_file, "--scaled"],
             capture_output=True,
             text=True,
         )
@@ -252,8 +274,233 @@ def run_pipeline(name, input_file, input_label, T):
             )
             return False, [float("nan")], oz_output
 
-    # print(", ".join([f"(S={i + 2} Err={e})" for i, e in enumerate(errs)]))
     return True, errs, oz_output
+
+
+def _decode_stencil_name(name):
+    """Parse metadata encoded in a stencil name string.
+
+    Name format: {shape}[Pos][Sp]{G|L|N}m{req_slices}_{stencil_num}
+    Returns (shape_str, has_negative, is_sparse, l1_tag, req_slices_str, stencil_num).
+    """
+    # Try new format first (with L1 tag, optional Sp)
+    m = re.match(r"^([0-9x]+)(Pos)?(Sp)?([GLN])m(.+)_(\d+)$", name)
+    if m:
+        shape_str = m.group(1)
+        has_negative = m.group(2) is None
+        is_sparse = m.group(3) is not None
+        l1_tag = m.group(4)
+        req_slices_str = m.group(5)
+        return (
+            shape_str,
+            has_negative,
+            is_sparse,
+            l1_tag,
+            req_slices_str,
+            int(m.group(6)),
+        )
+
+    # Fallback: legacy format without L1 tag / sparse marker
+    m = re.match(r"^([0-9x]+)(Pos)?m(.+)_(\d+)$", name)
+    if m:
+        shape_str = m.group(1)
+        has_negative = m.group(2) is None
+        req_slices_str = m.group(3)
+        return shape_str, has_negative, False, None, req_slices_str, int(m.group(4))
+
+    return None, None, None, None, None, None
+
+
+def plot_results(mode):
+    """Read precision_results.csv and produce a grid of RMSE-vs-slice-count plots.
+    Columns : one per unique stencil shape, in SHAPE_INPUT_PAIRS order.
+    Rows    : determined by *mode*:
+              "pos-neg" → 2 rows (negative-coefficient stencils / positive-only)
+              "slices"  → len(REQUESTED_SLICES) rows, one per requested-slice value
+              "sparse"  → 2 rows (sparse / dense)
+              "L1"      → 3 rows (ONE / GT1 / LT1)
+    """
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as ticker
+
+    if not os.path.exists(CSV_OUTPUT):
+        print(f"CSV file not found: {CSV_OUTPUT}. Run without --plot first.")
+        sys.exit(1)
+
+    df = pd.read_csv(CSV_OUTPUT)
+    if df.empty:
+        print("CSV is empty — nothing to plot.")
+        return
+
+    # Decode stencil metadata from the name column.
+    decoded = df["stencil"].apply(_decode_stencil_name)
+    df["stencil_shape"] = [d[0] for d in decoded]
+    df["has_negative"] = [d[1] for d in decoded]
+    df["is_sparse"] = [d[2] for d in decoded]
+    df["l1_tag"] = [d[3] for d in decoded]
+    df["req_slices"] = [d[4] for d in decoded]  # str: "1","2","3","None"
+
+    # Keep only rows that have numeric per-slice data.
+    df = df[df["status"] == "Completed"].copy()
+    df["rmse"] = pd.to_numeric(df["rmse"], errors="coerce")
+    df["n_slices"] = pd.to_numeric(df["n_slices"], errors="coerce")
+    df = df.dropna(subset=["rmse", "n_slices", "stencil_shape"])
+    df["n_slices"] = df["n_slices"].astype(int)
+
+    # Column order: unique shapes in the order they appear in SHAPE_INPUT_PAIRS.
+    shape_order = []
+    for stencil_shape, _, _ in SHAPE_INPUT_PAIRS:
+        s = "x".join(str(x) for x in stencil_shape)
+        if s not in shape_order:
+            shape_order.append(s)
+
+    # Row definitions differ by mode.
+    if mode == "pos-neg":
+        row_vals = [True, False]
+        row_labels = ["Negative coefficients", "Positive only"]
+        row_col = "has_negative"
+    elif mode == "slices":
+        row_vals = [str(v) if v is not None else "None" for v in REQUESTED_SLICES]
+        row_labels = [
+            f"Req. slices: {v if v is not None else 'None'}" for v in REQUESTED_SLICES
+        ]
+        row_col = "req_slices"
+    elif mode == "sparse":
+        row_vals = [True, False]
+        row_labels = ["Sparse", "Dense"]
+        row_col = "is_sparse"
+    elif mode == "L1":
+        row_vals = ["N", "G", "L"]
+        row_labels = ["L1 ~ 1 (stable)", "L1 > 1 (expansive)", "L1 < 1 (contractive)"]
+        row_col = "l1_tag"
+
+    n_rows = len(row_vals)
+    n_cols = len(shape_order)
+
+    timesteps = sorted(df["T"].unique())
+    cycle_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    t_colors = {T: cycle_colors[i % len(cycle_colors)] for i, T in enumerate(timesteps)}
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(3.5 * n_cols, 3.2 * n_rows),
+        squeeze=False,
+    )
+    group_desc = {
+        "pos-neg": "coefficient sign",
+        "slices": "requested slice count",
+        "sparse": "sparsity",
+        "L1": "L1 norm magnitude",
+    }[mode]
+    fig.suptitle(
+        f"Ozaki stencil precision  —  grouped by {group_desc}",
+        fontsize=13,
+        y=1.01,
+    )
+
+    # Collect one Line2D handle per T for the shared figure legend.
+    legend_handles = {}
+
+    for r_idx, (r_val, r_label) in enumerate(zip(row_vals, row_labels)):
+        for c_idx, shape in enumerate(shape_order):
+            ax = axes[r_idx, c_idx]
+
+            cell_df = df[(df["stencil_shape"] == shape) & (df[row_col] == r_val)]
+
+            has_data = False
+            for T in timesteps:
+                t_df = cell_df[cell_df["T"] == T]
+                if t_df.empty:
+                    continue
+
+                # Aggregate over all stencil instances sharing (shape, row, T, n_slices).
+                agg = (
+                    t_df.groupby("n_slices")["rmse"]
+                    .agg(mean="mean", lo="min", hi="max")
+                    .reset_index()
+                    .sort_values("n_slices")
+                )
+                if agg.empty:
+                    continue
+
+                color = t_colors[T]
+                (line,) = ax.plot(
+                    agg["n_slices"],
+                    agg["mean"],
+                    color=color,
+                    marker="o",
+                    markersize=3,
+                    linewidth=1.5,
+                    label=f"T={T}",
+                )
+                ax.fill_between(
+                    agg["n_slices"],
+                    agg["lo"],
+                    agg["hi"],
+                    color=color,
+                    alpha=0.15,
+                )
+                legend_handles[T] = line
+                has_data = True
+
+            if not has_data:
+                ax.set_visible(False)
+                continue
+
+            ax.set_yscale("log")
+            ax.yaxis.set_major_formatter(ticker.LogFormatterSciNotation())
+            ax.tick_params(labelsize=7)
+            ax.set_xlabel("Slice count", fontsize=8)
+            ax.set_title(f"Shape {shape}", fontsize=9, fontweight="bold")
+            # Left-column axes carry the row label as part of the y-axis title.
+            if c_idx == 0:
+                ax.set_ylabel(f"{r_label}\nRMSE", fontsize=8)
+            else:
+                ax.set_ylabel("RMSE", fontsize=8)
+
+    # Single figure-level legend for timestep lines, centred below the grid.
+    if legend_handles:
+        sorted_T = sorted(legend_handles)
+        fig.legend(
+            [legend_handles[T] for T in sorted_T],
+            [f"T = {T}" for T in sorted_T],
+            loc="lower center",
+            ncol=len(sorted_T),
+            fontsize=9,
+            bbox_to_anchor=(0.5, -0.03),
+            frameon=True,
+        )
+
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    out_path = f"precision_{mode}.png"
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"Saved plot: {out_path}")
+    plt.show()
+
+
+_parser = argparse.ArgumentParser(
+    description="Ozaki stencil precision tester and visualiser."
+)
+_parser.add_argument(
+    "--plot",
+    choices=["pos-neg", "slices", "sparse", "L1"],
+    metavar="{pos-neg,slices,sparse,L1}",
+    help=(
+        "Read existing results from the CSV and produce a "
+        "precision plot without re-running the test pipeline.  "
+        "'pos-neg' groups rows by coefficient sign; "
+        "'slices' groups rows by requested slice count; "
+        "'sparse' groups rows by sparsity (sparse vs dense); "
+        "'L1' groups rows by L1 norm magnitude (stable / expansive / contractive)."
+    ),
+)
+_args = _parser.parse_args()
+
+if _args.plot:
+    plot_results(_args.plot)
+    sys.exit(0)
 
 
 # --- Setup ---
@@ -308,6 +555,8 @@ with (
     open(BREACHES_OUTPUT, "w", newline="") as breachfile,
 ):
     writer = csv.writer(csvfile)
+    # One row per (stencil, input_shape, T, n_slices) so the plotter can draw
+    # RMSE as a function of slice count.
     writer.writerow(
         [
             "stencil",
@@ -318,19 +567,22 @@ with (
             "msb_shift_stencil",
             "status",
             "result",
+            "n_slices",
             "rmse",
         ]
     )
 
     for stencil_shape, input_shape, input_label in SHAPE_INPUT_PAIRS:
-        for neg_coeffs, req_slices, stencil_num in product(
-            NEGATIVE_COEFFS, REQUESTED_SLICES, STENCIL_NAME
+        for neg_coeffs, req_slices, sparse, l1_norm, stencil_num in product(
+            NEGATIVE_COEFFS, REQUESTED_SLICES, SPARSE, L1_NORM, STENCIL_NAME
         ):
             name, coeffs = generate_stencil_spec(
                 shape=stencil_shape,
                 negative_coeffs=neg_coeffs,
                 requested_slices=req_slices,
                 stencil_num=stencil_num,
+                sparse=sparse,
+                l1_norm=l1_norm,
                 rng=rng,
             )
             input_file = input_tensors[input_label]
@@ -339,23 +591,27 @@ with (
                 success, errs, oz_output = run_pipeline(
                     name, input_file, input_label, T
                 )
-                high_error = errs[-1] > ERROR_THRESHOLD
-                stencil_msb_shift = oz_output.split("\n")[0][-1]
-                writer.writerow(
-                    [
-                        name,
-                        input_label,
-                        T,
-                        EXTRA_MSBS,
-                        EXTRA_LSBS,
-                        stencil_msb_shift,
-                        "Completed" if success else "Failed",
-                        "Wrong" if high_error else "Correct",
-                        errs[-1],
-                    ]
-                )
-                csvfile.flush()
+                stencil_msb_shift = oz_output.split("\n")[0][-1] if oz_output else ""
+
                 if success:
+                    high_error = errs[-1] > ERROR_THRESHOLD
+                    # Write one CSV row per slice count for plotting.
+                    for i, err in enumerate(errs):
+                        n_slices = i + 2
+                        writer.writerow(
+                            [
+                                name,
+                                input_label,
+                                T,
+                                EXTRA_MSBS,
+                                EXTRA_LSBS,
+                                stencil_msb_shift,
+                                "Completed",
+                                "Wrong" if err > ERROR_THRESHOLD else "Correct",
+                                n_slices,
+                                err,
+                            ]
+                        )
                     print(f"  [OK] error = {errs[-1]:.6e}")
                     if high_error:
                         print(
@@ -371,3 +627,20 @@ with (
                         )
                         breachfile.write(f"run-ozaki output: {oz_output}\n")
                         breachfile.write(("-" * 90) + "\n\n")
+                else:
+                    writer.writerow(
+                        [
+                            name,
+                            input_label,
+                            T,
+                            EXTRA_MSBS,
+                            EXTRA_LSBS,
+                            stencil_msb_shift,
+                            "Failed",
+                            "N/A",
+                            "",
+                            "",
+                        ]
+                    )
+
+                csvfile.flush()

@@ -193,7 +193,7 @@ template <OzakiPair O> OzakiSlices<O> slice(std::span<const typename O::data_typ
 
 template <OzakiPair O, typename StencilType, int32_t N = 1, typename HighPrec = HighPrecType>
 StencilSlices<RebindStencil_t<StencilType, typename O::target_type>, N>
-slice_stencil(StencilType s, HighPrec a, int32_t extra_msb_shift = 0) {
+slice_stencil(StencilType s, HighPrec a, int32_t extra_msb_shift = 0, int32_t n_emulated = 0) {
   using Target = typename O::target_type;
   using IntStencilType = RebindStencil_t<StencilType, Target>;
 
@@ -288,25 +288,26 @@ slice_stencil(StencilType s, HighPrec a, int32_t extra_msb_shift = 0) {
       bg_value = 0; // defensive: should always be positive
     }
 
-    // Save bg_combined before the base-128 decomposition loop consumes it.
-    // bg_ratio = bg_combined * effective_a / 128^(N-1) — ideally exactly 1.0,
-    // deviates by rounding in the step above.
-    const unsigned __int128 bg_combined = bg_value;
-
     // Decompose into N base-128 digits (LSB first extraction, MSB-first storage)
     for (int32_t si = N - 1; si >= 0; --si) {
       result.boundary_gain[si] = static_cast<Target>(bg_value % base);
       bg_value /= base;
     }
 
-    // Compute bg_ratio in high precision, then store as double.
-    // double is sufficient: bg_ratio ≈ 1 + O(1e-5), and double has ~1e-15
-    // relative precision, which is far better than the boundary_gain rounding.
-    {
-      HighPrec ratio = static_cast<HighPrec>(bg_combined) * eff_a;
-      for (int32_t k = 0; k < N - 1; ++k)
-        ratio /= static_cast<HighPrec>(base);
-      result.bg_ratio = static_cast<double>(ratio);
+    // Compute high-precision emulated boundary gain with n_emulated digits.
+    // Encodes 1/effective_a in as many base-128 digits as there are data slices,
+    // giving precision ~1/128^(n_emulated-1). This eliminates per-iteration
+    // quantization error at boundary cells.
+    result.n_emulated_gain_slices = n_emulated;
+    if (n_emulated > 0) {
+      HighPrec value = HighPrec(1) / eff_a;
+      for (int32_t g = 0; g < n_emulated; ++g) {
+        int64_t digit_int = static_cast<int64_t>(
+            value + (value >= HighPrec(0) ? HighPrec(0.5) : HighPrec(-0.5)));
+        digit_int = std::max(static_cast<int64_t>(LO), std::min(static_cast<int64_t>(HI), digit_int));
+        result.emulated_gain[g] = static_cast<Target>(digit_int);
+        value = (value - static_cast<HighPrec>(digit_int)) * static_cast<HighPrec>(base);
+      }
     }
   }
 

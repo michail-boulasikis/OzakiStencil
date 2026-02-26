@@ -41,7 +41,7 @@ template <ozi::OzakiPair O> struct alignas(256) OzakiDescriptor {
   int32_t e_max = std::numeric_limits<int32_t>::min();
   int32_t e_min = std::numeric_limits<int32_t>::max();
   int32_t n_slices_input = 8;
-  int32_t n_slices_stencil = 1;
+  int32_t n_slices_stencil = 1; // reserved for future multi-slice stencil support; currently unused
 
   int32_t n_shifts = 0;
   int32_t shift_required = 0;
@@ -127,7 +127,7 @@ template <> struct OzakiPairTraits<ozigpu::OzakiFP_Int8<__float128>> {
   }
 
   static __host__ __device__ __forceinline__ void matmul(Acc *A, const Target *B, const Target *C, size_t m, size_t n,
-                                                         size_t k) {}
+                                                         size_t k) {} // not implemented; satisfies OzakiPair concept
 };
 #endif
 
