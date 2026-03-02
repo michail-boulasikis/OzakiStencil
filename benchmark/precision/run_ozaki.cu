@@ -18,6 +18,7 @@ int main(int argc, char *argv[]) {
   std::string input_file;
   std::string stencil_arg;
   std::string stencil_file;
+  std::string algorithm_str;
   int32_t slice_limit;
   std::vector<size_t> timesteps;
   int32_t extra_msb;
@@ -49,6 +50,8 @@ int main(int argc, char *argv[]) {
     ("extra-lsb", po::value<int32_t>(&extra_lsb)->default_value(0),
      "Extra LSB headroom for dynamic range")
     ("save-tensors,S", "Save every output tensor to disk")
+    ("algorithm,A", po::value<std::string>(&algorithm_str)->default_value("direct"),
+     "Algorithm: 'direct' (scalar stencil_v1) or 'convstencil' (WMMA tensor core, 2D 7x7 only)")
     ;
   // clang-format on
 
@@ -76,6 +79,12 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  Algorithm algo = Algorithm::Direct;
+  if (algorithm_str == "convstencil")
+    algo = Algorithm::ConvStencil;
+  else if (algorithm_str != "direct")
+    throw std::invalid_argument("Unknown algorithm: " + algorithm_str);
+
   try {
     NVTX_PUSH("Initialization");
     Tensor<Real> input = read_tensor<Real>(input_file);
@@ -101,12 +110,13 @@ int main(int argc, char *argv[]) {
 
         std::cerr << std::format("Running Ozaki for '{}' for {} timesteps...\n", spec.name, timestep);
 
-        auto runner = make_ozaki_runner(spec, input, static_cast<int32_t>(timestep), extra_msb, extra_lsb, output_dir);
+        auto runner =
+            make_ozaki_runner(spec, input, static_cast<int32_t>(timestep), extra_msb, extra_lsb, output_dir, algo);
 
         for (int32_t s = 2; s <= slice_limit && s < runner->get_max_slices(); ++s) {
           std::string output_path = std::format("{}{}_{}_{}_{}.dat", output_dir, output_prefix, spec.name, timestep, s);
           runner->run_experiment(s, output_path, save_tensors);
-          std::cerr << std::format("  Completed: {} Slices\n", s);
+          std::cerr << std::format("  Completed: {} Slices (saved at {})\n", s, output_path);
         }
 
         NVTX_POP();

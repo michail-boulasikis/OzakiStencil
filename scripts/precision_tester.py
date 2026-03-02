@@ -26,12 +26,13 @@ EXTRA_MSBS = 0
 
 # Entry: (stencil_shape, input_shape, label)
 SHAPE_INPUT_PAIRS = [
-    ([5], [128], "1D_128"),
-    #    ([7], [128], "1D_128"),
-    ([3, 3], [128, 128], "2D_128x128"),
-    ([5, 5], [128, 128], "2D_128x128"),
+    # ([5], [128], "1D_128"),
+    # ([7], [128], "1D_128"),
+    # ([3, 3], [128, 128], "2D_128x128"),
+    # ([5, 5], [128, 128], "2D_128x128"),
+    ([7, 7], [128, 128], "2D_128x128"),
     # ([7, 7], [128, 128], "2D_128x128"),
-    ([3, 3, 3], [32, 32, 32], "3D_32x32x32"),
+    # ([3, 3, 3], [32, 32, 32], "3D_32x32x32"),
     # ([5, 5, 5], [32, 32, 32], "3D_32x32x32"),
 ]
 
@@ -177,7 +178,7 @@ def generate_stencil_spec(
     return name, coeffs
 
 
-def run_pipeline(name, input_file, input_label, T):
+def run_pipeline(name, input_file, input_label, T, algorithm="direct"):
     stencil_file = f"{STENCIL_DIR}/{name}.stc"
     ref_prefix = f"ref_{input_label}"
     oz_prefix = f"oz_{input_label}"
@@ -225,6 +226,8 @@ def run_pipeline(name, input_file, input_label, T):
             "--extra-msb",
             str(EXTRA_MSBS),
             "--save-tensors",
+            "--algorithm",
+            algorithm,
         ],
         capture_output=True,
         text=True,
@@ -484,6 +487,17 @@ _parser = argparse.ArgumentParser(
     description="Ozaki stencil precision tester and visualiser."
 )
 _parser.add_argument(
+    "--algorithm",
+    "-A",
+    choices=["direct", "convstencil"],
+    default="direct",
+    help=(
+        "Algorithm passed to run-ozaki: "
+        "'direct' (scalar stencil_v1, default) or "
+        "'convstencil' (WMMA tensor core, 2D 7x7 stencils only)."
+    ),
+)
+_parser.add_argument(
     "--plot",
     choices=["pos-neg", "slices", "sparse", "L1"],
     metavar="{pos-neg,slices,sparse,L1}",
@@ -589,7 +603,7 @@ with (
             for T in TIMESTEPS:
                 print(f"Testing {name} | {input_label} | T={T} ...")
                 success, errs, oz_output = run_pipeline(
-                    name, input_file, input_label, T
+                    name, input_file, input_label, T, _args.algorithm
                 )
                 stencil_msb_shift = oz_output.split("\n")[0][-1] if oz_output else ""
 
