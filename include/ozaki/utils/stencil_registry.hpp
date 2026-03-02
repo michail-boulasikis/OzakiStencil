@@ -231,7 +231,7 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
         return l1;
       };
 
-      while (compute_msb_l1(p.extra_msb_shift) >= 63) {
+      while (compute_msb_l1(p.extra_msb_shift) >= 91) {
         p.extra_msb_shift++;
       }
 
