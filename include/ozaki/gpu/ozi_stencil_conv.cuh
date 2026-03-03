@@ -268,13 +268,23 @@ __global__ __launch_bounds__(128, 3) void cvstencil(typename O::target_type *__r
         const Target *in_slice = in + slice_stride * phys_idx;
 
         if (tile_in_bounds) {
-          // Row-by-row fast path (coalesced loads)
-          const Target *tile_base = in_slice + data_row_start * ldm + data_col_start;
+          // Row-by-row fast path with 32-byte sector-aligned loads.
+          // data_col_start is typically offset by HALO=3 from a 256-byte tile boundary,
+          // landing at byte 29 within a 32-byte sector. Aligning the load pointer down
+          // prevents each warp access from spanning two sectors.
           for (int32_t row = 0; row < DATA_TILE_SIZE_ROW; ++row) {
-            for (int32_t col = tid; col < DATA_TILE_SIZE_COL; col += blockDim.x) {
-              int8_t val = tile_base[row * ldm + col];
-              sm_data[0][compute_lut_a(row, col)] = val;
-              sm_data[1][compute_lut_b(row, col)] = val;
+            const Target *row_ptr = in_slice + (data_row_start + row) * ldm + data_col_start;
+            const int32_t pad = reinterpret_cast<uintptr_t>(row_ptr) & 31;
+            const Target *aligned_ptr = row_ptr - pad;
+            const int32_t total = DATA_TILE_SIZE_COL + pad;
+
+            for (int32_t pos = tid; pos < total; pos += blockDim.x) {
+              int8_t val = aligned_ptr[pos];
+              int32_t col = pos - pad;
+              if (col >= 0) {
+                sm_data[0][compute_lut_a(row, col)] = val;
+                sm_data[1][compute_lut_b(row, col)] = val;
+              }
             }
           }
         } else {
