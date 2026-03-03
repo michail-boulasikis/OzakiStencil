@@ -37,16 +37,22 @@ constexpr int32_t DATA_TILE_SIZE_COL = TILE_SIZE_COL + 2 * HALO; // = 262
 // Stencil2row shared memory dimensions (col-major: sm_row is fast dim)
 // SM_SIZE_ROW = number of column groups = floor(DATA_TILE_SIZE_COL / STRIDE) = MMA_M = 32
 // SM_SIZE_COL = K-extent covering all output rows' stencil windows + MMA tile padding
-constexpr int32_t SM_SIZE_ROW = DATA_TILE_SIZE_COL / STRIDE;                          // = 32
+constexpr int32_t SM_SIZE_ROW = DATA_TILE_SIZE_COL / STRIDE; // = 32 (logical width)
+constexpr int32_t SM_LD = 48; // physical leading dim (padding experiments, must be multiple of 16 for WMMA)
 constexpr int32_t SM_SIZE_COL = (TILE_SIZE_ROW - 1) * STENCIL_SIDE + MMA_NUM * MMA_K; // = 281
 
 constexpr int32_t COEFF_LD = MMA_N;                             // = 8 (weight matrix leading dim)
 constexpr int32_t WT_SIZE = MMA_NUM * MMA_K * COEFF_LD;         // = 512 (per-half weight size)
 constexpr int32_t ACC_TILE_SIZE = MMA_M * MMA_N;                // = 256 (elements per MMA tile)
 constexpr int32_t ELEMS_PER_THREAD = ACC_TILE_SIZE / WARP_SIZE; // = 8
-constexpr int32_t TRASH = SM_SIZE_COL * SM_SIZE_ROW - 1;        // dirty-bits sentinel index
+constexpr int32_t TRASH = SM_SIZE_COL * SM_LD - 1;              // dirty-bits sentinel index
 constexpr int32_t MAX_M = 12;                                   // max supported stencil slices
 constexpr int32_t MAX_DATA_SLICES = 24;                         // matches StencilSlices::MAX_DATA_SLICES
+
+// Chunking constants for 2-row processing (reduces register pressure)
+constexpr int32_t ROWS_PER_CHUNK = 2;
+constexpr int32_t NUM_CHUNKS = MMA_N / ROWS_PER_CHUNK; // = 4
+static_assert(MMA_N % ROWS_PER_CHUNK == 0, "MMA_N must be divisible by ROWS_PER_CHUNK");
 
 // Constant memory for weight matrices: [M][2][WT_SIZE] layout (unused currently)
 __constant__ int8_t cs_param_matrix_d[MAX_M * 2 * WT_SIZE];
@@ -68,7 +74,7 @@ __device__ __forceinline__ int32_t compute_lut_a(int32_t data_row, int32_t data_
   bool valid = (((data_col + 1) & (STRIDE - 1)) != 0) && (data_col < DATA_TILE_SIZE_COL - 2 * HALO - 1);
   int32_t sm_row = data_col >> 3;                                       // data_col / STRIDE
   int32_t sm_col = STENCIL_SIDE * data_row + (data_col & (STRIDE - 1)); // data_col % STRIDE
-  return valid ? (sm_col * SM_SIZE_ROW + sm_row) : TRASH;
+  return valid ? (sm_col * SM_LD + sm_row) : TRASH;
 }
 
 /** Compute the sm_data[1] (tessellation B / lower) index for data element at
@@ -78,7 +84,7 @@ __device__ __forceinline__ int32_t compute_lut_b(int32_t data_row, int32_t data_
   int32_t j_shifted = data_col - STENCIL_SIDE;
   int32_t sm_row = j_shifted >> 3;                                       // j_shifted / STRIDE
   int32_t sm_col = STENCIL_SIDE * data_row + (j_shifted & (STRIDE - 1)); // j_shifted % STRIDE
-  return valid ? (sm_col * SM_SIZE_ROW + sm_row) : TRASH;
+  return valid ? (sm_col * SM_LD + sm_row) : TRASH;
 }
 
 // ========== Weight matrix builder for M stencil slices ==========
@@ -150,9 +156,12 @@ using namespace ozi;
  */
 template <OzakiPair O, int32_t M = 1>
   requires(std::is_same_v<typename O::target_type, int8_t>) && (M >= 1)
-__global__ void cvstencil(typename O::target_type *__restrict__ out, const typename O::target_type *__restrict__ in,
-                          const typename O::target_type *__restrict__ weight, const size_t ldm, const size_t height,
-                          OzakiDescriptor<O> *__restrict__ desc, const convstencil::BoundaryGainData boundary) {
+__global__ __launch_bounds__(128, 3) void cvstencil(typename O::target_type *__restrict__ out,
+                                                    const typename O::target_type *__restrict__ in,
+                                                    const typename O::target_type *__restrict__ weight,
+                                                    const size_t ldm, const size_t height,
+                                                    OzakiDescriptor<O> *__restrict__ desc,
+                                                    __grid_constant__ const convstencil::BoundaryGainData boundary) {
   using namespace convstencil;
   using namespace nvcuda;
   using Target = typename O::target_type;
@@ -172,7 +181,7 @@ __global__ void cvstencil(typename O::target_type *__restrict__ out, const typen
   const size_t slice_stride = ldm * height;
 
   // ======================== Shared memory ========================
-  __shared__ __align__(16) int8_t sm_data[2][SM_SIZE_COL * SM_SIZE_ROW];
+  __shared__ __align__(16) int8_t sm_data[2][SM_SIZE_COL * SM_LD];
   __shared__ __align__(16) int32_t sm_staging[NUM_WARPS * ACC_TILE_SIZE];
   __shared__ int32_t sm_overflow[NUM_WARPS];
 
@@ -196,28 +205,7 @@ __global__ void cvstencil(typename O::target_type *__restrict__ out, const typen
   if (tid < NUM_WARPS)
     sm_overflow[tid] = 0;
 
-  // ======================== Per-thread accumulators and carry ========================
-  // acc_reg[si][row][elem]: sliding window accumulator for stencil slice position si
-  // carry_reg[row][elem]: carry from previous output extraction
-  // Register cost: M x MMA_N x ELEMS_PER_THREAD + MMA_N x ELEMS_PER_THREAD = (M+1) x 64
-  int32_t acc_reg[M][MMA_N][ELEMS_PER_THREAD];
-  int32_t carry_reg[MMA_N][ELEMS_PER_THREAD];
-
-#pragma unroll
-  for (int32_t si = 0; si < M; ++si)
-#pragma unroll
-    for (int32_t r = 0; r < MMA_N; ++r)
-#pragma unroll
-      for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
-        acc_reg[si][r][e] = 0;
-
-#pragma unroll
-  for (int32_t r = 0; r < MMA_N; ++r)
-#pragma unroll
-    for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
-      carry_reg[r][e] = 0;
-
-  // ======================== WMMA working fragments (reused) ========================
+  // ======================== WMMA working fragments (reused across chunks) ========================
   wmma::fragment<wmma::matrix_a, MMA_M, MMA_N, MMA_K, int8_t, wmma::col_major> in_frag;
   wmma::fragment<wmma::accumulator, MMA_M, MMA_N, MMA_K, int32_t> acc;
 
@@ -239,246 +227,238 @@ __global__ void cvstencil(typename O::target_type *__restrict__ out, const typen
   constexpr int32_t LANES_PER_ROW = MMA_N;              // = 8
   constexpr int32_t GROUPS = WARP_SIZE / LANES_PER_ROW; // = 4
 
+  // Zero-initialize sm_data padding (SM_LD - SM_SIZE_ROW = 16 pad bytes per column).
+  // Padding is read by WMMA but never written by compute_lut_a/b.
+  // Corresponding weight entries are zero, so zero padding is both safe and required.
+  for (int32_t idx = tid; idx < 2 * SM_SIZE_COL * SM_LD; idx += blockDim.x)
+    reinterpret_cast<int8_t *>(sm_data)[idx] = 0;
+
   // ====================================================================
-  // MAIN LOOP: iterate over data slices from LSB to MSB
-  // Outer loop over data slices, inner loop over output rows.
-  // For each data slice, all M stencil slices are applied via MMA.
-  // The sliding window of M accumulators tracks partial sums; the completed
-  // result at position (logic_s + M - 1) is extracted at each iteration.
+  // CHUNKED PROCESSING: outer loop over 2-row chunks, inner over slices
+  // Reduces register pressure from M*MMA_N*8 to M*ROWS_PER_CHUNK*8.
+  // sm_data is reloaded per (chunk, slice) pair — 4x total loads.
   // ====================================================================
-  for (int32_t logic_s = total_slices - 1; logic_s >= 0; --logic_s) {
-    const int32_t phys_idx = (carry_idx + logic_s) % total_slices;
-    const bool treat_as_zero = (logic_s == 0 && just_shifted);
+  for (int32_t chunk = 0; chunk < NUM_CHUNKS; ++chunk) {
 
-    // ---- Phase 1: Load data slice into stencil2row shared memory ----
-    // When treat_as_zero, skip loading entirely. The MMA is also skipped,
-    // so stale shared memory data is never read.
-    if (!treat_as_zero) {
-      const Target *in_slice = in + slice_stride * phys_idx;
-      constexpr int32_t LOAD_TOTAL = DATA_TILE_SIZE_ROW * DATA_TILE_SIZE_COL;
+    // Per-chunk accumulators: only ROWS_PER_CHUNK rows live at once
+    int32_t acc_reg[M][ROWS_PER_CHUNK][ELEMS_PER_THREAD];
+    int32_t carry_reg[ROWS_PER_CHUNK][ELEMS_PER_THREAD];
 
-      if (tile_in_bounds) {
-        // Fast path: all data tile positions are within the grid.
-        // TODO: vectorize with 4-byte loads for higher throughput (requires
-        // handling alignment since data_col_start may not be 4-byte aligned).
-        const Target *tile_base = in_slice + data_row_start * ldm + data_col_start;
-        for (int32_t idx = tid; idx < LOAD_TOTAL; idx += blockDim.x) {
-          int32_t local_row = idx / DATA_TILE_SIZE_COL;
-          int32_t local_col = idx % DATA_TILE_SIZE_COL;
-          int8_t val = tile_base[local_row * ldm + local_col];
-          sm_data[0][compute_lut_a(local_row, local_col)] = val;
-          sm_data[1][compute_lut_b(local_row, local_col)] = val;
-        }
-      } else {
-        // Slow path: bounds-checked load for tiles at the domain edge.
-        // Out-of-bounds positions are zero-filled (matches Dirichlet BCs).
-        for (int32_t idx = tid; idx < LOAD_TOTAL; idx += blockDim.x) {
-          int32_t local_row = idx / DATA_TILE_SIZE_COL;
-          int32_t local_col = idx % DATA_TILE_SIZE_COL;
-          int32_t global_row = data_row_start + local_row;
-          int32_t global_col = data_col_start + local_col;
-
-          int8_t val = 0;
-          if (global_row >= 0 && global_row < static_cast<int32_t>(height) && global_col >= 0 &&
-              global_col < static_cast<int32_t>(ldm)) {
-            val = in_slice[global_row * ldm + global_col];
-          }
-          sm_data[0][compute_lut_a(local_row, local_col)] = val;
-          sm_data[1][compute_lut_b(local_row, local_col)] = val;
-        }
-      }
-
-      // Zero the trash slots. The WMMA's last K-position (k_idx = MMA_NUM*MMA_K - 1 = 63)
-      // reads sm_col = 280, sm_row = 31, which is flat index 8991 = TRASH. The corresponding
-      // weight entry is zero-padded (k_idx 49..63 are beyond the 49 stencil coefficients), but
-      // zeroing TRASH explicitly adds safety.
-      if (tid == 0) {
-        sm_data[0][TRASH] = 0;
-        sm_data[1][TRASH] = 0;
-      }
-    }
-    __syncthreads();
-
-    // ---- Phase 2: Process each output row ----
-    for (int32_t i = 0; i < MMA_N; ++i) {
-
-      // ---- Step 2a: Shift the accumulator sliding window ----
-      // After shift: acc_reg[si] holds partial sums for result position (logic_s + si).
-      // acc_reg[M-1] is the oldest position, about to be output.
-      // acc_reg[0] is fresh (zeroed) for the new data slice.
-      // Carry from the previous output extraction is injected into acc_reg[M-1].
 #pragma unroll
-      for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e) {
+    for (int32_t si = 0; si < M; ++si)
 #pragma unroll
-        for (int32_t si = M - 1; si > 0; --si)
-          acc_reg[si][i][e] = acc_reg[si - 1][i][e];
-        acc_reg[0][i][e] = 0;
-        acc_reg[M - 1][i][e] += carry_reg[i][e];
-        carry_reg[i][e] = 0;
-      }
+      for (int32_t r = 0; r < ROWS_PER_CHUNK; ++r)
+#pragma unroll
+        for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
+          acc_reg[si][r][e] = 0;
 
-      // ---- Step 2b: MMA for each stencil slice ----
-      // S_si @ D_{logic_s} contributes to result position (logic_s + si),
-      // which maps to acc_reg[si] after the shift above.
+#pragma unroll
+    for (int32_t r = 0; r < ROWS_PER_CHUNK; ++r)
+#pragma unroll
+      for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
+        carry_reg[r][e] = 0;
+
+    // ---- Main data-slice loop for this chunk ----
+    for (int32_t logic_s = total_slices - 1; logic_s >= 0; --logic_s) {
+      const int32_t phys_idx = (carry_idx + logic_s) % total_slices;
+      const bool treat_as_zero = (logic_s == 0 && just_shifted);
+
+      // ---- Phase 1: Load sm_data (all threads cooperate) ----
       if (!treat_as_zero) {
-        int32_t s_col = (warp_id * MMA_N + i) * STENCIL_SIDE;
+        const Target *in_slice = in + slice_stride * phys_idx;
 
-        for (int32_t si = 0; si < M; ++si) {
-          // Skip if result position exceeds the representable range
-          if (logic_s + si >= total_slices)
-            continue;
-
-          // Restore accumulator fragment from register array
-#pragma unroll
-          for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
-            acc.x[e] = acc_reg[si][i][e];
-
-          // MMA: upper tessellation (tessellation A)
-#pragma unroll
-          for (int32_t c_idx = 0; c_idx < MMA_NUM; ++c_idx) {
-            wmma::load_matrix_sync(in_frag, sm_data[0] + (s_col + c_idx * MMA_K) * SM_SIZE_ROW, SM_SIZE_ROW);
-            wmma::mma_sync(acc, in_frag, coeff_frag[si][0][c_idx], acc);
+        if (tile_in_bounds) {
+          // Row-by-row fast path (coalesced loads)
+          const Target *tile_base = in_slice + data_row_start * ldm + data_col_start;
+          for (int32_t row = 0; row < DATA_TILE_SIZE_ROW; ++row) {
+            for (int32_t col = tid; col < DATA_TILE_SIZE_COL; col += blockDim.x) {
+              int8_t val = tile_base[row * ldm + col];
+              sm_data[0][compute_lut_a(row, col)] = val;
+              sm_data[1][compute_lut_b(row, col)] = val;
+            }
           }
-          // MMA: lower tessellation (tessellation B)
-#pragma unroll
-          for (int32_t c_idx = 0; c_idx < MMA_NUM; ++c_idx) {
-            wmma::load_matrix_sync(in_frag, sm_data[1] + (s_col + c_idx * MMA_K) * SM_SIZE_ROW, SM_SIZE_ROW);
-            wmma::mma_sync(acc, in_frag, coeff_frag[si][1][c_idx], acc);
+        } else {
+          // Row-by-row slow path (bounds-checked)
+          for (int32_t row = 0; row < DATA_TILE_SIZE_ROW; ++row) {
+            int32_t global_row = data_row_start + row;
+            for (int32_t col = tid; col < DATA_TILE_SIZE_COL; col += blockDim.x) {
+              int32_t global_col = data_col_start + col;
+              int8_t val = 0;
+              if (global_row >= 0 && global_row < static_cast<int32_t>(height) && global_col >= 0 &&
+                  global_col < static_cast<int32_t>(ldm)) {
+                val = in_slice[global_row * ldm + global_col];
+              }
+              sm_data[0][compute_lut_a(row, col)] = val;
+              sm_data[1][compute_lut_b(row, col)] = val;
+            }
           }
+        }
 
-          // Save acc back to register array
-#pragma unroll
-          for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
-            acc_reg[si][i][e] = acc.x[e];
+        if (tid == 0) {
+          sm_data[0][TRASH] = 0;
+          sm_data[1][TRASH] = 0;
         }
       }
+      __syncthreads();
 
-      // ---- Step 2c: Extract output at position (logic_s + M - 1) ----
-      // acc_reg[M-1] now holds the complete result for this position:
-      // all contributing S_si @ D_j terms have been accumulated, plus carry.
-      int32_t out_pos = logic_s + M - 1;
-      if (out_pos >= 0 && out_pos < total_slices) {
-        int32_t out_phys = (carry_idx + out_pos) % total_slices;
-        Target *slice_out = out + slice_stride * out_phys;
+      // ---- Phase 2: Process ROWS_PER_CHUNK rows ----
+      for (int32_t ii = 0; ii < ROWS_PER_CHUNK; ++ii) {
+        const int32_t i = chunk * ROWS_PER_CHUNK + ii; // global row in warp's stripe
 
-        // Put acc_reg[M-1][i] into the WMMA fragment for staging store.
-        // Fragment register layout is opaque but self-consistent across iterations.
+        // Step 2a: Shift sliding window
 #pragma unroll
-        for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
-          acc.x[e] = acc_reg[M - 1][i][e];
-
-        int32_t *warp_staging = sm_staging + warp_id * ACC_TILE_SIZE;
-        wmma::store_matrix_sync(warp_staging, acc, MMA_N, wmma::mem_row_major);
-
-        // Carry extraction: (full_value - truncated) >> 7 gives the base-128 carry digit.
-        // Extracted for ALL elements (interior + boundary). Boundary carry is semantically
-        // wrong but harmless — boundary output is overwritten by the emulated_gain path.
-        if (out_pos != 0) {
+        for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e) {
 #pragma unroll
-          for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e) {
-            int32_t val = acc_reg[M - 1][i][e];
-            Target trunc = static_cast<Target>(val);
-            carry_reg[i][e] = (val - static_cast<Acc>(trunc)) >> (CHAR_BIT * sizeof(Target) - 1);
+          for (int32_t si = M - 1; si > 0; --si)
+            acc_reg[si][ii][e] = acc_reg[si - 1][ii][e];
+          acc_reg[0][ii][e] = 0;
+          acc_reg[M - 1][ii][e] += carry_reg[ii][e];
+          carry_reg[ii][e] = 0;
+        }
+
+        // Step 2b: MMA for each stencil slice
+        if (!treat_as_zero) {
+          const int32_t s_col = (warp_id * MMA_N + i) * STENCIL_SIDE;
+
+          for (int32_t si = 0; si < M; ++si) {
+            if (logic_s + si >= total_slices)
+              continue;
+
+#pragma unroll
+            for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
+              acc.x[e] = acc_reg[si][ii][e];
+
+#pragma unroll
+            for (int32_t c_idx = 0; c_idx < MMA_NUM; ++c_idx) {
+              wmma::load_matrix_sync(in_frag, sm_data[0] + (s_col + c_idx * MMA_K) * SM_LD, SM_LD);
+              wmma::mma_sync(acc, in_frag, coeff_frag[si][0][c_idx], acc);
+            }
+#pragma unroll
+            for (int32_t c_idx = 0; c_idx < MMA_NUM; ++c_idx) {
+              wmma::load_matrix_sync(in_frag, sm_data[1] + (s_col + c_idx * MMA_K) * SM_LD, SM_LD);
+              wmma::mma_sync(acc, in_frag, coeff_frag[si][1][c_idx], acc);
+            }
+
+#pragma unroll
+            for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
+              acc_reg[si][ii][e] = acc.x[e];
           }
         }
 
-        // Output write (interior elements only) and overflow tracking.
-        // Boundary elements are NOT written here - they are handled in the boundary pass.
-        int32_t out_row_local = warp_id * MMA_N + i;
-        int32_t global_row = static_cast<int32_t>(blockIdx.x * TILE_SIZE_ROW) + out_row_local;
+        // Step 2c: Extract output
+        const int32_t out_pos = logic_s + M - 1;
+        if (out_pos >= 0 && out_pos < total_slices) {
+          const int32_t out_phys = (carry_idx + out_pos) % total_slices;
+          Target *slice_out = out + slice_stride * out_phys;
+
+#pragma unroll
+          for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
+            acc.x[e] = acc_reg[M - 1][ii][e];
+
+          int32_t *warp_staging = sm_staging + warp_id * ACC_TILE_SIZE;
+          wmma::store_matrix_sync(warp_staging, acc, MMA_N, wmma::mem_row_major);
+
+          if (out_pos != 0) {
+#pragma unroll
+            for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e) {
+              int32_t val = acc_reg[M - 1][ii][e];
+              Target trunc = static_cast<Target>(val);
+              carry_reg[ii][e] = (val - static_cast<Acc>(trunc)) >> (CHAR_BIT * sizeof(Target) - 1);
+            }
+          }
+
+          const int32_t out_row_local = warp_id * MMA_N + i;
+          const int32_t global_row = static_cast<int32_t>(blockIdx.x * TILE_SIZE_ROW) + out_row_local;
+
+#pragma unroll
+          for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e) {
+            int32_t local_col = lane_id % LANES_PER_ROW;
+            int32_t local_row = (lane_id / LANES_PER_ROW) + e * GROUPS;
+            int32_t flat_idx = local_row * MMA_N + local_col;
+            int32_t out_col = local_row * LANES_PER_ROW + local_col;
+            int32_t global_col = static_cast<int32_t>(blockIdx.y * TILE_SIZE_COL) + out_col;
+
+            bool in_grid = (global_row < static_cast<int32_t>(height) && global_col < static_cast<int32_t>(ldm));
+            bool is_interior = in_grid && (global_row >= HALO && global_row < static_cast<int32_t>(height) - HALO &&
+                                           global_col >= HALO && global_col < static_cast<int32_t>(ldm) - HALO);
+
+            if (is_interior) {
+              slice_out[global_row * ldm + global_col] = static_cast<Target>(warp_staging[flat_idx]);
+            }
+
+            if (out_pos == 0 && is_interior) {
+              max_acc = max(max_acc, abs(acc_reg[M - 1][ii][e]));
+            }
+          }
+        }
+      } // end ROWS_PER_CHUNK loop
+
+      __syncthreads();
+    } // end data-slice loop
+
+    // ---- Cleanup for this chunk: flush M-1 remaining positions ----
+    for (int32_t p = M - 2; p >= 0; --p) {
+      for (int32_t ii = 0; ii < ROWS_PER_CHUNK; ++ii) {
+        const int32_t i = chunk * ROWS_PER_CHUNK + ii;
 
 #pragma unroll
         for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e) {
-          int32_t local_col = lane_id % LANES_PER_ROW;
-          int32_t local_row = (lane_id / LANES_PER_ROW) + e * GROUPS;
-          int32_t flat_idx = local_row * MMA_N + local_col;
-          int32_t out_col = local_row * LANES_PER_ROW + local_col;
-          int32_t global_col = static_cast<int32_t>(blockIdx.y * TILE_SIZE_COL) + out_col;
-
-          bool in_grid = (global_row < static_cast<int32_t>(height) && global_col < static_cast<int32_t>(ldm));
-          bool is_interior = in_grid && (global_row >= HALO && global_row < static_cast<int32_t>(height) - HALO &&
-                                         global_col >= HALO && global_col < static_cast<int32_t>(ldm) - HALO);
-
-          if (is_interior) {
-            slice_out[global_row * ldm + global_col] = static_cast<Target>(warp_staging[flat_idx]);
-          }
-
-          // MSB overflow tracking (interior only; boundary tracked in boundary pass)
-          if (out_pos == 0 && is_interior) {
-            max_acc = max(max_acc, abs(acc_reg[M - 1][i][e]));
-          }
+#pragma unroll
+          for (int32_t si = M - 1; si > 0; --si)
+            acc_reg[si][ii][e] = acc_reg[si - 1][ii][e];
+          acc_reg[0][ii][e] = 0;
+          acc_reg[M - 1][ii][e] += carry_reg[ii][e];
+          carry_reg[ii][e] = 0;
         }
-      }
-    } // end output row loop
 
-    __syncthreads();
-  } // end main slice loop
-
-  // ====================================================================
-  // CLEANUP: flush remaining M-1 result positions
-  // After the main loop, acc_reg still holds partial sums for positions 0..M-2.
-  // The cleanup phase shifts and outputs these without loading new data.
-  // ====================================================================
-  for (int32_t p = M - 2; p >= 0; --p) {
-    for (int32_t i = 0; i < MMA_N; ++i) {
-      // Shift accumulators
-#pragma unroll
-      for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e) {
-#pragma unroll
-        for (int32_t si = M - 1; si > 0; --si)
-          acc_reg[si][i][e] = acc_reg[si - 1][i][e];
-        acc_reg[0][i][e] = 0;
-        acc_reg[M - 1][i][e] += carry_reg[i][e];
-        carry_reg[i][e] = 0;
-      }
-
-      // Extract output at position p
-      if (p < total_slices) {
-        int32_t out_phys = (carry_idx + p) % total_slices;
-        Target *slice_out = out + slice_stride * out_phys;
+        if (p < total_slices) {
+          const int32_t out_phys = (carry_idx + p) % total_slices;
+          Target *slice_out = out + slice_stride * out_phys;
 
 #pragma unroll
-        for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
-          acc.x[e] = acc_reg[M - 1][i][e];
+          for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
+            acc.x[e] = acc_reg[M - 1][ii][e];
 
-        int32_t *warp_staging = sm_staging + warp_id * ACC_TILE_SIZE;
-        wmma::store_matrix_sync(warp_staging, acc, MMA_N, wmma::mem_row_major);
+          int32_t *warp_staging = sm_staging + warp_id * ACC_TILE_SIZE;
+          wmma::store_matrix_sync(warp_staging, acc, MMA_N, wmma::mem_row_major);
 
-        if (p != 0) {
+          if (p != 0) {
+#pragma unroll
+            for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e) {
+              int32_t val = acc_reg[M - 1][ii][e];
+              Target trunc = static_cast<Target>(val);
+              carry_reg[ii][e] = (val - static_cast<Acc>(trunc)) >> (CHAR_BIT * sizeof(Target) - 1);
+            }
+          }
+
+          const int32_t out_row_local = warp_id * MMA_N + i;
+          const int32_t global_row = static_cast<int32_t>(blockIdx.x * TILE_SIZE_ROW) + out_row_local;
+
 #pragma unroll
           for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e) {
-            int32_t val = acc_reg[M - 1][i][e];
-            Target trunc = static_cast<Target>(val);
-            carry_reg[i][e] = (val - static_cast<Acc>(trunc)) >> (CHAR_BIT * sizeof(Target) - 1);
+            int32_t local_col = lane_id % LANES_PER_ROW;
+            int32_t local_row = (lane_id / LANES_PER_ROW) + e * GROUPS;
+            int32_t flat_idx = local_row * MMA_N + local_col;
+            int32_t out_col = local_row * LANES_PER_ROW + local_col;
+            int32_t global_col = static_cast<int32_t>(blockIdx.y * TILE_SIZE_COL) + out_col;
+
+            bool in_grid = (global_row < static_cast<int32_t>(height) && global_col < static_cast<int32_t>(ldm));
+            bool is_interior = in_grid && (global_row >= HALO && global_row < static_cast<int32_t>(height) - HALO &&
+                                           global_col >= HALO && global_col < static_cast<int32_t>(ldm) - HALO);
+
+            if (is_interior) {
+              slice_out[global_row * ldm + global_col] = static_cast<Target>(warp_staging[flat_idx]);
+            }
+
+            if (p == 0 && is_interior) {
+              max_acc = max(max_acc, abs(acc_reg[M - 1][ii][e]));
+            }
           }
         }
+      } // end ROWS_PER_CHUNK cleanup inner
+    } // end cleanup position loop
 
-        int32_t out_row_local = warp_id * MMA_N + i;
-        int32_t global_row = static_cast<int32_t>(blockIdx.x * TILE_SIZE_ROW) + out_row_local;
-
-#pragma unroll
-        for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e) {
-          int32_t local_col = lane_id % LANES_PER_ROW;
-          int32_t local_row = (lane_id / LANES_PER_ROW) + e * GROUPS;
-          int32_t flat_idx = local_row * MMA_N + local_col;
-          int32_t out_col = local_row * LANES_PER_ROW + local_col;
-          int32_t global_col = static_cast<int32_t>(blockIdx.y * TILE_SIZE_COL) + out_col;
-
-          bool in_grid = (global_row < static_cast<int32_t>(height) && global_col < static_cast<int32_t>(ldm));
-          bool is_interior = in_grid && (global_row >= HALO && global_row < static_cast<int32_t>(height) - HALO &&
-                                         global_col >= HALO && global_col < static_cast<int32_t>(ldm) - HALO);
-
-          if (is_interior) {
-            slice_out[global_row * ldm + global_col] = static_cast<Target>(warp_staging[flat_idx]);
-          }
-
-          if (p == 0 && is_interior) {
-            max_acc = max(max_acc, abs(acc_reg[M - 1][i][e]));
-          }
-        }
-      }
-    }
-  }
+  } // end chunk loop
 
   // ====================================================================
   // BOUNDARY HANDLING: emulated_gain for non-interior elements

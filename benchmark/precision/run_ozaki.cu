@@ -108,6 +108,7 @@ int main(int argc, char *argv[]) {
       for (size_t timestep : timesteps) {
         NVTX_PUSH(std::format("{} Timesteps", timestep).c_str());
 
+        std::cerr << std::format("Using algorithm {}\n", algorithm_str);
         std::cerr << std::format("Running Ozaki for '{}' for {} timesteps...\n", spec.name, timestep);
 
         auto runner =
@@ -116,7 +117,10 @@ int main(int argc, char *argv[]) {
         for (int32_t s = 2; s <= slice_limit && s < runner->get_max_slices(); ++s) {
           std::string output_path = std::format("{}{}_{}_{}_{}.dat", output_dir, output_prefix, spec.name, timestep, s);
           runner->run_experiment(s, output_path, save_tensors);
-          std::cerr << std::format("  Completed: {} Slices (saved at {})\n", s, output_path);
+          if (save_tensors)
+            std::cerr << std::format("  Completed: {} Slices (saved at {})\n", s, output_path);
+          else
+            std::cerr << std::format("  Completed: {} Slices\n", s, output_path);
         }
 
         NVTX_POP();
