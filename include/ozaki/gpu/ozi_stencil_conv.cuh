@@ -185,22 +185,6 @@ __global__ __launch_bounds__(128, 3) void cvstencil(typename O::target_type *__r
   __shared__ __align__(16) int32_t sm_staging[NUM_WARPS * ACC_TILE_SIZE];
   __shared__ int32_t sm_overflow[NUM_WARPS];
 
-  // ======================== Load M * 2 weight fragments ========================
-  // Each INT8 matrix_b fragment (16×8 = 128 bytes / 32 threads) uses 1 register per thread.
-  // Total weight registers: M × 2 × MMA_NUM = M × 8.
-  wmma::fragment<wmma::matrix_b, MMA_M, MMA_N, MMA_K, int8_t, wmma::row_major> coeff_frag[M][2][MMA_NUM];
-
-#pragma unroll
-  for (int32_t si = 0; si < M; ++si) {
-#pragma unroll
-    for (int32_t c_idx = 0; c_idx < MMA_NUM; ++c_idx) {
-      wmma::load_matrix_sync(coeff_frag[si][0][c_idx],
-                             weight + si * 2 * WT_SIZE + 0 * WT_SIZE + c_idx * MMA_K * COEFF_LD, COEFF_LD);
-      wmma::load_matrix_sync(coeff_frag[si][1][c_idx],
-                             weight + si * 2 * WT_SIZE + 1 * WT_SIZE + c_idx * MMA_K * COEFF_LD, COEFF_LD);
-    }
-  }
-
   // ======================== Initialize overflow flags ========================
   if (tid < NUM_WARPS)
     sm_overflow[tid] = 0;
@@ -339,14 +323,16 @@ __global__ __launch_bounds__(128, 3) void cvstencil(typename O::target_type *__r
               acc.x[e] = acc_reg[si][ii][e];
 
 #pragma unroll
-            for (int32_t c_idx = 0; c_idx < MMA_NUM; ++c_idx) {
-              wmma::load_matrix_sync(in_frag, sm_data[0] + (s_col + c_idx * MMA_K) * SM_LD, SM_LD);
-              wmma::mma_sync(acc, in_frag, coeff_frag[si][0][c_idx], acc);
-            }
+            for (int32_t half = 0; half < 2; ++half) {
 #pragma unroll
-            for (int32_t c_idx = 0; c_idx < MMA_NUM; ++c_idx) {
-              wmma::load_matrix_sync(in_frag, sm_data[1] + (s_col + c_idx * MMA_K) * SM_LD, SM_LD);
-              wmma::mma_sync(acc, in_frag, coeff_frag[si][1][c_idx], acc);
+              for (int32_t c_idx = 0; c_idx < MMA_NUM; ++c_idx) {
+                wmma::load_matrix_sync(in_frag, sm_data[half] + (s_col + c_idx * MMA_K) * SM_LD, SM_LD);
+                wmma::fragment<wmma::matrix_b, MMA_M, MMA_N, MMA_K, int8_t, wmma::row_major> b_frag;
+                wmma::load_matrix_sync(b_frag,
+                                       weight + si * 2 * WT_SIZE + half * WT_SIZE + c_idx * MMA_K * COEFF_LD,
+                                       COEFF_LD);
+                wmma::mma_sync(acc, in_frag, b_frag, acc);
+              }
             }
 
 #pragma unroll

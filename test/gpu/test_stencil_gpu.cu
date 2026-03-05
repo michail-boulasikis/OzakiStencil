@@ -354,13 +354,11 @@ TEST_F(StencilGPUTest, Naive_Identity1D) {
   ASSERT_EQ(cudaSuccess, cudaMemcpy(d_in, input.data(), N * sizeof(Real), cudaMemcpyHostToDevice));
   ASSERT_EQ(cudaSuccess, cudaMemset(d_out, 0, N * sizeof(Real)));
 
-  constexpr int32_t COARSEN = 1;
   dim3 block(256);
   dim3 grid((N + 255) / 256);
-  size_t smem = ozi::tile_smem_bytes<Real, COARSEN, 3>(block);
 
   std::array<size_t, 1> shape = {N};
-  ozi::stencil<Real, COARSEN, 3><<<grid, block, smem>>>(d_out, d_in, shape);
+  ozi::stencil_fp64<3><<<grid, block>>>(d_out, d_in, shape);
   ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
 
   std::vector<Real> result(N);
@@ -387,13 +385,11 @@ TEST_F(StencilGPUTest, Naive_SecondOrderFD1D) {
   ASSERT_EQ(cudaSuccess, cudaMemcpy(d_in, input.data(), N * sizeof(Real), cudaMemcpyHostToDevice));
   ASSERT_EQ(cudaSuccess, cudaMemset(d_out, 0, N * sizeof(Real)));
 
-  constexpr int32_t COARSEN = 1;
   dim3 block(256);
   dim3 grid((N + 255) / 256);
-  size_t smem = ozi::tile_smem_bytes<Real, COARSEN, 3>(block);
 
   std::array<size_t, 1> shape = {N};
-  ozi::stencil<Real, COARSEN, 3><<<grid, block, smem>>>(d_out, d_in, shape);
+  ozi::stencil_fp64<3><<<grid, block>>>(d_out, d_in, shape);
   ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
 
   std::vector<Real> gpu_result(N);
@@ -423,13 +419,11 @@ TEST_F(StencilGPUTest, Naive_Laplace2D) {
   ASSERT_EQ(cudaSuccess, cudaMemcpy(d_in, input.data(), H * W * sizeof(Real), cudaMemcpyHostToDevice));
   ASSERT_EQ(cudaSuccess, cudaMemset(d_out, 0, H * W * sizeof(Real)));
 
-  constexpr int32_t COARSEN = 1;
   dim3 block(32, 16);
   dim3 grid((W + 31) / 32, (H + 15) / 16);
-  size_t smem = ozi::tile_smem_bytes<Real, COARSEN, 3, 3>(block);
 
   std::array<size_t, 2> shape = {H, W};
-  ozi::stencil<Real, COARSEN, 3, 3><<<grid, block, smem>>>(d_out, d_in, shape);
+  ozi::stencil_fp64<3, 3><<<grid, block>>>(d_out, d_in, shape);
   ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
 
   std::vector<Real> gpu_result(H * W);
@@ -462,13 +456,11 @@ TEST_F(StencilGPUTest, Naive_Box3D) {
   ASSERT_EQ(cudaSuccess, cudaMemcpy(d_in, input.data(), total * sizeof(Real), cudaMemcpyHostToDevice));
   ASSERT_EQ(cudaSuccess, cudaMemset(d_out, 0, total * sizeof(Real)));
 
-  constexpr int32_t COARSEN = 1;
   dim3 block(8, 8, 4);
   dim3 grid((W + 7) / 8, (H + 7) / 8, (D + 3) / 4);
-  size_t smem = ozi::tile_smem_bytes<Real, COARSEN, 3, 3, 3>(block);
 
   std::array<size_t, 3> shape = {D, H, W};
-  ozi::stencil<Real, COARSEN, 3, 3, 3><<<grid, block, smem>>>(d_out, d_in, shape);
+  ozi::stencil_fp64<3, 3, 3><<<grid, block>>>(d_out, d_in, shape);
   ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
 
   std::vector<Real> gpu_result(total);
@@ -502,13 +494,11 @@ TEST_F(StencilGPUTest, Naive_PolynomialExact2D) {
   ASSERT_EQ(cudaSuccess, cudaMemcpy(d_in, input.data(), H * W * sizeof(Real), cudaMemcpyHostToDevice));
   ASSERT_EQ(cudaSuccess, cudaMemset(d_out, 0, H * W * sizeof(Real)));
 
-  constexpr int32_t COARSEN = 1;
   dim3 block(32, 16);
   dim3 grid((W + 31) / 32, (H + 15) / 16);
-  size_t smem = ozi::tile_smem_bytes<Real, COARSEN, 3, 3>(block);
 
   std::array<size_t, 2> shape = {H, W};
-  ozi::stencil<Real, COARSEN, 3, 3><<<grid, block, smem>>>(d_out, d_in, shape);
+  ozi::stencil_fp64<3, 3><<<grid, block>>>(d_out, d_in, shape);
   ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
 
   std::vector<Real> result(H * W);
