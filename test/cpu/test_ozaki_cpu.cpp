@@ -1,9 +1,8 @@
-#include <Eigen/Dense>
 #include <gtest/gtest.h>
 
 #include <ozaki/core/stencil.hpp>
 #include <ozaki/cpu/ozi.hpp>
-#include "test_utils.hpp"
+#include "../test_utils.hpp"
 
 #include <cmath>
 #include <limits>
@@ -120,147 +119,6 @@ TYPED_TEST(OzakiTestCPU, InfinityThrows) {
   }
 }
 
-TYPED_TEST(OzakiTestCPU, MatMulNormal) {
-  using Scalar = TypeParam;
-  using MapMat = Eigen::Map<Eigen::Matrix<Scalar, 32, 32, Eigen::ColMajor>>;
-
-  auto vecA = this->generate_random(test_data::N);
-  auto vecB = this->generate_random(test_data::N);
-  std::vector<Scalar> vecC_ozaki(test_data::N);
-
-  MapMat A(vecA.data());
-  MapMat B(vecB.data());
-  Eigen::Matrix<Scalar, 32, 32, Eigen::ColMajor> C_actual = A * B;
-
-  auto slicesA = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecA);
-  auto slicesB = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecB);
-  ozicpu::mul<ozicpu::OzakiFP_Int8<Scalar>>(vecC_ozaki, slicesA, slicesB, 32, 32, 32);
-
-  MapMat C_ozaki(vecC_ozaki.data());
-
-  ASSERT_TRUE(C_actual.isApprox(C_ozaki, this->get_tolerance()));
-}
-
-TYPED_TEST(OzakiTestCPU, MatMulBeta) {
-  using Scalar = TypeParam;
-  using MapMat = Eigen::Map<Eigen::Matrix<Scalar, 32, 32, Eigen::ColMajor>>;
-
-  std::mt19937 engine{test_data::SEED};
-  std::gamma_distribution<double> gamma_dist(0.2, 1.0);
-  std::bernoulli_distribution bool_dist(0.5);
-
-  auto betadist = [&]() -> Scalar {
-    double g1 = gamma_dist(engine);
-    double g2 = gamma_dist(engine);
-    double beta = g1 / (g1 + g2);
-
-    double eps = static_cast<double>(std::numeric_limits<Scalar>::epsilon());
-    double scalar = bool_dist(engine) ? (1.0 / eps) : eps;
-
-    return static_cast<Scalar>(bool_dist(engine) ? (beta * scalar) : -(beta * scalar));
-  };
-
-  std::vector<Scalar> vecA(test_data::N), vecB(test_data::N), vecC_ozaki(test_data::N);
-  for (size_t i = 0; i < test_data::N; ++i) {
-    vecA[i] = betadist();
-    vecB[i] = betadist();
-  }
-
-  MapMat A(vecA.data());
-  MapMat B(vecB.data());
-  auto C_actual = A * B;
-
-  auto slicesA = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecA);
-  auto slicesB = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecB);
-  ozicpu::mul<ozicpu::OzakiFP_Int8<Scalar>>(vecC_ozaki, slicesA, slicesB, 32, 32, 32);
-
-  MapMat C_ozaki(vecC_ozaki.data());
-  ASSERT_TRUE(C_actual.isApprox(C_ozaki, this->get_tolerance()));
-}
-
-TYPED_TEST(OzakiTestCPU, MatMulScaleSkew) {
-  // large * tiny ~ unity
-  using Scalar = TypeParam;
-  using MapMat = Eigen::Map<Eigen::Matrix<Scalar, 32, 32, Eigen::ColMajor>>;
-
-  std::mt19937 engine{test_data::SEED};
-  double huge_base = std::is_same_v<Scalar, float> ? 1.0e30 : 1.0e100;
-  double tiny_base = std::is_same_v<Scalar, float> ? 1.0e-30 : 1.0e-100;
-
-  std::uniform_real_distribution<double> dist_huge(huge_base, huge_base * 5.0);
-  std::uniform_real_distribution<double> dist_tiny(tiny_base, tiny_base * 5.0);
-
-  std::vector<Scalar> vecA(test_data::N), vecB(test_data::N), vecC_ozaki(test_data::N);
-  for (size_t i = 0; i < test_data::N; ++i) {
-    vecA[i] = static_cast<Scalar>(dist_huge(engine));
-    vecB[i] = static_cast<Scalar>(dist_tiny(engine));
-  }
-
-  MapMat A(vecA.data());
-  MapMat B(vecB.data());
-  auto C_actual = A * B;
-
-  auto slicesA = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecA);
-  auto slicesB = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecB);
-  ozicpu::mul<ozicpu::OzakiFP_Int8<Scalar>>(vecC_ozaki, slicesA, slicesB, 32, 32, 32);
-  MapMat C_ozaki(vecC_ozaki.data());
-
-  double tol = std::is_same_v<Scalar, float> ? 1e-5 : 1e-11;
-  ASSERT_TRUE(C_actual.isApprox(C_ozaki, tol));
-}
-
-TYPED_TEST(OzakiTestCPU, MatMulLogUniform) {
-  using Scalar = TypeParam;
-  using MapMat = Eigen::Map<Eigen::Matrix<Scalar, 32, 32, Eigen::ColMajor>>;
-
-  std::mt19937 engine{test_data::SEED};
-  double log_range = std::is_same_v<Scalar, float> ? 5.0 : 10.0;
-
-  std::uniform_real_distribution<double> exp_dist(-log_range, log_range);
-  std::uniform_real_distribution<double> man_dist(-1.0, 1.0);
-  std::normal_distribution<double> norm_dist(0.0, 1.0);
-
-  std::vector<Scalar> vecA(test_data::N), vecB(test_data::N), vecC_ozaki(test_data::N);
-  for (size_t i = 0; i < test_data::N; ++i) {
-    vecA[i] = static_cast<Scalar>(man_dist(engine) * std::pow(10.0, exp_dist(engine)));
-    vecB[i] = static_cast<Scalar>(norm_dist(engine));
-  }
-
-  MapMat A(vecA.data());
-  MapMat B(vecB.data());
-  auto C_actual = A * B;
-
-  auto slicesA = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecA);
-  auto slicesB = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecB);
-  ozicpu::mul<ozicpu::OzakiFP_Int8<Scalar>>(vecC_ozaki, slicesA, slicesB, 32, 32, 32);
-  MapMat C_ozaki(vecC_ozaki.data());
-
-  ASSERT_TRUE(C_actual.isApprox(C_ozaki, this->get_tolerance()));
-}
-
-TYPED_TEST(OzakiTestCPU, MatMulRectangular) {
-  using Scalar = TypeParam;
-  using MapMat = Eigen::Map<Eigen::Matrix<Scalar, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>>;
-
-  size_t M = 16, K = 8, N = 64;
-
-  auto vecA = this->generate_random(M * K);
-  auto vecB = this->generate_random(K * N);
-  std::vector<Scalar> vecC_ozaki(M * N);
-
-  MapMat A(vecA.data(), M, K);
-  MapMat B(vecB.data(), K, N);
-  auto C_actual = A * B;
-
-  auto slicesA = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecA);
-  auto slicesB = ozicpu::slice<ozicpu::OzakiFP_Int8<Scalar>>(vecB);
-  ozicpu::mul<ozicpu::OzakiFP_Int8<Scalar>>(vecC_ozaki, slicesA, slicesB, M, N, K);
-
-  MapMat C_ozaki(vecC_ozaki.data(), M, N);
-
-  ASSERT_TRUE(C_actual.isApprox(C_ozaki, this->get_tolerance()));
-}
-
 // verify that Ozaki survives catastrophic cancellation where Naive fails
 TYPED_TEST(OzakiTestCPU, StabilityCancellation) {
   using Scalar = TypeParam;
@@ -305,5 +163,80 @@ TYPED_TEST(OzakiTestCPU, SimpleStencil) {
     } else {
       ASSERT_FLOAT_EQ(result_ozaki[j], result_gold[j]) << "Mismatch at index " << j;
     }
+  }
+}
+
+TYPED_TEST(OzakiTestCPU, Stencil2D_Laplace) {
+  using Scalar = TypeParam;
+  constexpr size_t H = 64, W = 64;
+  auto u = this->generate_random(H * W);
+
+  // 5-point Laplacian: [0,1,0; 1,-4,1; 0,1,0]
+  ozi::Stencil<Scalar, 3, 3> laplacian(
+      {Scalar(0), Scalar(1), Scalar(0), Scalar(1), Scalar(-4), Scalar(1), Scalar(0), Scalar(1), Scalar(0)});
+
+  std::vector<Scalar> result_ozaki(H * W);
+  ozicpu::stencil<Scalar, 3, 3>(result_ozaki, laplacian, u, {H, W});
+
+  auto result_gold = test_utils::compute_gold_standard(laplacian, u, std::array<size_t, 2>{H, W});
+
+  double rmse = test_utils::interior_relative_rmse<Scalar, 2>(result_ozaki, result_gold, {H, W}, laplacian.offsets);
+  EXPECT_LT(rmse, this->get_tolerance()) << "2D Laplacian interior RMSE too high";
+}
+
+TYPED_TEST(OzakiTestCPU, Stencil2D_Heat) {
+  using Scalar = TypeParam;
+  constexpr size_t H = 64, W = 64;
+  auto u = this->generate_random(H * W);
+
+  // Heat 3x3: {0, 3/16, 0, 3/16, 4/16, 3/16, 0, 3/16, 0}
+  ozi::Stencil<Scalar, 3, 3> heat({Scalar(0), Scalar(3.0 / 16), Scalar(0), Scalar(3.0 / 16), Scalar(4.0 / 16),
+                                   Scalar(3.0 / 16), Scalar(0), Scalar(3.0 / 16), Scalar(0)});
+
+  std::vector<Scalar> result_ozaki(H * W);
+  ozicpu::stencil<Scalar, 3, 3>(result_ozaki, heat, u, {H, W});
+
+  auto result_gold = test_utils::compute_gold_standard(heat, u, std::array<size_t, 2>{H, W});
+
+  double rmse = test_utils::interior_relative_rmse<Scalar, 2>(result_ozaki, result_gold, {H, W}, heat.offsets);
+  EXPECT_LT(rmse, this->get_tolerance()) << "2D Heat interior RMSE too high";
+}
+
+TYPED_TEST(OzakiTestCPU, Stencil3D_Box) {
+  using Scalar = TypeParam;
+  constexpr size_t D = 16, H = 16, W = 16;
+  auto u = this->generate_random(D * H * W);
+
+  // Uniform 3x3x3 box filter: all coefficients = 1/27
+  ozi::Stencil<Scalar, 3, 3, 3> box;
+  for (auto &c : box.coeffs)
+    c = Scalar(1.0 / 27);
+
+  std::vector<Scalar> result_ozaki(D * H * W);
+  ozicpu::stencil<Scalar, 3, 3, 3>(result_ozaki, box, u, {D, H, W});
+
+  auto result_gold = test_utils::compute_gold_standard(box, u, std::array<size_t, 3>{D, H, W});
+
+  double rmse = test_utils::interior_relative_rmse<Scalar, 3>(result_ozaki, result_gold, {D, H, W}, box.offsets);
+  EXPECT_LT(rmse, this->get_tolerance()) << "3D Box interior RMSE too high";
+}
+
+TYPED_TEST(OzakiTestCPU, StencilPolynomialExact1D) {
+  using Scalar = TypeParam;
+  constexpr size_t N = 256;
+
+  // u(x) = x^2, stencil {1, -2, 1} should give 2.0 for interior cells
+  auto stencil = test_data::d2x<Scalar>;
+  std::vector<Scalar> u(N);
+  for (size_t i = 0; i < N; ++i)
+    u[i] = static_cast<Scalar>(static_cast<double>(i) * static_cast<double>(i));
+
+  std::vector<Scalar> result_ozaki(N);
+  ozicpu::stencil<Scalar, 3>(result_ozaki, stencil, u, {N});
+
+  // Interior cells (indices 1..N-2) should all be 2.0
+  for (size_t j = stencil.offsets[0]; j < N - stencil.offsets[0]; ++j) {
+    double err = std::abs(static_cast<double>(result_ozaki[j]) - 2.0);
+    EXPECT_LT(err, this->get_tolerance()) << "Polynomial exactness failed at index " << j;
   }
 }

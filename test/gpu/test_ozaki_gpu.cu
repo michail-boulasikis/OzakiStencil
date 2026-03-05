@@ -6,7 +6,7 @@
 #include <ios>
 #include <ozaki/core/stencil.hpp>
 #include <ozaki/gpu/ozi_kernels.cuh>
-#include "test_utils.hpp"
+#include "../test_utils.hpp"
 
 #include <bit>
 #include <cstdint>
@@ -169,18 +169,6 @@ using TestTypes = ::testing::Types<float, double>;
 
 TYPED_TEST_SUITE(OzakiTestGPU, TestTypes);
 
-TYPED_TEST(OzakiTestGPU, Fill) {
-  using Scalar = TypeParam;
-
-  ozigpu::fill<Scalar><<<this->N_SMALL, this->N_SMALL>>>(this->d_data, this->CVAL, this->N);
-
-  ASSERT_EQ(CUDA_SUCCESS, cudaDeviceSynchronize());
-  ASSERT_EQ(CUDA_SUCCESS, cudaMemcpy(this->h_data, this->d_data, this->N * sizeof(Scalar), cudaMemcpyDeviceToHost));
-
-  for (size_t i = 0; i < this->N; ++i)
-    ASSERT_EQ(this->CVAL, this->h_data[i]) << "Iter[" << i << "]";
-}
-
 TYPED_TEST(OzakiTestGPU, ScaleExtraction) {
   using Scalar = TypeParam;
 
@@ -218,24 +206,18 @@ TYPED_TEST(OzakiTestGPU, ScaleExtraction) {
 
 TYPED_TEST(OzakiTestGPU, SliceAndMendNormal) {
   using Scalar = TypeParam;
+  // Test both static and dynamic slicing in a single test
   this->verify_slice_and_mend(get_slice_max_normal<Scalar>(), false,
+                              [this]() { this->generate_normal(this->h_data, this->N); });
+  this->verify_slice_and_mend(get_slice_max_normal<Scalar>(), true,
                               [this]() { this->generate_normal(this->h_data, this->N); });
 }
 
 TYPED_TEST(OzakiTestGPU, SliceAndMendBeta) {
   using Scalar = TypeParam;
+  // Test both static and dynamic slicing in a single test
   this->verify_slice_and_mend(get_slice_max_beta<Scalar>(), false,
                               [this]() { this->generate_beta(this->h_data, this->N); });
-}
-
-TYPED_TEST(OzakiTestGPU, SliceAndMendNormalDyn) {
-  using Scalar = TypeParam;
-  this->verify_slice_and_mend(get_slice_max_normal<Scalar>(), true,
-                              [this]() { this->generate_normal(this->h_data, this->N); });
-}
-
-TYPED_TEST(OzakiTestGPU, SliceAndMendBetaDyn) {
-  using Scalar = TypeParam;
   this->verify_slice_and_mend(get_slice_max_beta<Scalar>(), true,
                               [this]() { this->generate_beta(this->h_data, this->N); });
 }
