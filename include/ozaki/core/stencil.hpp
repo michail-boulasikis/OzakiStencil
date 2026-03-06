@@ -196,6 +196,47 @@ public:
     return apply_unrolled_impl<AccType>(src, in_strides, std::make_index_sequence<size>{}, idx...);
   }
 
+  // Pointer-based apply: reads coefficients from an external pointer instead of
+  // this->coeffs. Useful when coefficients reside in __constant__ memory and
+  // should be loaded on demand (via LDC/LDCU) rather than copied to registers
+  // or local memory. All shape/stride information is compile-time; only offsets
+  // and the coefficient pointer are runtime.
+  template <size_t Is>
+  HD static constexpr int64_t compute_neighbor_offset(const offset_type &offsets,
+                                                      const std::array<size_t, dims> &in_strides) {
+    constexpr auto s_idx = linear_to_multi(Is);
+    int64_t offset = 0;
+    for (size_t d = 0; d < dims; ++d) {
+      int64_t diff = static_cast<int64_t>(s_idx[d]) - static_cast<int64_t>(offsets[d]);
+      offset += diff * static_cast<int64_t>(in_strides[d]);
+    }
+    return offset;
+  }
+
+  template <typename AccType, typename InputT, size_t... Is, typename... Idx>
+  HD static OZI_ALWAYS_INLINE AccType apply_unrolled_from(const T *__restrict__ coeff_ptr,
+                                                          const offset_type &offsets,
+                                                          const InputT *__restrict__ src,
+                                                          const std::array<size_t, dims> &in_strides,
+                                                          std::index_sequence<Is...>, Idx... center_indices) {
+    const std::array<size_t, dims> c_idx = {static_cast<size_t>(center_indices)...};
+    int64_t center_base = 0;
+    for (size_t d = 0; d < dims; ++d)
+      center_base += static_cast<int64_t>(c_idx[d]) * static_cast<int64_t>(in_strides[d]);
+
+    return ((static_cast<AccType>(coeff_ptr[Is]) *
+             static_cast<AccType>(src[center_base + compute_neighbor_offset<Is>(offsets, in_strides)])) +
+            ...);
+  }
+
+  template <typename AccType, typename InputT, typename... Idx>
+    requires(sizeof...(Idx) == dims)
+  HD static OZI_ALWAYS_INLINE AccType apply_at_as_from(const T *__restrict__ coeff_ptr, const offset_type &offsets,
+                                                       const InputT *__restrict__ src,
+                                                       const std::array<size_t, dims> &in_strides, Idx... idx) {
+    return apply_unrolled_from<AccType>(coeff_ptr, offsets, src, in_strides, std::make_index_sequence<size>{}, idx...);
+  }
+
   template <typename AccType, typename OutContainer, typename InContainer>
   void apply_to(OutContainer &output, const InContainer &input, const shape_type &in_shape) const {
 

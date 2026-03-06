@@ -409,11 +409,14 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
     if (cfg.flush_l2)
       cache_inv.invalidate();
 
+    // Copy stencil slices to constant memory
+    CUDA_CHECK(cudaMemcpyToSymbol(ozigpu::stencil_v1_cmem, &ss, sizeof(ss)));
+
     // Warmup
     if (cfg.warmup > 0) {
       NVTX_PUSH("Warmup");
       for (int32_t t = 0; t < cfg.warmup; ++t) {
-        ozigpu::stencil_v1<Oz, M, Dims...><<<grid, block>>>(d_slices_2, d_slices_1, ss, input_shape, d_desc);
+        ozigpu::stencil_v1<Oz, M, Dims...><<<grid, block>>>(d_slices_2, d_slices_1, input_shape, d_desc);
         if (t < cfg.warmup - 1)
           ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, 0);
         std::swap(d_slices_1, d_slices_2);
@@ -445,7 +448,7 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
     NVTX_PUSH("Integration");
     ev.record_start();
     for (int32_t t = 0; t < cfg.timesteps; ++t) {
-      ozigpu::stencil_v1<Oz, M, Dims...><<<grid, block>>>(d_slices_2, d_slices_1, ss, input_shape, d_desc);
+      ozigpu::stencil_v1<Oz, M, Dims...><<<grid, block>>>(d_slices_2, d_slices_1, input_shape, d_desc);
       if (t < cfg.timesteps - 1) {
         int32_t min_shifts_now;
         if (t == cfg.timesteps - 2)

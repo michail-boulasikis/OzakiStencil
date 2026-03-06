@@ -202,10 +202,13 @@ public:
     int32_t total_shifts_needed = static_cast<int32_t>(
         std::ceil(n_iterations * log2_sf / 7.0));
 
+    // Copy stencil slices to constant memory
+    CUDA_CHECK(cudaMemcpyToSymbol(ozigpu::stencil_v1_cmem, &stencil_slices_, sizeof(stencil_slices_)));
+
     NVTX_PUSH("Integration Loop");
     for (int32_t t = 0; t < n_iterations; ++t) {
       ozigpu::stencil_v1<ozigpu::OzakiFP_Int8<Real>, M, Dims...>
-          <<<grid, block>>>(d_slices_2, d_slices_1, stencil_slices_, input_shape, d_desc);
+          <<<grid, block>>>(d_slices_2, d_slices_1, input_shape, d_desc);
 
       if (t < n_iterations - 1) {
         // At the penultimate iteration, require ALL shifts so the final

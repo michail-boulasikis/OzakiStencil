@@ -17,6 +17,8 @@ template <size_t... Dims>
   requires(sizeof...(Dims) <= 3)
 __global__ void stencil_fp32(float *__restrict__ out, const float *__restrict__ in,
                              const typename Stencil<float, Dims...>::shape_type input_shape) {
+  using S = Stencil<float, Dims...>;
+  const auto *s = reinterpret_cast<const S *>(stencil_cmem);
 
   int32_t i, j, k;
   i = threadIdx.x + blockDim.x * blockIdx.x;
@@ -25,11 +27,9 @@ __global__ void stencil_fp32(float *__restrict__ out, const float *__restrict__ 
   if constexpr (sizeof...(Dims) > 2)
     k = threadIdx.z + blockDim.z * blockIdx.z;
 
-  auto s = *reinterpret_cast<const Stencil<float, Dims...> *>(stencil_cmem);
-
-  constexpr auto s_shape = s.get_shape();
+  constexpr auto s_shape = S::get_shape();
   auto check_dim = [&] __device__(int32_t idx, int32_t dim_idx) {
-    return (idx >= s.offsets[dim_idx] && idx <= input_shape[dim_idx] - (s_shape[dim_idx] - s.offsets[dim_idx]));
+    return (idx >= s->offsets[dim_idx] && idx <= input_shape[dim_idx] - (s_shape[dim_idx] - s->offsets[dim_idx]));
   };
 
   bool in_bounds;
@@ -45,17 +45,19 @@ __global__ void stencil_fp32(float *__restrict__ out, const float *__restrict__ 
     return;
 
   const auto input_strides = make_strides_from_shape(input_shape);
+  const float *coeffs = s->coeffs.data();
+  const auto &offsets = s->offsets;
 
   size_t out_offset = 0;
   if constexpr (sizeof...(Dims) == 1) {
     out_offset = i;
-    out[out_offset] = s.template apply_at_as<float>(in, input_strides, i);
+    out[out_offset] = S::template apply_at_as_from<float>(coeffs, offsets, in, input_strides, i);
   } else if constexpr (sizeof...(Dims) == 2) {
     out_offset = i + j * input_shape[1];
-    out[out_offset] = s.template apply_at_as<float>(in, input_strides, j, i);
+    out[out_offset] = S::template apply_at_as_from<float>(coeffs, offsets, in, input_strides, j, i);
   } else if constexpr (sizeof...(Dims) == 3) {
     out_offset = i + j * input_shape[2] + k * input_shape[1] * input_shape[2];
-    out[out_offset] = s.template apply_at_as<float>(in, input_strides, k, j, i);
+    out[out_offset] = S::template apply_at_as_from<float>(coeffs, offsets, in, input_strides, k, j, i);
   }
 }
 
@@ -63,6 +65,8 @@ template <size_t... Dims>
   requires(sizeof...(Dims) <= 3)
 __global__ void stencil_fp64(double *__restrict__ out, const double *__restrict__ in,
                              const typename Stencil<double, Dims...>::shape_type input_shape) {
+  using S = Stencil<double, Dims...>;
+  const auto *s = reinterpret_cast<const S *>(stencil_cmem);
 
   int32_t i, j, k;
   i = threadIdx.x + blockDim.x * blockIdx.x;
@@ -71,11 +75,9 @@ __global__ void stencil_fp64(double *__restrict__ out, const double *__restrict_
   if constexpr (sizeof...(Dims) > 2)
     k = threadIdx.z + blockDim.z * blockIdx.z;
 
-  auto s = *reinterpret_cast<const Stencil<double, Dims...> *>(stencil_cmem);
-
-  constexpr auto s_shape = s.get_shape();
+  constexpr auto s_shape = S::get_shape();
   auto check_dim = [&] __device__(int32_t idx, int32_t dim_idx) {
-    return (idx >= s.offsets[dim_idx] && idx <= input_shape[dim_idx] - (s_shape[dim_idx] - s.offsets[dim_idx]));
+    return (idx >= s->offsets[dim_idx] && idx <= input_shape[dim_idx] - (s_shape[dim_idx] - s->offsets[dim_idx]));
   };
 
   bool in_bounds;
@@ -91,17 +93,19 @@ __global__ void stencil_fp64(double *__restrict__ out, const double *__restrict_
     return;
 
   const auto input_strides = make_strides_from_shape(input_shape);
+  const double *coeffs = s->coeffs.data();
+  const auto &offsets = s->offsets;
 
   size_t out_offset = 0;
   if constexpr (sizeof...(Dims) == 1) {
     out_offset = i;
-    out[out_offset] = s.template apply_at_as<double>(in, input_strides, i);
+    out[out_offset] = S::template apply_at_as_from<double>(coeffs, offsets, in, input_strides, i);
   } else if constexpr (sizeof...(Dims) == 2) {
     out_offset = i + j * input_shape[1];
-    out[out_offset] = s.template apply_at_as<double>(in, input_strides, j, i);
+    out[out_offset] = S::template apply_at_as_from<double>(coeffs, offsets, in, input_strides, j, i);
   } else if constexpr (sizeof...(Dims) == 3) {
     out_offset = i + j * input_shape[2] + k * input_shape[1] * input_shape[2];
-    out[out_offset] = s.template apply_at_as<double>(in, input_strides, k, j, i);
+    out[out_offset] = S::template apply_at_as_from<double>(coeffs, offsets, in, input_strides, k, j, i);
   }
 }
 
@@ -110,6 +114,8 @@ template <size_t... Dims>
   requires(sizeof...(Dims) <= 3)
 __global__ void stencil_fp128(__float128 *__restrict__ out, const __float128 *__restrict__ in,
                               const typename Stencil<__float128, Dims...>::shape_type input_shape) {
+  using S = Stencil<__float128, Dims...>;
+  const auto *s = reinterpret_cast<const S *>(stencil_cmem);
 
   int32_t i, j, k;
   i = threadIdx.x + blockDim.x * blockIdx.x;
@@ -118,11 +124,9 @@ __global__ void stencil_fp128(__float128 *__restrict__ out, const __float128 *__
   if constexpr (sizeof...(Dims) > 2)
     k = threadIdx.z + blockDim.z * blockIdx.z;
 
-  auto s = *reinterpret_cast<const Stencil<__float128, Dims...> *>(stencil_cmem);
-
-  constexpr auto s_shape = s.get_shape();
+  constexpr auto s_shape = S::get_shape();
   auto check_dim = [&] __device__(int32_t idx, int32_t dim_idx) {
-    return (idx >= s.offsets[dim_idx] && idx <= input_shape[dim_idx] - (s_shape[dim_idx] - s.offsets[dim_idx]));
+    return (idx >= s->offsets[dim_idx] && idx <= input_shape[dim_idx] - (s_shape[dim_idx] - s->offsets[dim_idx]));
   };
 
   bool in_bounds;
@@ -138,17 +142,19 @@ __global__ void stencil_fp128(__float128 *__restrict__ out, const __float128 *__
     return;
 
   const auto input_strides = make_strides_from_shape(input_shape);
+  const __float128 *coeffs = s->coeffs.data();
+  const auto &offsets = s->offsets;
 
   size_t out_offset = 0;
   if constexpr (sizeof...(Dims) == 1) {
     out_offset = i;
-    out[out_offset] = s.template apply_at_as<__float128>(in, input_strides, i);
+    out[out_offset] = S::template apply_at_as_from<__float128>(coeffs, offsets, in, input_strides, i);
   } else if constexpr (sizeof...(Dims) == 2) {
     out_offset = i + j * input_shape[1];
-    out[out_offset] = s.template apply_at_as<__float128>(in, input_strides, j, i);
+    out[out_offset] = S::template apply_at_as_from<__float128>(coeffs, offsets, in, input_strides, j, i);
   } else if constexpr (sizeof...(Dims) == 3) {
     out_offset = i + j * input_shape[2] + k * input_shape[1] * input_shape[2];
-    out[out_offset] = s.template apply_at_as<__float128>(in, input_strides, k, j, i);
+    out[out_offset] = S::template apply_at_as_from<__float128>(coeffs, offsets, in, input_strides, k, j, i);
   }
 }
 #endif

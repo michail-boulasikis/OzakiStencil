@@ -201,8 +201,11 @@ protected:
         (scaling_factor > HighPrecType(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
     int32_t total_shifts_needed = static_cast<int32_t>(std::ceil(timesteps * log2_sf / 7.0));
 
+    // Copy stencil slices to constant memory before kernel launch
+    ASSERT_EQ(cudaSuccess, cudaMemcpyToSymbol(ozigpu::stencil_v1_cmem, &ss, sizeof(ss)));
+
     for (int32_t t = 0; t < timesteps; ++t) {
-      ozigpu::stencil_v1<OzPair, M, Dims...><<<grid, block>>>(d_slices_2, d_slices_1, ss, input_shape, d_desc);
+      ozigpu::stencil_v1<OzPair, M, Dims...><<<grid, block>>>(d_slices_2, d_slices_1, input_shape, d_desc);
 
       if (t < timesteps - 1) {
         int32_t min_shifts_now;

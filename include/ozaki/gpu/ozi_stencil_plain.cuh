@@ -10,6 +10,12 @@
 #include <type_traits>
 
 namespace ozigpu {
+
+// Constant memory for stencil data. StencilSlices structs are copied here
+// before kernel launch so coefficients are loaded on demand via LDC/LDCU
+// instead of being copied to the per-thread stack.
+__constant__ int8_t stencil_v1_cmem[8192];
+
 /**
  * Computes S @ u, where u is the ozaki decomposition of a tensor, and S is a
  * multi-slice stencil described by M Target-type stencil slices.
@@ -22,15 +28,22 @@ namespace ozigpu {
  * The inner loop iterates over stencil slices, accumulating pair-wise products
  * into M accumulators of equal scale, with carry propagation between result
  * positions.
+ *
+ * Stencil data is read from __constant__ memory (stencil_v1_cmem). Callers
+ * must copy the StencilSlices struct via cudaMemcpyToSymbol before launch.
  */
 template <OzakiPair O, int32_t M, size_t... Dims>
   requires(sizeof...(Dims) <= 3) && std::is_integral_v<typename O::target_type> && (M >= 1)
 __global__ void stencil_v1(typename O::target_type *__restrict__ out, const typename O::target_type *__restrict__ in,
-                           const ozi::StencilSlices<Stencil<typename O::target_type, Dims...>, M> s,
                            const typename Stencil<typename O::target_type, Dims...>::shape_type input_shape,
                            OzakiDescriptor<O> *__restrict__ desc) {
   using Target = typename O::target_type;
   using Acc = typename O::acc_type;
+  using StencilType = Stencil<Target, Dims...>;
+  using StencilSlices_type = ozi::StencilSlices<StencilType, M>;
+
+  // Access stencil data directly from constant memory — no struct copy
+  const auto *s = reinterpret_cast<const StencilSlices_type *>(stencil_v1_cmem);
 
   const int32_t total_slices = desc->n_slices_input;
   const int32_t carry_idx = desc->carry_slice_index;
@@ -50,10 +63,10 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
   }
 
   // Bounds check uses s[0] since all slices share the same shape
-  const auto &s_shape = s.slices[0].get_shape();
+  constexpr auto s_shape = StencilType::get_shape();
   auto check_dim = [&] __device__(int32_t idx, size_t dim_idx) {
-    return (idx >= s.slices[0].offsets[dim_idx] &&
-            idx <= input_shape[dim_idx] - (s_shape[dim_idx] - s.slices[0].offsets[dim_idx]));
+    return (idx >= s->slices[0].offsets[dim_idx] &&
+            idx <= input_shape[dim_idx] - (s_shape[dim_idx] - s->slices[0].offsets[dim_idx]));
   };
 
   bool in_bounds;
@@ -79,8 +92,6 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
   }
 
   const auto input_strides = ozi::make_strides_from_shape(input_shape);
-
-  using StencilSlices_type = ozi::StencilSlices<Stencil<Target, Dims...>, M>;
 
   // M accumulators for the sliding window of result positions.
   // acc[0] tracks the most significant active position,
@@ -132,12 +143,18 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
 
           Acc partial = static_cast<Acc>(0);
           if (!treat_as_zero) {
+            // Load coefficients for slice si on demand from constant memory
+            const Target *coeff_si = s->slices[si].coeffs.data();
+            const auto &offsets_si = s->slices[si].offsets;
             if constexpr (sizeof...(Dims) == 1)
-              partial = s.slices[si].template apply_at_as<Acc>(current_slice_input, input_strides, i);
+              partial = StencilType::template apply_at_as_from<Acc>(coeff_si, offsets_si, current_slice_input,
+                                                                    input_strides, i);
             else if constexpr (sizeof...(Dims) == 2)
-              partial = s.slices[si].template apply_at_as<Acc>(current_slice_input, input_strides, j, i);
+              partial = StencilType::template apply_at_as_from<Acc>(coeff_si, offsets_si, current_slice_input,
+                                                                    input_strides, j, i);
             else if constexpr (sizeof...(Dims) == 3)
-              partial = s.slices[si].template apply_at_as<Acc>(current_slice_input, input_strides, k, j, i);
+              partial = StencilType::template apply_at_as_from<Acc>(coeff_si, offsets_si, current_slice_input,
+                                                                    input_strides, k, j, i);
           }
           acc[si] += partial;
         }
@@ -187,38 +204,42 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
 
     } else {
       // ========= BOUNDARY PATH: full N×N_bg multiplication with emulated_gain =========
-      const int32_t n_bg = s.n_emulated_gain_slices;
+      // Streaming formulation: process output positions from LSB to MSB,
+      // fusing accumulation with carry propagation. Uses O(1) stack instead
+      // of O(total_slices) for the boundary_result array.
+      const int32_t n_bg = s->n_emulated_gain_slices;
       const bool skip_lsb = desc->just_shifted;
 
       if (n_bg > 0) {
-        int32_t boundary_result[StencilSlices_type::MAX_DATA_SLICES] = {};
+        Acc b_carry = static_cast<Acc>(0);
+        Acc b_raw = static_cast<Acc>(0);
 
-        for (int32_t d = total_slices - 1; d >= 0; --d) {
-          if (d == 0 && skip_lsb)
-            continue;
-          int32_t phys_d = (carry_idx + d) % total_slices;
-          Acc data_d = static_cast<Acc>(in[slice_stride * phys_d + out_offset]);
+        for (int32_t r = total_slices - 1; r >= 0; --r) {
+          b_raw = b_carry;
+          b_carry = static_cast<Acc>(0);
 
           for (int32_t g = 0; g < n_bg; ++g) {
-            int32_t r = d + g;
-            if (r < total_slices)
-              boundary_result[r] += static_cast<int32_t>(data_d) * static_cast<int32_t>(s.emulated_gain[g]);
+            int32_t d = r - g;
+            if (d >= 0 && !(d == 0 && skip_lsb)) {
+              int32_t phys_d = (carry_idx + d) % total_slices;
+              b_raw += static_cast<Acc>(in[slice_stride * phys_d + out_offset])
+                     * static_cast<int32_t>(s->emulated_gain[g]);
+            }
+          }
+
+          int32_t phys_r = (carry_idx + r) % total_slices;
+          Target *out_ptr = out + slice_stride * phys_r;
+          if (r > 0) {
+            Target digit = static_cast<Target>(b_raw);
+            out_ptr[out_offset] = digit;
+            b_carry = (b_raw - static_cast<Acc>(digit)) >> (CHAR_BIT * sizeof(Target) - 1);
+          } else {
+            out_ptr[out_offset] = static_cast<Target>(b_raw);
           }
         }
 
-        // Carry propagation and write output
-        for (int32_t r = total_slices - 1; r > 0; --r) {
-          int32_t phys_r = (carry_idx + r) % total_slices;
-          Target digit = static_cast<Target>(boundary_result[r]);
-          out[slice_stride * phys_r + out_offset] = digit;
-          boundary_result[r - 1] +=
-              (boundary_result[r] - static_cast<int32_t>(digit)) >> (CHAR_BIT * sizeof(Target) - 1);
-        }
-        // MSB: no carry target
-        out[slice_stride * ((carry_idx) % total_slices) + out_offset] = static_cast<Target>(boundary_result[0]);
-
-        // Set acc[M-1] for overflow detection
-        acc[M - 1] = static_cast<Acc>(boundary_result[0]);
+        // Set acc[M-1] for overflow detection (MSB value before truncation)
+        acc[M - 1] = b_raw;
       }
     }
   }
