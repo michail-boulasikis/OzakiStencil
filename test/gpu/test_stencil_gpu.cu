@@ -1,7 +1,7 @@
 /**
  * GPU stencil kernel test suite.
  *
- * Tests four GPU stencil code paths:
+ * Tests five GPU stencil code paths:
  *   1. NaiveGPUStencil  - FP64 shared-memory stencil (ozi::stencil)
  *   2. OzakiStencilV1   - Ozaki INT8 scalar stencil (ozigpu::stencil_v1)
  *   3. ConvStencilWMMA  - Ozaki INT8 tensor-core stencil (ozigpu::cvstencil)
@@ -145,8 +145,8 @@ protected:
     h_desc.n_slices_input = num_slices_total;
 
     ASSERT_EQ(cudaSuccess, cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_slices_1, num_slices_total * n_elems * sizeof(int8_t)));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_slices_2, num_slices_total * n_elems * sizeof(int8_t)));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_slices_1, num_slices_total * n_elems * sizeof(int8_t) + ozigpu::STENCIL_V1_ALLOC_PAD));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_slices_2, num_slices_total * n_elems * sizeof(int8_t) + ozigpu::STENCIL_V1_ALLOC_PAD));
   }
 
   void prepare_slices() {
@@ -898,7 +898,7 @@ TEST_F(StencilGPUTest, Boundary_StencilV1_AllBoundary) {
 }
 
 // ============================================================
-// Test Suite 5: M > 1 Stencil Tests (Gap 1)
+// Test Suite 6: M > 1 Stencil Tests (Gap 1)
 // ============================================================
 
 TEST_F(StencilGPUTest, OzakiV1_M2_SingleStep_1D) {
@@ -1024,7 +1024,7 @@ TEST_F(StencilGPUTest, CvStencil_M2_MatchesV1_7x7) {
 }
 
 // ============================================================
-// Test Suite 6: Overflow/Shift Mechanism Tests (Gap 2)
+// Test Suite 7: Overflow/Shift Mechanism Tests (Gap 2)
 // ============================================================
 
 TEST_F(StencilGPUTest, OzakiV1_ShiftCount_SingleShift_Heat2D) {

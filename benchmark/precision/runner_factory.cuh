@@ -47,15 +47,6 @@ dispatch_m(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Rea
   case 4:
     return make_runner_impl<4>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
                                extra_msb_shift);
-  case 5:
-    return make_runner_impl<5>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
-                               extra_msb_shift);
-  case 6:
-    return make_runner_impl<6>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
-                               extra_msb_shift);
-  case 7:
-    return make_runner_impl<7>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
-                               extra_msb_shift);
   case 8:
     return make_runner_impl<8>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
                                extra_msb_shift);
@@ -64,12 +55,6 @@ dispatch_m(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Rea
                                extra_msb_shift);
   case 10:
     return make_runner_impl<10>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
-                                extra_msb_shift);
-  case 11:
-    return make_runner_impl<11>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
-                                extra_msb_shift);
-  case 12:
-    return make_runner_impl<12>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
                                 extra_msb_shift);
   default:
     throw std::invalid_argument("  Stencil requires M=" + std::to_string(m) +
@@ -116,15 +101,6 @@ dispatch_m_convstencil(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, cons
   case 4:
     return make_convstencil_runner_impl<4>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
                                            a_coeff, extra_msb_shift);
-  case 5:
-    return make_convstencil_runner_impl<5>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
-                                           a_coeff, extra_msb_shift);
-  case 6:
-    return make_convstencil_runner_impl<6>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
-                                           a_coeff, extra_msb_shift);
-  case 7:
-    return make_convstencil_runner_impl<7>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
-                                           a_coeff, extra_msb_shift);
   case 8:
     return make_convstencil_runner_impl<8>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
                                            a_coeff, extra_msb_shift);
@@ -133,12 +109,6 @@ dispatch_m_convstencil(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, cons
                                            a_coeff, extra_msb_shift);
   case 10:
     return make_convstencil_runner_impl<10>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
-                                            a_coeff, extra_msb_shift);
-  case 11:
-    return make_convstencil_runner_impl<11>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
-                                            a_coeff, extra_msb_shift);
-  case 12:
-    return make_convstencil_runner_impl<12>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
                                             a_coeff, extra_msb_shift);
   default:
     throw std::invalid_argument("  Stencil requires M=" + std::to_string(m) +
@@ -163,9 +133,8 @@ inline std::unique_ptr<OzakiRunnerBase> make_ozaki_runner(const StencilSpec &spe
       [&](const auto &s) {
         constexpr size_t stencil_ndims = std::decay_t<decltype(s)>::dims;
         if (stencil_ndims != input.shape.size())
-          throw std::invalid_argument(
-              std::format("Stencil '{}' has {} dimensions but input tensor has {} dimensions",
-                          spec.name, stencil_ndims, input.shape.size()));
+          throw std::invalid_argument(std::format("Stencil '{}' has {} dimensions but input tensor has {} dimensions",
+                                                  spec.name, stencil_ndims, input.shape.size()));
       },
       variant);
 

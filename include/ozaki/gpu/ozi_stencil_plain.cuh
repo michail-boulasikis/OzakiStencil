@@ -16,6 +16,145 @@ namespace ozigpu {
 // instead of being copied to the per-thread stack.
 __constant__ int8_t stencil_v1_cmem[8192];
 
+// Padding bytes required for slice buffer allocations used with stencil_v1.
+// vdot_line uses aligned uint32_t loads that can over-read by up to 12 bytes
+// past the last needed data byte (worst case: W=7, dboff=0 on the last
+// physical slice's edge thread). Without this padding the load may cross
+// into an unmapped page and trigger a Warp MMU Fault.
+static constexpr size_t STENCIL_V1_ALLOC_PAD = 16;
+
+// ============================================================================
+// Vectorized stencil application helpers
+//
+// Loads int32 words from 4-byte-aligned global addresses, extracts the needed
+// bytes via PRMT, and feeds them to __dp4a together with pre-packed coefficient
+// words read directly from __constant__ memory as uint32_t (LDC.U32).
+//
+// The coefficient packing (int8 → uint32) is done once on the host by
+// StencilSlices::compute_packed_coeffs() and uploaded as part of the struct.
+// This eliminates the runtime byte-load + shift/OR packing that previously
+// dominated math-pipe time.
+// ============================================================================
+namespace detail {
+
+// Dot product of W consecutive int8 data values (at line_ptr) with W int8
+// coefficients (pre-packed in packed_row), using int32 vectorized loads +
+// __dp4a.  The PRMT selector dsel is passed in from the caller so it can
+// be hoisted out of the row loop when stride_slow is 4-aligned.
+// W is the compile-time stencil extent in the fastest dimension.
+template <int32_t W>
+__device__ __forceinline__ int32_t vdot_line(const uint32_t *__restrict__ packed_row,
+                                             const int8_t *__restrict__ line_ptr, uint32_t dsel) {
+  static_assert(W >= 1 && W <= 7, "Supported stencil widths: 1-7");
+
+  // -- Align data pointer to 4-byte boundary, load int32 words --
+  const uint32_t *dwp = reinterpret_cast<const uint32_t *>(reinterpret_cast<uintptr_t>(line_ptr) & ~uintptr_t(3));
+
+  uint32_t dw0 = dwp[0], dw1 = dwp[1];
+  [[maybe_unused]] uint32_t dw2 = 0;
+  if constexpr (W > 5)
+    dw2 = dwp[2]; // only needed when boff + W can exceed 8
+
+  // Pre-packed coefficient words (LDC.U32 from __constant__ memory).
+  // Unused high bytes are already zeroed by compute_packed_coeffs().
+  const uint32_t cpacked0 = packed_row[0];
+  [[maybe_unused]] const uint32_t cpacked1 = (W > 4) ? packed_row[1] : 0u;
+
+  int32_t acc = 0;
+
+  // -- Group 0: taps 0..min(3, W-1) via __dp4a --
+  {
+    uint32_t dpacked = __byte_perm(dw0, dw1, dsel);
+    acc = __dp4a(static_cast<int32_t>(dpacked), static_cast<int32_t>(cpacked0), acc);
+  }
+
+  // -- Group 1: taps 4..min(7, W-1) via __dp4a (if W > 4) --
+  if constexpr (W > 4) {
+    uint32_t dpacked = __byte_perm(dw1, dw2, dsel);
+    acc = __dp4a(static_cast<int32_t>(dpacked), static_cast<int32_t>(cpacked1), acc);
+  }
+
+  return acc;
+}
+
+// Full stencil application using vectorized loads and pre-packed coefficients.
+// Iterates over the slow dimension(s) and calls vdot_line for each
+// fast-dimension strip.  Uses incremental pointer advancement and hoisted
+// PRMT-selector computation to minimize per-row ALU.
+template <typename AccType, size_t... Dims, typename... Idx>
+__device__ __forceinline__ AccType apply_stencil_vec(const uint32_t *__restrict__ packed_ptr,
+                                                     const std::array<size_t, sizeof...(Dims)> &offsets,
+                                                     const int8_t *__restrict__ src,
+                                                     const std::array<size_t, sizeof...(Dims)> &in_strides,
+                                                     Idx... center_indices) {
+  constexpr size_t ndims = sizeof...(Dims);
+  constexpr auto shape = std::array<size_t, ndims>{Dims...};
+  constexpr int32_t fast_W = static_cast<int32_t>(shape[ndims - 1]);
+  constexpr int32_t packed_per_row = (fast_W + 3) / 4;
+
+  const std::array<size_t, ndims> c_idx = {static_cast<size_t>(center_indices)...};
+  int64_t center_base = 0;
+  for (size_t d = 0; d < ndims; ++d)
+    center_base += static_cast<int64_t>(c_idx[d]) * static_cast<int64_t>(in_strides[d]);
+  const int8_t *center_ptr = src + center_base;
+
+  if constexpr (ndims == 1) {
+    const int8_t *line = center_ptr - static_cast<int64_t>(offsets[0]);
+    uint32_t dboff = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(line)) & 3u;
+    uint32_t dsel = 0x3210u + dboff * 0x1111u;
+    return static_cast<AccType>(vdot_line<fast_W>(packed_ptr, line, dsel));
+  } else if constexpr (ndims == 2) {
+    constexpr int32_t H = static_cast<int32_t>(shape[0]);
+    const int64_t stride_slow = static_cast<int64_t>(in_strides[0]);
+    const int64_t off_fast = static_cast<int64_t>(offsets[ndims - 1]);
+
+    // Initial line pointer: first row of the stencil window
+    const int8_t *line = center_ptr - static_cast<int64_t>(offsets[0]) * stride_slow - off_fast;
+
+    // Precompute alignment; track incrementally across rows
+    uint32_t dboff = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(line)) & 3u;
+    const uint32_t dboff_delta = static_cast<uint32_t>(stride_slow) & 3u;
+
+    AccType result = static_cast<AccType>(0);
+#pragma unroll
+    for (int32_t r = 0; r < H; ++r) {
+      uint32_t dsel = 0x3210u + dboff * 0x1111u;
+      result += static_cast<AccType>(vdot_line<fast_W>(packed_ptr + r * packed_per_row, line, dsel));
+      line += stride_slow;
+      dboff = (dboff + dboff_delta) & 3u;
+    }
+    return result;
+  } else {
+    constexpr int32_t D = static_cast<int32_t>(shape[0]);
+    constexpr int32_t H = static_cast<int32_t>(shape[1]);
+    const int64_t stride_d = static_cast<int64_t>(in_strides[0]);
+    const int64_t stride_h = static_cast<int64_t>(in_strides[1]);
+    const int64_t off_fast = static_cast<int64_t>(offsets[ndims - 1]);
+    const uint32_t dboff_delta_h = static_cast<uint32_t>(stride_h) & 3u;
+
+    AccType result = static_cast<AccType>(0);
+#pragma unroll
+    for (int32_t dd = 0; dd < D; ++dd) {
+      // Compute start-of-row pointer for this depth slice
+      const int8_t *line = center_ptr + static_cast<int64_t>(dd - static_cast<int32_t>(offsets[0])) * stride_d -
+                           static_cast<int64_t>(offsets[1]) * stride_h - off_fast;
+
+      uint32_t dboff = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(line)) & 3u;
+
+#pragma unroll
+      for (int32_t r = 0; r < H; ++r) {
+        uint32_t dsel = 0x3210u + dboff * 0x1111u;
+        result += static_cast<AccType>(vdot_line<fast_W>(packed_ptr + (dd * H + r) * packed_per_row, line, dsel));
+        line += stride_h;
+        dboff = (dboff + dboff_delta_h) & 3u;
+      }
+    }
+    return result;
+  }
+}
+
+} // namespace detail
+
 /**
  * Computes S @ u, where u is the ozaki decomposition of a tensor, and S is a
  * multi-slice stencil described by M Target-type stencil slices.
@@ -28,6 +167,10 @@ __constant__ int8_t stencil_v1_cmem[8192];
  * The inner loop iterates over stencil slices, accumulating pair-wise products
  * into M accumulators of equal scale, with carry propagation between result
  * positions.
+ *
+ * Uses int32 vectorized global loads (via detail::apply_stencil_vec) instead
+ * of individual byte loads, reducing LDG instruction count by ~2-3× while
+ * keeping the barrier-free, L1-cache-friendly structure.
  *
  * Stencil data is read from __constant__ memory (stencil_v1_cmem). Callers
  * must copy the StencilSlices struct via cudaMemcpyToSymbol before launch.
@@ -113,13 +256,14 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
       out_offset = i + j * input_shape[2] + k * input_shape[1] * input_shape[2];
 
     if (in_bounds) {
+      const auto &offsets = s->slices[0].offsets; // all stencils have the same offsets
+
       // Main loop: process data slices from LSB to MSB
       // Each iteration loads one data slice and applies all M stencil slices to
       // it. Products S_si @ D_j contribute to result position (j + si), which
       // maps to accumulator index si. After accumulation, the completed result
       // in acc[M-1] is extracted, and the carry propagates via a shift of the
       // accumulator window.
-#pragma unroll 4
       for (int32_t logic_s = total_slices - 1; logic_s >= 0; --logic_s) {
         // Shift accumulators: slide the window one position towards MSB.
         // acc[M-1] receives the old acc[M-2] plus carry from previous output.
@@ -138,6 +282,7 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
         // Inner loop: apply all M stencil slices to the loaded data slice.
         // Iterates from least significant to most significant stencil slice.
         // S_si @ D_{logic_s} contributes to result position (logic_s + si).
+#pragma unroll
         for (int32_t si = M - 1; si >= 0; --si) {
           // Skip if the result position falls outside the valid range
           if (logic_s + si >= total_slices)
@@ -145,18 +290,16 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
 
           Acc partial = static_cast<Acc>(0);
           if (!treat_as_zero) {
-            // Load coefficients for slice si on demand from constant memory
-            const Target *coeff_si = s->slices[si].coeffs.data();
-            const auto &offsets_si = s->slices[si].offsets;
+            const uint32_t *packed_si = s->packed_coeffs[si];
             if constexpr (sizeof...(Dims) == 1)
-              partial = StencilType::template apply_at_as_from<Acc>(coeff_si, offsets_si, current_slice_input,
-                                                                    input_strides, i);
+              partial =
+                  detail::apply_stencil_vec<Acc, Dims...>(packed_si, offsets, current_slice_input, input_strides, i);
             else if constexpr (sizeof...(Dims) == 2)
-              partial = StencilType::template apply_at_as_from<Acc>(coeff_si, offsets_si, current_slice_input,
-                                                                    input_strides, j, i);
+              partial =
+                  detail::apply_stencil_vec<Acc, Dims...>(packed_si, offsets, current_slice_input, input_strides, j, i);
             else if constexpr (sizeof...(Dims) == 3)
-              partial = StencilType::template apply_at_as_from<Acc>(coeff_si, offsets_si, current_slice_input,
-                                                                    input_strides, k, j, i);
+              partial = detail::apply_stencil_vec<Acc, Dims...>(packed_si, offsets, current_slice_input, input_strides,
+                                                                k, j, i);
           }
           acc[si] += partial;
         }
@@ -224,8 +367,8 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
             int32_t d = r - g;
             if (d >= 0 && !(d == 0 && skip_lsb)) {
               int32_t phys_d = phys_lut[d];
-              b_raw += static_cast<Acc>(in[slice_stride * phys_d + out_offset])
-                     * static_cast<int32_t>(s->emulated_gain[g]);
+              b_raw +=
+                  static_cast<Acc>(in[slice_stride * phys_d + out_offset]) * static_cast<int32_t>(s->emulated_gain[g]);
             }
           }
 

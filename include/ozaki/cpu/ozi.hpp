@@ -311,6 +311,7 @@ slice_stencil(StencilType s, HighPrec a, int32_t extra_msb_shift = 0, int32_t n_
     }
   }
 
+  result.compute_packed_coeffs();
   return result;
 }
 

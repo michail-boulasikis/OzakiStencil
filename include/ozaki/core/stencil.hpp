@@ -329,6 +329,15 @@ HD constexpr auto correlate(const Stencil<T1, A...> &a, const Stencil<T2, B...> 
 template <typename StencilType, int32_t N> struct StencilSlices {
   static constexpr int32_t MAX_DATA_SLICES = 24;
 
+  // Compile-time constants for pre-packed coefficient layout.
+  // Each fast-dimension row of coefficients is packed into ceil(fast_W/4)
+  // uint32_t words for direct LDC.U32 loads in the GPU kernel, eliminating
+  // the per-call byte-packing ALU that previously dominated math-pipe time.
+  static constexpr size_t ndims_ = StencilType::dims;
+  static constexpr int32_t fast_W_ = static_cast<int32_t>(StencilType::shape[ndims_ - 1]);
+  static constexpr int32_t packed_per_row_ = (fast_W_ + 3) / 4;
+  static constexpr int32_t n_slow_rows_ = static_cast<int32_t>(StencilType::size) / fast_W_;
+
   StencilType slices[N];
   // Per-slice boundary gains: the L1 norm of the combined integer stencil
   // decomposed into N base-128 digits (MSB first). Used as fallback when
@@ -340,6 +349,33 @@ template <typename StencilType, int32_t N> struct StencilSlices {
   // making post-hoc boundary correction unnecessary.
   typename StencilType::value_type emulated_gain[MAX_DATA_SLICES];
   int32_t n_emulated_gain_slices = 0;
+
+  // Pre-packed coefficient words for vectorized vdot_line in stencil_v1.
+  // Layout: packed_coeffs[slice_idx][row * packed_per_row_ + word_idx].
+  // Each uint32_t word holds up to 4 int8_t coefficients packed little-endian,
+  // with unused high bytes zeroed. Computed host-side by compute_packed_coeffs().
+  uint32_t packed_coeffs[N][n_slow_rows_ * packed_per_row_];
+
+  // Packs the int8 coefficients from slices[].coeffs into aligned uint32_t
+  // words. Must be called after slices are populated and before uploading
+  // to GPU constant memory.
+  HD void compute_packed_coeffs() {
+    for (int32_t si = 0; si < N; ++si) {
+      const auto *raw = slices[si].coeffs.data();
+      for (int32_t row = 0; row < n_slow_rows_; ++row) {
+        for (int32_t w = 0; w < packed_per_row_; ++w) {
+          uint32_t packed = 0;
+          for (int32_t b = 0; b < 4; ++b) {
+            if (w * 4 + b < fast_W_) {
+              int32_t idx = row * fast_W_ + w * 4 + b;
+              packed |= static_cast<uint32_t>(static_cast<uint8_t>(raw[idx])) << (b * 8);
+            }
+          }
+          packed_coeffs[si][row * packed_per_row_ + w] = packed;
+        }
+      }
+    }
+  }
 };
 
 template <typename StencilType, typename NewT>

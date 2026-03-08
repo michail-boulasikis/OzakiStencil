@@ -346,8 +346,8 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
   h_desc.n_slices_input = actual_slices;
   CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
 
-  CUDA_CHECK(cudaMalloc(&d_slices_1, actual_slices * n_elems * sizeof(int8_t)));
-  CUDA_CHECK(cudaMalloc(&d_slices_2, actual_slices * n_elems * sizeof(int8_t)));
+  CUDA_CHECK(cudaMalloc(&d_slices_1, actual_slices * n_elems * sizeof(int8_t) + ozigpu::STENCIL_V1_ALLOC_PAD));
+  CUDA_CHECK(cudaMalloc(&d_slices_2, actual_slices * n_elems * sizeof(int8_t) + ozigpu::STENCIL_V1_ALLOC_PAD));
 
   // -- Slice (with warmup + repetition; D2D copy excluded from timing) --
   NVTX_PUSH("Slice");
@@ -575,8 +575,8 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
   h_desc.n_slices_input = actual_slices;
   CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
 
-  CUDA_CHECK(cudaMalloc(&d_slices_1, actual_slices * n_elems * sizeof(int8_t)));
-  CUDA_CHECK(cudaMalloc(&d_slices_2, actual_slices * n_elems * sizeof(int8_t)));
+  CUDA_CHECK(cudaMalloc(&d_slices_1, actual_slices * n_elems * sizeof(int8_t) + ozigpu::STENCIL_V1_ALLOC_PAD));
+  CUDA_CHECK(cudaMalloc(&d_slices_2, actual_slices * n_elems * sizeof(int8_t) + ozigpu::STENCIL_V1_ALLOC_PAD));
 
   // -- Slice (with warmup + repetition; D2D copy excluded from timing) --
   NVTX_PUSH("Slice");
@@ -749,12 +749,6 @@ PhaseTimings dispatch_bench_direct(int m, const ozi::Stencil<CoeffStorageType, D
     return do_bench.template operator()<3>();
   case 4:
     return do_bench.template operator()<4>();
-  case 5:
-    return do_bench.template operator()<5>();
-  case 6:
-    return do_bench.template operator()<6>();
-  case 7:
-    return do_bench.template operator()<7>();
   case 8:
     return do_bench.template operator()<8>();
   case 9:
@@ -806,12 +800,6 @@ PhaseTimings dispatch_bench_conv(int m, const ozi::Stencil<CoeffStorageType, Dim
         return do_bench.template operator()<3>();
       case 4:
         return do_bench.template operator()<4>();
-      case 5:
-        return do_bench.template operator()<5>();
-      case 6:
-        return do_bench.template operator()<6>();
-      case 7:
-        return do_bench.template operator()<7>();
       case 8:
         return do_bench.template operator()<8>();
       case 9:

@@ -23,7 +23,7 @@ using namespace ozi;
 //       = (carry_idx + logical_idx) % total_slices
 // All possible carry_idx values (0..N-1) are pre-computed so kernels need
 // no integer division regardless of how carry_slice_index evolves on-device.
-constexpr int32_t PHYS_LUT_MAX_SLICES = 64;
+constexpr int32_t PHYS_LUT_MAX_SLICES = 24;
 __constant__ int32_t phys_lut_cmem[PHYS_LUT_MAX_SLICES * PHYS_LUT_MAX_SLICES];
 
 /**
@@ -37,8 +37,7 @@ inline void upload_slice_phys_lut(int32_t total_slices) {
       lut[c * PHYS_LUT_MAX_SLICES + i] = (c + i) % total_slices;
     }
   }
-  cudaMemcpyToSymbol(phys_lut_cmem, lut,
-                      total_slices * PHYS_LUT_MAX_SLICES * sizeof(int32_t));
+  cudaMemcpyToSymbol(phys_lut_cmem, lut, total_slices * PHYS_LUT_MAX_SLICES * sizeof(int32_t));
 }
 template <typename T> __global__ void fill(T *__restrict__ in, const T val, size_t n) {
   const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
@@ -255,11 +254,9 @@ __global__ void mend(OutputType *__restrict__ out, const typename O::target_type
 
 /** State update kernel for integration */
 template <OzakiPair O>
-__global__ void update_ozaki_desc(OzakiDescriptor<O> *__restrict__ desc,
-                                  int32_t min_shifts = 0) {
+__global__ void update_ozaki_desc(OzakiDescriptor<O> *__restrict__ desc, int32_t min_shifts = 0) {
   if (threadIdx.x == 0) {
-    bool should_shift = (desc->shift_required != 0) ||
-                        (desc->n_shifts < min_shifts);
+    bool should_shift = (desc->shift_required != 0) || (desc->n_shifts < min_shifts);
     if (should_shift) {
       int32_t total = desc->n_slices_input;
       desc->carry_slice_index = (desc->carry_slice_index + total - 1) % total;
