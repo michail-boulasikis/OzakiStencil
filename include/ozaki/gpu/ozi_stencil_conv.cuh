@@ -172,6 +172,8 @@ __global__ __launch_bounds__(128, 3) void cvstencil(typename O::target_type *__r
   const int32_t carry_idx = desc->carry_slice_index;
   const Target threshold = desc->overflow_danger_threshold;
   const int32_t just_shifted = desc->just_shifted;
+  // Row of the pre-computed physical-index LUT for the current carry_idx
+  const int32_t *phys_lut = &phys_lut_cmem[carry_idx * PHYS_LUT_MAX_SLICES];
 
   // ======================== Thread identity ========================
   const int32_t warp_id = threadIdx.x / WARP_SIZE;
@@ -244,7 +246,7 @@ __global__ __launch_bounds__(128, 3) void cvstencil(typename O::target_type *__r
 
     // ---- Main data-slice loop for this chunk ----
     for (int32_t logic_s = total_slices - 1; logic_s >= 0; --logic_s) {
-      const int32_t phys_idx = (carry_idx + logic_s) % total_slices;
+      const int32_t phys_idx = phys_lut[logic_s];
       const bool treat_as_zero = (logic_s == 0 && just_shifted);
 
       // ---- Phase 1: Load sm_data (all threads cooperate) ----
@@ -344,7 +346,7 @@ __global__ __launch_bounds__(128, 3) void cvstencil(typename O::target_type *__r
         // Step 2c: Extract output
         const int32_t out_pos = logic_s + M - 1;
         if (out_pos >= 0 && out_pos < total_slices) {
-          const int32_t out_phys = (carry_idx + out_pos) % total_slices;
+          const int32_t out_phys = phys_lut[out_pos];
           Target *slice_out = out + slice_stride * out_phys;
 
 #pragma unroll
@@ -408,7 +410,7 @@ __global__ __launch_bounds__(128, 3) void cvstencil(typename O::target_type *__r
         }
 
         if (p < total_slices) {
-          const int32_t out_phys = (carry_idx + p) % total_slices;
+          const int32_t out_phys = phys_lut[p];
           Target *slice_out = out + slice_stride * out_phys;
 
 #pragma unroll
@@ -492,7 +494,7 @@ __global__ __launch_bounds__(128, 3) void cvstencil(typename O::target_type *__r
           for (int32_t d = total_slices - 1; d >= 0; --d) {
             if (d == 0 && just_shifted)
               continue;
-            int32_t phys_d = (carry_idx + d) % total_slices;
+            int32_t phys_d = phys_lut[d];
             int32_t data_d = static_cast<int32_t>(in[slice_stride * phys_d + global_offset]);
 
             for (int32_t g = 0; g < boundary.n_slices; ++g) {
@@ -504,13 +506,13 @@ __global__ __launch_bounds__(128, 3) void cvstencil(typename O::target_type *__r
 
           // Carry propagation (LSB -> MSB) and write all output slices
           for (int32_t r = total_slices - 1; r > 0; --r) {
-            int32_t phys_r = (carry_idx + r) % total_slices;
+            int32_t phys_r = phys_lut[r];
             Target digit = static_cast<Target>(bnd_result[r]);
             out[slice_stride * phys_r + global_offset] = digit;
             bnd_result[r - 1] += (bnd_result[r] - static_cast<int32_t>(digit)) >> (CHAR_BIT * sizeof(Target) - 1);
           }
           // MSB: no carry target
-          int32_t phys_0 = carry_idx % total_slices;
+          int32_t phys_0 = phys_lut[0];
           out[slice_stride * phys_0 + global_offset] = static_cast<Target>(bnd_result[0]);
 
           // Overflow tracking for boundary element (using MSB value)

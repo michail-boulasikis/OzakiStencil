@@ -411,6 +411,7 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
 
     // Copy stencil slices to constant memory
     CUDA_CHECK(cudaMemcpyToSymbol(ozigpu::stencil_v1_cmem, &ss, sizeof(ss)));
+    ozigpu::upload_slice_phys_lut(actual_slices);
 
     // Warmup
     if (cfg.warmup > 0) {
@@ -633,6 +634,8 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
     ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+
+    ozigpu::upload_slice_phys_lut(actual_slices);
 
     if (cfg.flush_l2)
       cache_inv.invalidate();

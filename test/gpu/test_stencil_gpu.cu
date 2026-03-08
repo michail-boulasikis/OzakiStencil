@@ -203,6 +203,7 @@ protected:
 
     // Copy stencil slices to constant memory before kernel launch
     ASSERT_EQ(cudaSuccess, cudaMemcpyToSymbol(ozigpu::stencil_v1_cmem, &ss, sizeof(ss)));
+    ozigpu::upload_slice_phys_lut(num_slices_total);
 
     for (int32_t t = 0; t < timesteps; ++t) {
       ozigpu::stencil_v1<OzPair, M, Dims...><<<grid, block>>>(d_slices_2, d_slices_1, input_shape, d_desc);
@@ -314,6 +315,8 @@ protected:
     double log2_sf =
         (scaling_factor > HighPrecType(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
     int32_t total_shifts_needed = static_cast<int32_t>(std::ceil(timesteps * log2_sf / 7.0));
+
+    ozigpu::upload_slice_phys_lut(num_slices_total);
 
     for (int32_t t = 0; t < timesteps; ++t) {
       ozigpu::cvstencil<OzPair, M><<<grid, block>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary);

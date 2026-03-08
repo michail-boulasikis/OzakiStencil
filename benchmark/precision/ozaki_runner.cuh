@@ -204,6 +204,7 @@ public:
 
     // Copy stencil slices to constant memory
     CUDA_CHECK(cudaMemcpyToSymbol(ozigpu::stencil_v1_cmem, &stencil_slices_, sizeof(stencil_slices_)));
+    ozigpu::upload_slice_phys_lut(active_slices);
 
     NVTX_PUSH("Integration Loop");
     for (int32_t t = 0; t < n_iterations; ++t) {
@@ -352,6 +353,8 @@ public:
         : 0.0;
     int32_t total_shifts_needed = static_cast<int32_t>(
         std::ceil(n_iterations * log2_sf / 7.0));
+
+    ozigpu::upload_slice_phys_lut(active_slices);
 
     NVTX_PUSH("Integration Loop");
     for (int32_t t = 0; t < n_iterations; ++t) {

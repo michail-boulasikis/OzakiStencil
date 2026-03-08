@@ -48,6 +48,8 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
   const int32_t total_slices = desc->n_slices_input;
   const int32_t carry_idx = desc->carry_slice_index;
   const Target threshold = desc->overflow_danger_threshold;
+  // Row of the pre-computed physical-index LUT for the current carry_idx
+  const int32_t *phys_lut = &phys_lut_cmem[carry_idx * PHYS_LUT_MAX_SLICES];
   __shared__ int32_t smem[32];
 
   int32_t i, j, k;
@@ -129,7 +131,7 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
         carry = static_cast<Acc>(0);
 
         // Load data slice once (the critical path bottleneck)
-        int32_t phys_idx = (carry_idx + logic_s) % total_slices;
+        int32_t phys_idx = phys_lut[logic_s];
         const Target *current_slice_input = in + slice_stride * phys_idx;
         bool treat_as_zero = (logic_s == 0 && desc->just_shifted);
 
@@ -163,7 +165,7 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
         // (all contributing S_si @ D_j terms have been accumulated).
         int32_t out_pos = logic_s + M - 1;
         if (out_pos < total_slices) {
-          int32_t out_phys = (carry_idx + out_pos) % total_slices;
+          int32_t out_phys = phys_lut[out_pos];
           Target *current_slice_output = out + slice_stride * out_phys;
 
           if (out_pos != 0) {
@@ -188,7 +190,7 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
         carry = static_cast<Acc>(0);
 
         if (p < total_slices) {
-          int32_t out_phys = (carry_idx + p) % total_slices;
+          int32_t out_phys = phys_lut[p];
           Target *current_slice_output = out + slice_stride * out_phys;
 
           if (p != 0) {
@@ -221,13 +223,13 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
           for (int32_t g = 0; g < n_bg; ++g) {
             int32_t d = r - g;
             if (d >= 0 && !(d == 0 && skip_lsb)) {
-              int32_t phys_d = (carry_idx + d) % total_slices;
+              int32_t phys_d = phys_lut[d];
               b_raw += static_cast<Acc>(in[slice_stride * phys_d + out_offset])
                      * static_cast<int32_t>(s->emulated_gain[g]);
             }
           }
 
-          int32_t phys_r = (carry_idx + r) % total_slices;
+          int32_t phys_r = phys_lut[r];
           Target *out_ptr = out + slice_stride * phys_r;
           if (r > 0) {
             Target digit = static_cast<Target>(b_raw);

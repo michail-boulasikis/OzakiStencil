@@ -17,6 +17,29 @@
 
 namespace ozigpu {
 using namespace ozi;
+
+// Pre-computed physical-index LUT that replaces modulo in stencil kernels.
+// Layout: phys_lut[carry_idx * PHYS_LUT_MAX_SLICES + logical_idx]
+//       = (carry_idx + logical_idx) % total_slices
+// All possible carry_idx values (0..N-1) are pre-computed so kernels need
+// no integer division regardless of how carry_slice_index evolves on-device.
+constexpr int32_t PHYS_LUT_MAX_SLICES = 64;
+__constant__ int32_t phys_lut_cmem[PHYS_LUT_MAX_SLICES * PHYS_LUT_MAX_SLICES];
+
+/**
+ * Populates the physical-index LUT in constant memory. Must be called once
+ * before the integration loop (after total_slices is known).
+ */
+inline void upload_slice_phys_lut(int32_t total_slices) {
+  int32_t lut[PHYS_LUT_MAX_SLICES * PHYS_LUT_MAX_SLICES];
+  for (int32_t c = 0; c < total_slices; ++c) {
+    for (int32_t i = 0; i < total_slices; ++i) {
+      lut[c * PHYS_LUT_MAX_SLICES + i] = (c + i) % total_slices;
+    }
+  }
+  cudaMemcpyToSymbol(phys_lut_cmem, lut,
+                      total_slices * PHYS_LUT_MAX_SLICES * sizeof(int32_t));
+}
 template <typename T> __global__ void fill(T *__restrict__ in, const T val, size_t n) {
   const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
   if (tid < n)
