@@ -9,8 +9,8 @@ import sys
 import argparse
 from itertools import product
 
-STENCIL_NAME = ["0", "1", "2"]
-REQUESTED_SLICES = [1, 2, None]
+STENCIL_NAME = ["0"]
+REQUESTED_SLICES = [1, 2, 3, None]
 NEGATIVE_COEFFS = [True, False]
 SPARSE = [True, False]
 L1_NORM = ["ONE", "GT1", "LT1"]
@@ -27,13 +27,12 @@ EXTRA_MSBS = 0
 # Entry: (stencil_shape, input_shape, label)
 SHAPE_INPUT_PAIRS = [
     ([5], [128], "1D_128"),
-    # ([7], [128], "1D_128"),
+    ([7], [128], "1D_128"),
     ([3, 3], [128, 128], "2D_128x128"),
     ([5, 5], [128, 128], "2D_128x128"),
-    # ([7, 7], [128, 128], "2D_128x128"),
-    # ([7, 7], [128, 128], "2D_128x128"),
+    ([7, 7], [128, 128], "2D_128x128"),
     ([3, 3, 3], [32, 32, 32], "3D_32x32x32"),
-    # ([5, 5, 5], [32, 32, 32], "3D_32x32x32"),
+    ([5, 5, 5], [32, 32, 32], "3D_32x32x32"),
 ]
 
 ERROR_THRESHOLD = 1e-8
@@ -116,7 +115,7 @@ def generate_stencil_spec(
 
     coeffs = None
     if requested_slices:
-        abs_limit = 2 ** (7 * requested_slices)
+        abs_limit = 2 ** (7 * requested_slices) // np.prod(shape)
         coeffs = rng.integers(
             -abs_limit if negative_coeffs else 0, abs_limit, size=shape
         ).astype(PRECISION_TYPE_MAP[original_precision])

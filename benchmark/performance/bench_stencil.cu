@@ -753,8 +753,10 @@ PhaseTimings dispatch_bench_direct(int m, const ozi::Stencil<CoeffStorageType, D
     return do_bench.template operator()<8>();
   case 9:
     return do_bench.template operator()<9>();
+  case 10:
+    return do_bench.template operator()<10>();
   default:
-    throw std::invalid_argument("M=" + std::to_string(m) + " not supported (max 9)");
+    throw std::invalid_argument("M=" + std::to_string(m) + " not supported (max 10)");
   }
 }
 
@@ -804,6 +806,8 @@ PhaseTimings dispatch_bench_conv(int m, const ozi::Stencil<CoeffStorageType, Dim
         return do_bench.template operator()<8>();
       case 9:
         return do_bench.template operator()<9>();
+      case 10:
+        return do_bench.template operator()<10>();
       default:
         throw std::invalid_argument("M=" + std::to_string(m) + " not supported (max 9)");
       }
