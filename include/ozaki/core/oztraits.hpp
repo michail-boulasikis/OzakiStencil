@@ -82,7 +82,7 @@ template <typename T> HDF int32_t ffs(T val) {
   } else if constexpr (sizeof(T) <= 8) {
     return __ffsll(static_cast<int64_t>(val));
   } else {
-    static_assert(false, "`ffs` not supported for types with size greater than 8 bytes");
+    static_assert(sizeof(T) == 0, "`ffs` not supported for types with size greater than 8 bytes");
   }
 #else
   return std::countr_zero(val) + 1;
@@ -90,7 +90,7 @@ template <typename T> HDF int32_t ffs(T val) {
 }
 
 template <typename T> HDF int32_t dyn_min_lsb(T a, int32_t b) {
-  static_assert(false, "`dyn_min_lsb` is not implemented for this type.");
+  static_assert(sizeof(T) == 0, "`dyn_min_lsb` is not implemented for this type.");
   return -1;
 }
 

@@ -73,7 +73,7 @@ template <std::floating_point T> struct OzakiPairTraits<ozigpu::OzakiFP_Int8<T>>
       asm("cvt.rni.sat.s8.f32 %0, %1;" : "=r"(temp) : "f"(a_scaled));
       return static_cast<Target>(temp);
     } else {
-      static_assert(false, "down_cast not implemented for this type yet.");
+      static_assert(!std::is_same_v<Data, Data>, "down_cast not implemented for this type yet.");
     }
   }
 

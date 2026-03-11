@@ -24,7 +24,7 @@
 
 namespace ozicpu {
 template <typename T> struct OzakiFP_Int8 {
-static_assert(false, "Not implemented");
+static_assert(sizeof(T) == 0, "Not implemented");
 };
 
 template <std::floating_point T>
