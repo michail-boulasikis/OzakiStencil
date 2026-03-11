@@ -26,7 +26,7 @@ using Real = double;
 #if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
 using AccumulatorType = __float128;
 #else
-using AccumulatorType = long double;
+using AccumulatorType = double;
 #endif
 
 // Non-templated base class for Ozaki stencil runners.
@@ -246,14 +246,15 @@ public:
     CUDA_CHECK(cudaMemcpy(&h_desc, d_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>),
                           cudaMemcpyDeviceToHost));
 
-#ifdef OZAKI_HAVE_FLOAT128
+#if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
     __float128 factor = ozigpu::total_integration_scale_factor_quad<ozigpu::OzakiFP_Int8<Real>>(
         this->scaling_factor, n_iterations, h_desc.n_shifts);
     ozigpu::scale<AccumulatorType, __float128><<<nBlocksScale, nThreadsScale>>>(d_res, factor, n_elems);
 #else
-    long double factor = ozigpu::total_integration_scale_factor_quad<ozigpu::OzakiFP_Int8<Real>>(
-        this->scaling_factor, n_iterations, h_desc.n_shifts);
-    ozigpu::scale<AccumulatorType, long double><<<nBlocksScale, nThreadsScale>>>(d_res, factor, n_elems);
+    double factor = static_cast<double>(
+        ozigpu::total_integration_scale_factor_quad<ozigpu::OzakiFP_Int8<Real>>(
+            this->scaling_factor, n_iterations, h_desc.n_shifts));
+    ozigpu::scale<AccumulatorType, double><<<nBlocksScale, nThreadsScale>>>(d_res, factor, n_elems);
 #endif
 
     std::vector<AccumulatorType> gpu_result(n_elems);
@@ -394,14 +395,15 @@ public:
     CUDA_CHECK(cudaMemcpy(&h_desc, d_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>),
                           cudaMemcpyDeviceToHost));
 
-#ifdef OZAKI_HAVE_FLOAT128
+#if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
     __float128 factor = ozigpu::total_integration_scale_factor_quad<ozigpu::OzakiFP_Int8<Real>>(
         this->scaling_factor, n_iterations, h_desc.n_shifts);
     ozigpu::scale<AccumulatorType, __float128><<<nBlocksScale, nThreadsScale>>>(d_res, factor, n_elems);
 #else
-    long double factor = ozigpu::total_integration_scale_factor_quad<ozigpu::OzakiFP_Int8<Real>>(
-        this->scaling_factor, n_iterations, h_desc.n_shifts);
-    ozigpu::scale<AccumulatorType, long double><<<nBlocksScale, nThreadsScale>>>(d_res, factor, n_elems);
+    double factor = static_cast<double>(
+        ozigpu::total_integration_scale_factor_quad<ozigpu::OzakiFP_Int8<Real>>(
+            this->scaling_factor, n_iterations, h_desc.n_shifts));
+    ozigpu::scale<AccumulatorType, double><<<nBlocksScale, nThreadsScale>>>(d_res, factor, n_elems);
 #endif
 
     std::vector<AccumulatorType> gpu_result(n_elems);

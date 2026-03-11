@@ -50,7 +50,7 @@ using Real = double;
 #if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
 using AccType = __float128;
 #else
-using AccType = long double;
+using AccType = double;
 #endif
 using OzPair = ozigpu::OzakiFP_Int8<Real>;
 
@@ -238,14 +238,14 @@ protected:
     ozigpu::mend<OzPair, AccType><<<nBMend, nTMend>>>(d_res, d_slices_1, d_desc, n_elems);
     EXPECT_EQ(cudaSuccess, cudaMemcpy(&h_desc, d_desc, sizeof(h_desc), cudaMemcpyDeviceToHost));
 
-#ifdef OZAKI_HAVE_FLOAT128
+#if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
     __float128 factor =
         ozigpu::total_integration_scale_factor_quad<OzPair>(scaling_factor, timesteps, h_desc.n_shifts);
     ozigpu::scale<AccType, __float128><<<nBScale, nTScale>>>(d_res, factor, n_elems);
 #else
-    long double factor =
-        ozigpu::total_integration_scale_factor_quad<OzPair>(scaling_factor, timesteps, h_desc.n_shifts);
-    ozigpu::scale<AccType, long double><<<nBScale, nTScale>>>(d_res, factor, n_elems);
+    double factor = static_cast<double>(
+        ozigpu::total_integration_scale_factor_quad<OzPair>(scaling_factor, timesteps, h_desc.n_shifts));
+    ozigpu::scale<AccType, double><<<nBScale, nTScale>>>(d_res, factor, n_elems);
 #endif
     EXPECT_EQ(cudaSuccess, cudaDeviceSynchronize());
 

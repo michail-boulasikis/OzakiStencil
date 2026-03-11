@@ -143,7 +143,7 @@ protected:
   }
 };
 
-#ifdef OZAKI_HAVE_FLOAT128
+#if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
 using TestTypes = ::testing::Types<float, double, __float128>;
 #else
 using TestTypes = ::testing::Types<float, double>;
