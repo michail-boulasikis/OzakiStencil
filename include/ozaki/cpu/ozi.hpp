@@ -15,7 +15,7 @@
 #include <type_traits>
 #include <vector>
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
 #define HighPrecType __float128
 #else
 #define HighPrecType long double
@@ -35,7 +35,7 @@ struct OzakiFP_Int8<T> {
   using acc_type = int32_t;
 };
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
 // Specialization for __float128 (not recognized by std::floating_point concept)
 template <>
 struct OzakiFP_Int8<__float128> {
@@ -48,7 +48,7 @@ struct OzakiFP_Int8<__float128> {
 
 namespace ozi {
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
 // CPU-side OzakiPairTraits for __float128
 template <> struct OzakiPairTraits<ozicpu::OzakiFP_Int8<__float128>> {
   using Data = __float128;

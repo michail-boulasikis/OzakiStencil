@@ -61,7 +61,7 @@ protected:
   }
 };
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
 using TestTypes = ::testing::Types<float, double, long double, __float128>;
 #else
 using TestTypes = ::testing::Types<float, double, long double>

@@ -10,14 +10,26 @@
 
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
+#if __CUDA_ARCH__ >= 1000
 #include <crt/device_fp128_functions.h>
+#endif
 #include <cuda_fp16.h>
 #define HDF __host__ __device__ __forceinline__
 #else
 #define HDF
 #endif
 
-#ifdef __GNUC__
+// OZAKI_HAVE_FLOAT128: defined when __float128 is genuinely available.
+// True for: GCC/NVCC host code, and device code on Blackwell (sm_120+).
+// Excluded: any device compilation on pre-Blackwell (__CUDA_ARCH__ defined but < 1000),
+//           and nvc++ (__NVCOMPILER defined) which may not support __float128 in all contexts.
+#ifndef OZAKI_HAVE_FLOAT128
+#if (defined(__GNUC__) && !defined(__NVCOMPILER) && !defined(__CUDA_ARCH__)) || __CUDA_ARCH__ >= 1000
+#define OZAKI_HAVE_FLOAT128 1
+#endif
+#endif
+
+#ifdef OZAKI_HAVE_FLOAT128
 #include <quadmath.h>
 #endif
 
@@ -68,7 +80,7 @@ template <> struct FloatTraits<double> {
   static constexpr int32_t MantissaBits = 52;
   static constexpr int32_t ExponentBias = 1023;
 };
-#if __GNUC__ || __CUDA_ARCH__ >= 100
+#ifdef OZAKI_HAVE_FLOAT128
 template <> struct FloatTraits<__float128> {
   static constexpr int32_t MantissaBits = 112;
   static constexpr int32_t ExponentBias = 16383;
@@ -120,7 +132,7 @@ template <std::floating_point T> HDF int32_t dyn_min_lsb(T a, int32_t current_ls
   return min(current_lsb, bit_exponent);
 }
 
-#if __GNUC__ || __CUDA_ARCH__ >= 100
+#ifdef OZAKI_HAVE_FLOAT128
 template <> HDF int32_t dyn_min_lsb(__float128 a, int32_t current_lsb) {
   using IntType = RawInt<__float128>;
   using Traits = FloatTraits<__float128>;
@@ -193,7 +205,7 @@ template <std::integral T> struct OzakiTraits<T> {
   static HDF int32_t slice_step(int32_t v) { return v - (CHAR_BIT * sizeof(T) - 1); }
 };
 
-#if __GNUC__ || __CUDA_ARCH__ >= 100
+#ifdef OZAKI_HAVE_FLOAT128
 template <> struct OzakiTraits<__float128> {
   static HDF __float128 abs(__float128 a) {
 #ifdef __CUDA_ARCH__

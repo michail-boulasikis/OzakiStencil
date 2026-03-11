@@ -7,7 +7,13 @@
 #include <string>
 #include <vector>
 
-#ifdef __GNUC__
+#ifndef OZAKI_HAVE_FLOAT128
+#if (defined(__GNUC__) && !defined(__NVCOMPILER) && !defined(__CUDA_ARCH__)) || __CUDA_ARCH__ >= 1000
+#define OZAKI_HAVE_FLOAT128 1
+#endif
+#endif
+
+#ifdef OZAKI_HAVE_FLOAT128
 #include <quadmath.h>
 using CoeffStorageType = __float128;
 #else
@@ -51,7 +57,7 @@ inline StencilSpec parse_stencil_arg(const std::string &arg) {
   std::istringstream coeffs_ss(coeffs_str);
   std::string coeff_str;
   while (std::getline(coeffs_ss, coeff_str, ',')) {
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
     spec.coeffs.push_back(strtoflt128(coeff_str.c_str(), nullptr));
 #else
     spec.coeffs.push_back(static_cast<CoeffStorageType>(std::stold(coeff_str)));
@@ -116,7 +122,7 @@ inline StencilSpec read_stencil_file(const std::string &path) {
       std::istringstream ss(line);
       std::string token;
       while (ss >> token) {
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
         spec.coeffs.push_back(strtoflt128(token.c_str(), nullptr));
 #else
         spec.coeffs.push_back(static_cast<CoeffStorageType>(std::stold(token)));

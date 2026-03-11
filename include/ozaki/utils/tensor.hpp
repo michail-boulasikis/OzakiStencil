@@ -22,7 +22,7 @@ template <typename T> size_t get_type_id() {
     return 1;
   } else if constexpr (std::is_same_v<T, long double>) {
     return 2;
-#if defined(__CUDACC__) && (__CUDA_ARCH__ >= 100)
+#if defined(__CUDACC__) && (__CUDA_ARCH__ >= 1000)
   } else if constexpr (std::is_same_v<T, __float128>) {
     return 3;
   }

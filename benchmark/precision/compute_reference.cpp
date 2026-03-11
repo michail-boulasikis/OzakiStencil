@@ -115,7 +115,7 @@ int main(int argc, char *argv[]) {
           std::cerr << "  Wrote: " << path << "\n";
         };
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
         if (compute_fp128_ref)
           compute_and_save.template operator()<__float128>("fp128");
 #endif

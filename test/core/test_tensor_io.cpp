@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
 #include <quadmath.h>
 #endif
 

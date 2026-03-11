@@ -179,7 +179,7 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
     }
     if (abs_max > CoeffStorageType(0)) {
       int exp;
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
       frexpq(abs_max, &exp);
       p.a_coeff = scalbnq(static_cast<__float128>(1.0), exp - 63);
 #else
@@ -245,7 +245,7 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
   CoeffStorageType effective_a = p.a_coeff;
   {
     int32_t shift0 = std::max(0, p_max - (target_bits - 1) + p.extra_msb_shift);
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
     effective_a = scalbnq(p.a_coeff, shift0);
 #else
     effective_a = std::scalbn(p.a_coeff, shift0);
@@ -263,7 +263,7 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
   while (p.scaling_factor >= CoeffStorageType(128)) {
     p.extra_msb_shift++;
     int32_t new_shift0 = std::max(0, p_max - (target_bits - 1) + p.extra_msb_shift);
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
     effective_a = scalbnq(p.a_coeff, new_shift0);
 #else
     effective_a = std::scalbn(p.a_coeff, new_shift0);

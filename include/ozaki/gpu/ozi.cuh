@@ -6,7 +6,11 @@
 
 #include <climits>
 #include <concepts>
+#ifdef __CUDACC__
+#if __CUDA_ARCH__ >= 1000
 #include <crt/device_fp128_functions.h>
+#endif
+#endif
 #include <cuda_runtime.h>
 #include <limits>
 #include <type_traits>
@@ -18,7 +22,7 @@
 #ifdef OZAKI_USE_BOOST_MULTIPRECISION
 #include <boost/multiprecision/cpp_bin_float.hpp>
 #include <string>
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
 #include <quadmath.h>
 #endif
 #endif
@@ -90,7 +94,7 @@ template <std::floating_point T> struct OzakiPairTraits<ozigpu::OzakiFP_Int8<T>>
   }
 };
 
-#if __GNUC__ || __CUDA_ARCH__ >= 100
+#ifdef OZAKI_HAVE_FLOAT128
 template <> struct OzakiPairTraits<ozigpu::OzakiFP_Int8<__float128>> {
   using Data = typename ozigpu::OzakiFP_Int8<__float128>::data_type;
   using Target = typename ozigpu::OzakiFP_Int8<__float128>::target_type;
@@ -141,12 +145,14 @@ __device__ __forceinline__ T shfl_down_sync_wrapper(uint32_t mask, T val, uint32
   if constexpr (sizeof(T) <= 8) {
     // Native shuffle support for types up to 64 bits
     return __shfl_down_sync(mask, val, offset, width);
+#ifdef OZAKI_HAVE_FLOAT128
   } else if constexpr (std::is_same_v<T, __float128>) {
     // For __float128, split into two 64-bit components, shuffle each, then reconstruct
     RawInt<T> raw = bit_cast<RawInt<T>>(val);
     raw.hi = __shfl_down_sync(mask, raw.hi, offset, width);
     raw.lo = __shfl_down_sync(mask, raw.lo, offset, width);
     return bit_cast<T>(raw);
+#endif
   } else {
     static_assert(sizeof(T) <= 16, "Unsupported type size for warp shuffle");
   }
@@ -165,7 +171,7 @@ template <typename T> __device__ __forceinline__ int32_t log2_ceil_abs(T val) {
 
 template <ozi::OzakiPair O>
 __host__
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
     __float128
 #else
     long double
@@ -184,7 +190,7 @@ __host__
   int64_t exp_shift = static_cast<int64_t>(slice_bits) * shifts;
   result *= boost::multiprecision::pow(high_precision_float(2), exp_shift);
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
   std::string str = result.str(128);
   return strtoflt128(str.c_str(), nullptr);
 #else
@@ -195,7 +201,7 @@ __host__
   // Fallback: original implementation using native quad precision
   // Note: This has reduced accuracy for non-power-of-2 scaling factors
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
   // We compute: 2^(slice_bits * shifts) / a^time_steps
   int exp;
 

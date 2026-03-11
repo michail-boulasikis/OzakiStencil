@@ -55,6 +55,8 @@ target_compile_options(ozaki_cuda_common INTERFACE
   $<$<COMPILE_LANGUAGE:CUDA>:--generate-line-info --expt-relaxed-constexpr --extended-lambda>
 )
 
+target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_CUDA_ARCH=${CUDA_COMPUTE_CAPABILITY})
+
 if(OZAKI_NVTX_EVENTS)
   target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_NVTX_EVENTS)
 endif()

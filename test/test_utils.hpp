@@ -102,7 +102,7 @@ std::vector<T> compute_gold_standard_multistep(const ozi::Stencil<T, Dims...> &s
                                                const std::vector<T> &input,
                                                const std::array<size_t, sizeof...(Dims)> &shape,
                                                int32_t timesteps) {
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
   using HighPrec = __float128;
 #else
   using HighPrec = long double;
@@ -148,7 +148,7 @@ template <typename T, typename InputContainer, size_t... Dims>
 std::vector<T> compute_gold_standard(const ozi::Stencil<T, Dims...> &stencil, const InputContainer &input,
                                      const std::array<size_t, sizeof...(Dims)> &shape) {
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
   using HighPrec = __float128;
 #else
   using HighPrec = long double;

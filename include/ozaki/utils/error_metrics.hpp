@@ -5,11 +5,17 @@
 #include <stdexcept>
 #include <vector>
 
-#ifdef __GNUC__
+#ifndef OZAKI_HAVE_FLOAT128
+#if (defined(__GNUC__) && !defined(__NVCOMPILER) && !defined(__CUDA_ARCH__)) || __CUDA_ARCH__ >= 1000
+#define OZAKI_HAVE_FLOAT128 1
+#endif
+#endif
+
+#ifdef OZAKI_HAVE_FLOAT128
 #include <quadmath.h>
 #define HIGH_PREC __float128
 #else
-#define HIGH_PREC long double
+#define HIGH_PREC (long double)
 #endif
 
 template <typename T_Test, typename T_Ref>
@@ -22,7 +28,7 @@ HIGH_PREC calculate_rmse(const std::vector<T_Test> &test, const std::vector<T_Re
     HIGH_PREC diff = static_cast<HIGH_PREC>(test[i]) - static_cast<HIGH_PREC>(ref[i]);
     err += diff * diff;
   }
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
   return sqrtq(err / static_cast<HIGH_PREC>(test.size()));
 #else
   return std::sqrt(err / static_cast<HIGH_PREC>(test.size()));

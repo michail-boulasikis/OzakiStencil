@@ -18,12 +18,16 @@
 #include <string>
 #include <vector>
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
 #include <quadmath.h>
 #endif
 
 using Real = double;
+#if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
 using AccumulatorType = __float128;
+#else
+using AccumulatorType = long double;
+#endif
 
 // Non-templated base class for Ozaki stencil runners.
 // Holds all CUDA resources with RAII cleanup.
@@ -195,7 +199,7 @@ public:
     // grows the integer domain by ~log2(sf) bits. Every 7 bits of growth
     // requires one shift. Distributing shifts evenly prevents both
     // under-shifting (MSB overflow) and over-shifting (data loss).
-    double log2_sf = (this->scaling_factor > HighPrecType(1))
+    double log2_sf = (this->scaling_factor > static_cast<HighPrecType>(1))
         ? std::log2(static_cast<double>(this->scaling_factor))
         : 0.0;
     int32_t total_shifts_needed = static_cast<int32_t>(
@@ -242,7 +246,7 @@ public:
     CUDA_CHECK(cudaMemcpy(&h_desc, d_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>),
                           cudaMemcpyDeviceToHost));
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
     __float128 factor = ozigpu::total_integration_scale_factor_quad<ozigpu::OzakiFP_Int8<Real>>(
         this->scaling_factor, n_iterations, h_desc.n_shifts);
     ozigpu::scale<AccumulatorType, __float128><<<nBlocksScale, nThreadsScale>>>(d_res, factor, n_elems);
@@ -347,7 +351,7 @@ public:
         (ldm + ozigpu::convstencil::TILE_SIZE_COL - 1) / ozigpu::convstencil::TILE_SIZE_COL);
 
     // Proactive shift schedule
-    double log2_sf = (this->scaling_factor > HighPrecType(1))
+    double log2_sf = (this->scaling_factor > static_cast<HighPrecType>(1))
         ? std::log2(static_cast<double>(this->scaling_factor))
         : 0.0;
     int32_t total_shifts_needed = static_cast<int32_t>(
@@ -390,7 +394,7 @@ public:
     CUDA_CHECK(cudaMemcpy(&h_desc, d_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>),
                           cudaMemcpyDeviceToHost));
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
     __float128 factor = ozigpu::total_integration_scale_factor_quad<ozigpu::OzakiFP_Int8<Real>>(
         this->scaling_factor, n_iterations, h_desc.n_shifts);
     ozigpu::scale<AccumulatorType, __float128><<<nBlocksScale, nThreadsScale>>>(d_res, factor, n_elems);

@@ -66,7 +66,7 @@ protected:
   }
 };
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
 using TestTypes = ::testing::Types<float, double, long double, __float128>;
 #else
 using TestTypes = ::testing::Types<float, double, long double>;
@@ -166,7 +166,7 @@ TYPED_TEST(SliceStencilTest, FourthOrderFDPhysicalNormalization) {
   using Scalar = TypeParam;
   using Traits = ozicpu::OzakiFP_Int8<Scalar>;
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
   using HP = __float128;
 #else
   using HP = long double;
@@ -331,7 +331,7 @@ TEST(SliceStencilPhysical, FourthOrderOnXSquared) {
   constexpr size_t N = 32;
   const Scalar h = 0.1;
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
   // Compute a in __float128 so HighPrec is deduced as __float128 in
   // slice_stencil, guaranteeing exact integer recovery regardless of the
   // double rounding of 1/(12 h2).

@@ -28,7 +28,7 @@
 
 #include <boost/program_options.hpp>
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
 #include <quadmath.h>
 #endif
 
@@ -380,7 +380,7 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
     l1_int = 1;
 
   // Proactive shift schedule
-  double log2_sf = (scaling_factor > HighPrecType(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
+  double log2_sf = (scaling_factor > static_cast<HighPrecType>(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
   int32_t total_shifts_needed = static_cast<int32_t>(std::ceil(cfg.timesteps * log2_sf / 7.0));
 
   auto [grid, block] = make_grid_block<ndims>(shape);
@@ -609,7 +609,7 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
     l1_int = 1;
 
   // Proactive shift schedule
-  double log2_sf = (scaling_factor > HighPrecType(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
+  double log2_sf = (scaling_factor > static_cast<HighPrecType>(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
   int32_t total_shifts_needed = static_cast<int32_t>(std::ceil(cfg.timesteps * log2_sf / 7.0));
 
   // ConvStencil grid/block

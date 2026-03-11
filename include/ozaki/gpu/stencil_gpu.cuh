@@ -109,7 +109,7 @@ __global__ void stencil_fp64(double *__restrict__ out, const double *__restrict_
   }
 }
 
-#if !defined(__CUDA_ARCH_LIST__) || __CUDA_ARCH_LIST__ >= 1000
+#ifdef OZAKI_HAVE_FLOAT128
 template <size_t... Dims>
   requires(sizeof...(Dims) <= 3)
 __global__ void stencil_fp128(__float128 *__restrict__ out, const __float128 *__restrict__ in,

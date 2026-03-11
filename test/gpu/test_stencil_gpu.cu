@@ -39,7 +39,7 @@
 #include <random>
 #include <vector>
 
-#ifdef __GNUC__
+#ifdef OZAKI_HAVE_FLOAT128
 #include <quadmath.h>
 #endif
 
@@ -47,7 +47,11 @@
 // Type aliases
 // ============================================================
 using Real = double;
+#if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
 using AccType = __float128;
+#else
+using AccType = long double;
+#endif
 using OzPair = ozigpu::OzakiFP_Int8<Real>;
 
 // ============================================================
@@ -200,7 +204,7 @@ protected:
       input_shape[d] = shape[d];
 
     double log2_sf =
-        (scaling_factor > HighPrecType(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
+        (scaling_factor > static_cast<HighPrecType>(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
     int32_t total_shifts_needed = static_cast<int32_t>(std::ceil(timesteps * log2_sf / 7.0));
 
     // Copy stencil slices to constant memory before kernel launch
@@ -234,9 +238,15 @@ protected:
     ozigpu::mend<OzPair, AccType><<<nBMend, nTMend>>>(d_res, d_slices_1, d_desc, n_elems);
     EXPECT_EQ(cudaSuccess, cudaMemcpy(&h_desc, d_desc, sizeof(h_desc), cudaMemcpyDeviceToHost));
 
+#ifdef OZAKI_HAVE_FLOAT128
     __float128 factor =
         ozigpu::total_integration_scale_factor_quad<OzPair>(scaling_factor, timesteps, h_desc.n_shifts);
     ozigpu::scale<AccType, __float128><<<nBScale, nTScale>>>(d_res, factor, n_elems);
+#else
+    long double factor =
+        ozigpu::total_integration_scale_factor_quad<OzPair>(scaling_factor, timesteps, h_desc.n_shifts);
+    ozigpu::scale<AccType, long double><<<nBScale, nTScale>>>(d_res, factor, n_elems);
+#endif
     EXPECT_EQ(cudaSuccess, cudaDeviceSynchronize());
 
     std::vector<AccType> result_q(n_elems);
@@ -315,7 +325,7 @@ protected:
 
     // Shift schedule
     double log2_sf =
-        (scaling_factor > HighPrecType(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
+        (scaling_factor > static_cast<HighPrecType>(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
     int32_t total_shifts_needed = static_cast<int32_t>(std::ceil(timesteps * log2_sf / 7.0));
 
     ozigpu::upload_slice_phys_lut(num_slices_total);

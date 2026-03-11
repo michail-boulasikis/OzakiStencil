@@ -143,7 +143,7 @@ protected:
   }
 };
 
-#if defined(__GNUC__) || __CUDA_ARCH__ >= 100
+#ifdef OZAKI_HAVE_FLOAT128
 using TestTypes = ::testing::Types<float, double, __float128>;
 #else
 using TestTypes = ::testing::Types<float, double>;
