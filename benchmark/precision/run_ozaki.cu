@@ -4,7 +4,6 @@
 #include <ozaki/utils/stencil_spec.hpp>
 #include <ozaki/utils/tensor.hpp>
 
-#include <format>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -106,21 +105,21 @@ int main(int argc, char *argv[]) {
       NVTX_PUSH(spec.name.c_str());
 
       for (size_t timestep : timesteps) {
-        NVTX_PUSH(std::format("{} Timesteps", timestep).c_str());
+        NVTX_PUSH((std::to_string(timestep) + " Timesteps").c_str());
 
-        std::cerr << std::format("Using algorithm {}\n", algorithm_str);
-        std::cerr << std::format("Running Ozaki for '{}' for {} timesteps...\n", spec.name, timestep);
+        std::cerr << "Using algorithm " << algorithm_str << "\n";
+        std::cerr << "Running Ozaki for '" << spec.name << "' for " << timestep << " timesteps...\n";
 
         auto runner =
             make_ozaki_runner(spec, input, static_cast<int32_t>(timestep), extra_msb, extra_lsb, output_dir, algo);
 
         for (int32_t s = 2; s <= slice_limit && s < runner->get_max_slices(); ++s) {
-          std::string output_path = std::format("{}{}_{}_{}_{}.dat", output_dir, output_prefix, spec.name, timestep, s);
+          std::string output_path = output_dir + output_prefix + "_" + spec.name + "_" + std::to_string(timestep) + "_" + std::to_string(s) + ".dat";
           runner->run_experiment(s, output_path, save_tensors);
           if (save_tensors)
-            std::cerr << std::format("  Completed: {} Slices (saved at {})\n", s, output_path);
+            std::cerr << "  Completed: " << s << " Slices (saved at " << output_path << ")\n";
           else
-            std::cerr << std::format("  Completed: {} Slices\n", s, output_path);
+            std::cerr << "  Completed: " << s << " Slices\n";
         }
 
         NVTX_POP();
@@ -132,7 +131,7 @@ int main(int argc, char *argv[]) {
     std::cerr << "Done.\n";
 
   } catch (const std::exception &e) {
-    std::cerr << std::format("Error: {}\n", e.what());
+    std::cerr << "Error: " << e.what() << "\n";
     return 1;
   }
 

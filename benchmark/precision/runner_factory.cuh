@@ -7,9 +7,9 @@
 #include <ozaki/utils/stencil_spec.hpp>
 #include <ozaki/utils/tensor.hpp>
 
-#include <format>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <variant>
@@ -133,13 +133,18 @@ inline std::unique_ptr<OzakiRunnerBase> make_ozaki_runner(const StencilSpec &spe
       [&](const auto &s) {
         constexpr size_t stencil_ndims = std::decay_t<decltype(s)>::dims;
         if (stencil_ndims != input.shape.size())
-          throw std::invalid_argument(std::format("Stencil '{}' has {} dimensions but input tensor has {} dimensions",
-                                                  spec.name, stencil_ndims, input.shape.size()));
+          throw std::invalid_argument("Stencil '" + spec.name + "' has " + std::to_string(stencil_ndims) +
+                                      " dimensions but input tensor has " + std::to_string(input.shape.size()) +
+                                      " dimensions");
       },
       variant);
 
-  std::cout << std::format("  Using stencil {}: #Slices = {}, a = {}, extra_msb_shift = {}\n", spec.name, params.m,
-                           params.a_coeff, params.extra_msb_shift);
+  {
+    std::ostringstream oss;
+    oss << "  Using stencil " << spec.name << ": #Slices = " << params.m
+        << ", a = " << static_cast<long double>(params.a_coeff) << ", extra_msb_shift = " << params.extra_msb_shift << "\n";
+    std::cout << oss.str();
+  }
 
   return std::visit(
       [&](auto &stencil) -> std::unique_ptr<OzakiRunnerBase> {

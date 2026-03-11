@@ -7,8 +7,8 @@
 
 #include <algorithm>
 #include <cmath>
-#include <format>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using Real = double;
@@ -29,8 +29,8 @@ struct ReferenceSolver {
     constexpr size_t ndims = sizeof...(Dims);
     if (ndims != input.shape.size())
       throw std::invalid_argument(
-          std::format("Stencil has {} dimensions but input tensor has {} dimensions",
-                      ndims, input.shape.size()));
+          "Stencil has " + std::to_string(ndims) +
+          " dimensions but input tensor has " + std::to_string(input.shape.size()) + " dimensions");
     std::array<size_t, ndims> shape{};
     for (size_t d = 0; d < ndims && d < input.shape.size(); ++d)
       shape[d] = input.shape[d];

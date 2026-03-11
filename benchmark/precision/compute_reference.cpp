@@ -5,7 +5,6 @@
 #include <ozaki/utils/stencil_spec.hpp>
 #include <ozaki/utils/tensor.hpp>
 
-#include <format>
 #include <iostream>
 #include <string>
 #include <variant>
@@ -101,7 +100,7 @@ int main(int argc, char *argv[]) {
       auto variant = ozi::make_stencil(spec);
 
       for (size_t timestep : timesteps) {
-        std::cerr << std::format("Computing references for '{}' at {} timesteps...\n", spec.name, timestep);
+        std::cerr << "Computing references for '" << spec.name << "' at " << timestep << " timesteps...\n";
 
         auto compute_and_save = [&]<typename ComputeType>(const std::string &type_label) {
           auto result = std::visit(
@@ -111,9 +110,9 @@ int main(int argc, char *argv[]) {
               variant);
 
           std::string path =
-              std::format("{}{}_{}_{}_{}.dat", output_dir, output_prefix, spec.name, type_label, timestep);
+              output_dir + output_prefix + "_" + spec.name + "_" + type_label + "_" + std::to_string(timestep) + ".dat";
           write_tensor(path, Tensor<ComputeType>{input.shape, result});
-          std::cerr << std::format("  Wrote: {}\n", path);
+          std::cerr << "  Wrote: " << path << "\n";
         };
 
 #ifdef __GNUC__
@@ -132,7 +131,7 @@ int main(int argc, char *argv[]) {
     std::cerr << "Done.\n";
 
   } catch (const std::exception &e) {
-    std::cerr << std::format("Error: {}\n", e.what());
+    std::cerr << "Error: " << e.what() << "\n";
     return 1;
   }
 

@@ -1,7 +1,6 @@
 #include <ozaki/utils/error_metrics.hpp>
 #include <ozaki/utils/tensor.hpp>
 
-#include <format>
 #include <iostream>
 #include <string>
 #include <algorithm>
@@ -80,10 +79,10 @@ int main(int argc, char *argv[]) {
     }
 
     HIGH_PREC error = calculate_rmse(ref.data, result.data);
-    std::cout << std::format("{}\n", error);
+    std::cout << static_cast<long double>(error) << "\n";
 
   } catch (const std::exception &e) {
-    std::cerr << std::format("Error: {}\n", e.what());
+    std::cerr << "Error: " << e.what() << "\n";
     return 1;
   }
 

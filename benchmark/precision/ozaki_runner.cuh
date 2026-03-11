@@ -13,7 +13,6 @@
 #include <algorithm>
 #include <climits>
 #include <cuda_runtime_api.h>
-#include <format>
 #include <limits>
 #include <memory>
 #include <string>
@@ -151,7 +150,7 @@ public:
 
   std::vector<AccumulatorType> run_experiment(int32_t active_slices, const std::string &output_path,
                                               bool save_tensors) override {
-    NVTX_PUSH(std::format("Run {} Slices (Direct)", active_slices).c_str());
+    NVTX_PUSH(("Run " + std::to_string(active_slices) + " Slices (Direct)").c_str());
 
     // Compute overflow threshold from the most significant stencil slice
     double slice0_l1 = stencil_slices_.slices[0].template l1_norm<double>();
@@ -316,7 +315,7 @@ public:
 
   std::vector<AccumulatorType> run_experiment(int32_t active_slices, const std::string &output_path,
                                               bool save_tensors) override {
-    NVTX_PUSH(std::format("Run {} Slices (ConvStencil)", active_slices).c_str());
+    NVTX_PUSH(("Run " + std::to_string(active_slices) + " Slices (ConvStencil)").c_str());
 
     // Compute overflow threshold from the most significant stencil slice
     double slice0_l1 = stencil_slices_.slices[0].template l1_norm<double>();

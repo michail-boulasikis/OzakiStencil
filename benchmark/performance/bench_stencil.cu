@@ -14,7 +14,7 @@
 #include <climits>
 #include <cmath>
 #include <cuda_runtime_api.h>
-#include <format>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -283,7 +283,7 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
   for (auto s : shape)
     n_elems *= s;
 
-  std::string nvtx_label = std::format("Ozaki Direct (M={}, S={})", M, num_slices_total);
+  std::string nvtx_label = "Ozaki Direct (M=" + std::to_string(M) + ", S=" + std::to_string(num_slices_total) + ")";
   NVTX_PUSH(nvtx_label.c_str());
 
   // Allocate device resources
@@ -508,7 +508,7 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
   const size_t height = shape[0];
   const size_t ldm = shape[1];
 
-  std::string nvtx_label = std::format("Ozaki ConvStencil (M={}, S={})", M, num_slices_total);
+  std::string nvtx_label = "Ozaki ConvStencil (M=" + std::to_string(M) + ", S=" + std::to_string(num_slices_total) + ")";
   NVTX_PUSH(nvtx_label.c_str());
 
   // Allocate device resources
@@ -823,7 +823,7 @@ static void print_header(const cudaDeviceProp &prop, const std::vector<size_t> &
   std::cout << "================================================================\n";
   std::cout << "OzakiStencil Performance Benchmark\n";
   std::cout << "================================================================\n";
-  std::cout << std::format("Device:         {}\n", prop.name);
+  std::cout << "Device:         " << prop.name << "\n";
 
   std::string shape_str;
   for (size_t i = 0; i < shape.size(); ++i) {
@@ -831,15 +831,18 @@ static void print_header(const cudaDeviceProp &prop, const std::vector<size_t> &
       shape_str += " x ";
     shape_str += std::to_string(shape[i]);
   }
-  std::cout << std::format("Input shape:    {}\n", shape_str);
-  std::cout << std::format("Stencil:        {} (M={})\n", stencil_name, m);
-  std::cout << std::format("Data slices:    {}\n", slices);
-  std::cout << std::format("Timesteps:      {}\n", cfg.timesteps);
-  std::cout << std::format("Warmup:         {}\n", cfg.warmup);
-  std::cout << std::format("Repeats:        {}\n", cfg.repeats);
+  std::cout << "Input shape:    " << shape_str << "\n";
+  std::cout << "Stencil:        " << stencil_name << " (M=" << m << ")\n";
+  std::cout << "Data slices:    " << slices << "\n";
+  std::cout << "Timesteps:      " << cfg.timesteps << "\n";
+  std::cout << "Warmup:         " << cfg.warmup << "\n";
+  std::cout << "Repeats:        " << cfg.repeats << "\n";
   std::cout << "----------------------------------------------------------------\n";
-  std::cout << std::format("{:<22s} {:>10s} {:>10s} {:>10s} {:>9s}\n", "Algorithm", "Min (ms)", "Med (ms)", "Max (ms)",
-                           "GStPt/s");
+  std::cout << std::left << std::setw(22) << "Algorithm"
+            << std::right << std::setw(10) << "Min (ms)"
+            << std::setw(10) << "Med (ms)"
+            << std::setw(10) << "Max (ms)"
+            << std::setw(9) << "GStPt/s" << "\n";
   std::cout << "----------------------------------------------------------------\n";
 }
 
@@ -849,7 +852,12 @@ static void print_naive_row(const char *name, const PhaseTimings &t, const std::
   float md = stat_median(t.integration_ms);
   float mx = stat_max(t.integration_ms);
   double gstpts = compute_gstpts(shape, timesteps, mn);
-  std::cout << std::format("{:<22s} {:>10.2f} {:>10.2f} {:>10.2f} {:>9.2f}\n", name, mn, md, mx, gstpts);
+  std::cout << std::left << std::setw(22) << name
+            << std::fixed << std::setprecision(2)
+            << std::right << std::setw(10) << mn
+            << std::setw(10) << md
+            << std::setw(10) << mx
+            << std::setw(9) << gstpts << "\n";
 }
 
 static void print_ozaki_row(const char *name, const PhaseTimings &t, const std::vector<size_t> &shape,
@@ -864,19 +872,39 @@ static void print_ozaki_row(const char *name, const PhaseTimings &t, const std::
   float total_med = dr_med + sl_med + int_med + mend_med;
   float total_max = dr_max + sl_max + int_max + mend_max;
   double gstpts = compute_gstpts(shape, timesteps, total_min);
-  std::cout << std::format("{:<22s} {:>10.2f} {:>10.2f} {:>10.2f} {:>9.2f}\n", name, total_min, total_med, total_max,
-                           gstpts);
-  std::cout << std::format("  {:<20s} {:>10.2f} {:>10.2f} {:>10.2f}\n", "DynRange", dr_min, dr_med, dr_max);
-  std::cout << std::format("  {:<20s} {:>10.2f} {:>10.2f} {:>10.2f}\n", "Slice", sl_min, sl_med, sl_max);
+  std::cout << std::left << std::setw(22) << name
+            << std::fixed << std::setprecision(2)
+            << std::right << std::setw(10) << total_min
+            << std::setw(10) << total_med
+            << std::setw(10) << total_max
+            << std::setw(9) << gstpts << "\n";
+  std::cout << "  " << std::left << std::setw(20) << "DynRange"
+            << std::fixed << std::setprecision(2)
+            << std::right << std::setw(10) << dr_min
+            << std::setw(10) << dr_med
+            << std::setw(10) << dr_max << "\n";
+  std::cout << "  " << std::left << std::setw(20) << "Slice"
+            << std::fixed << std::setprecision(2)
+            << std::right << std::setw(10) << sl_min
+            << std::setw(10) << sl_med
+            << std::setw(10) << sl_max << "\n";
 
   double int_gstpts = compute_gstpts(shape, timesteps, int_min);
-  std::cout << std::format("  {:<20s} {:>10.2f} {:>10.2f} {:>10.2f} {:>9.2f}\n", "Integration", int_min, int_med,
-                           int_max, int_gstpts);
-  std::cout << std::format("  {:<20s} {:>10.2f} {:>10.2f} {:>10.2f}\n", "Mend", mend_min, mend_med, mend_max);
+  std::cout << "  " << std::left << std::setw(20) << "Integration"
+            << std::fixed << std::setprecision(2)
+            << std::right << std::setw(10) << int_min
+            << std::setw(10) << int_med
+            << std::setw(10) << int_max
+            << std::setw(9) << int_gstpts << "\n";
+  std::cout << "  " << std::left << std::setw(20) << "Mend"
+            << std::fixed << std::setprecision(2)
+            << std::right << std::setw(10) << mend_min
+            << std::setw(10) << mend_med
+            << std::setw(10) << mend_max << "\n";
 }
 
 static void print_skipped_row(const char *name, const char *reason) {
-  std::cout << std::format("{:<22s} [skipped: {}]\n", name, reason);
+  std::cout << std::left << std::setw(22) << name << " [skipped: " << reason << "]\n";
 }
 
 static void print_footer() { std::cout << "================================================================\n"; }
@@ -950,7 +978,8 @@ static void run_benchmarks(const StencilSpec &spec, const BenchConfig &cfg, int 
         // Validate dimensionality
         if (ndims != cfg.shape.size()) {
           throw std::invalid_argument(
-              std::format("Stencil '{}' has {} dims but shape has {} dims", spec.name, ndims, cfg.shape.size()));
+              "Stencil '" + spec.name + "' has " + std::to_string(ndims) +
+              " dims but shape has " + std::to_string(cfg.shape.size()) + " dims");
         }
 
         // -- Naive FP32 --
@@ -970,14 +999,14 @@ static void run_benchmarks(const StencilSpec &spec, const BenchConfig &cfg, int 
 #if __CUDA_ARCH_LIST__ >= 1200 || !defined(__CUDA_ARCH_LIST__)
           if (device_cc >= 1200) {
             auto t = bench_naive<__float128>(stencil, cfg.shape, cfg, cache_inv, "Naive FP128");
-            std::string label = std::format("Naive FP128 [sm_{}]", device_cc / 10);
+            std::string label = "Naive FP128 [sm_" + std::to_string(device_cc / 10) + "]";
             print_naive_row(label.c_str(), t, cfg.shape, cfg.timesteps);
           } else {
-            std::string reason = std::format("device sm_{} < sm_120", device_cc / 10);
+            std::string reason = "device sm_" + std::to_string(device_cc / 10) + " < sm_120";
             print_skipped_row("Naive FP128", reason.c_str());
           }
 #else
-          std::string reason = std::format("device sm_{} < sm_120", device_cc / 10);
+          std::string reason = "device sm_" + std::to_string(device_cc / 10) + " < sm_120";
           print_skipped_row("Naive FP128", reason.c_str());
 #endif
         }
@@ -1037,11 +1066,13 @@ static dim3 parse_block_size(const std::string &s) {
 static void validate_block_size(const dim3 &block, const cudaDeviceProp &prop) {
   uint32_t total = block.x * block.y * block.z;
   if (total > static_cast<uint32_t>(prop.maxThreadsPerBlock))
-    throw std::invalid_argument(std::format("Block size {}x{}x{} = {} threads exceeds device limit of {}", block.x,
-                                            block.y, block.z, total, prop.maxThreadsPerBlock));
+    throw std::invalid_argument("Block size " + std::to_string(block.x) + "x" + std::to_string(block.y) + "x" +
+                                std::to_string(block.z) + " = " + std::to_string(total) +
+                                " threads exceeds device limit of " + std::to_string(prop.maxThreadsPerBlock));
   if (total % WARP_SIZE != 0)
-    throw std::invalid_argument(std::format("Block size {}x{}x{} = {} threads is not a multiple of WARP_SIZE ({})",
-                                            block.x, block.y, block.z, total, WARP_SIZE));
+    throw std::invalid_argument("Block size " + std::to_string(block.x) + "x" + std::to_string(block.y) + "x" +
+                                std::to_string(block.z) + " = " + std::to_string(total) +
+                                " threads is not a multiple of WARP_SIZE (" + std::to_string(WARP_SIZE) + ")");
 }
 
 int main(int argc, char **argv) {
@@ -1127,7 +1158,7 @@ int main(int argc, char **argv) {
     try {
       run_benchmarks(spec, cfg, algo_flags, device_cc);
     } catch (const std::exception &e) {
-      std::cerr << std::format("Error benchmarking '{}': {}\n", spec.name, e.what());
+      std::cerr << "Error benchmarking '" << spec.name << "': " << e.what() << "\n";
     }
     NVTX_POP();
   }

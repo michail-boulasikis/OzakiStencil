@@ -3,7 +3,7 @@
 
 #include <vector>
 #include <fstream>
-#include <format>
+#include <string>
 #include <type_traits>
 
 template <typename T> struct Tensor {
@@ -37,7 +37,7 @@ template <typename T> size_t get_type_id() {
 template <typename T> Tensor<T> read_tensor(const std::string &filepath) {
   std::ifstream f(filepath, std::ios::in | std::ios::binary);
   if (!f.is_open()) {
-    throw std::runtime_error(std::format("Could not open file at {}.", filepath));
+    throw std::runtime_error("Could not open file at " + filepath + ".");
   }
 
   size_t n_dims;
@@ -48,7 +48,8 @@ template <typename T> Tensor<T> read_tensor(const std::string &filepath) {
 
   size_t expected_type_id = get_type_id<T>();
   if (type_id != expected_type_id) {
-    throw std::runtime_error(std::format("Type mismatch: expected type {}, but file contains type {}", expected_type_id, type_id));
+    throw std::runtime_error("Type mismatch: expected type " + std::to_string(expected_type_id) +
+                             ", but file contains type " + std::to_string(type_id));
   }
 
   std::vector<size_t> shape(n_dims);
@@ -67,7 +68,7 @@ template <typename T> Tensor<T> read_tensor(const std::string &filepath) {
 template <typename T> void write_tensor(const std::string &filepath, const Tensor<T> &tensor) {
   std::ofstream f(filepath, std::ios::out | std::ios::binary);
   if (!f.is_open()) {
-    throw std::runtime_error(std::format("Could not open file at {}.", filepath));
+    throw std::runtime_error("Could not open file at " + filepath + ".");
   }
 
   size_t n_dims = tensor.shape.size();
