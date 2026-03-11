@@ -51,7 +51,7 @@ TEST_F(TensorIOTest, Roundtrip_Float_1D) {
   for (size_t i = 0; i < t.data.size(); ++i)
     EXPECT_EQ(t2.data[i], t.data[i]) << "Mismatch at index " << i;
 
-  // Shape accessor checks (consolidated from ShapePreservation_1D)
+  // Shape accessor checks
   EXPECT_EQ(t2.shape.size(), 1u);
   EXPECT_EQ(t2.width(), 10u);
   EXPECT_EQ(t2.height(), 1u);
@@ -73,7 +73,7 @@ TEST_F(TensorIOTest, Roundtrip_Double_2D) {
   for (size_t i = 0; i < t.data.size(); ++i)
     EXPECT_EQ(t2.data[i], t.data[i]) << "Mismatch at index " << i;
 
-  // Shape accessor checks (consolidated from ShapePreservation_2D)
+  // Shape accessor checks
   EXPECT_EQ(t2.shape.size(), 2u);
   EXPECT_EQ(t2.width(), 4u);
   EXPECT_EQ(t2.height(), 5u);
@@ -95,7 +95,7 @@ TEST_F(TensorIOTest, Roundtrip_LongDouble_3D) {
   for (size_t i = 0; i < t.data.size(); ++i)
     EXPECT_EQ(t2.data[i], t.data[i]) << "Mismatch at index " << i;
 
-  // Shape accessor checks (consolidated from ShapePreservation_3D)
+  // Shape accessor checks
   EXPECT_EQ(t2.shape.size(), 3u);
   EXPECT_EQ(t2.width(), 2u);
   EXPECT_EQ(t2.height(), 3u);

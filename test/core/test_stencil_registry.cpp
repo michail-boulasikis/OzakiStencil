@@ -25,7 +25,7 @@ TEST(FindIntegerBasis, SingleNonZero) {
   StencilSpec spec;
   spec.coeffs = {CoeffStorageType(0), CoeffStorageType(5), CoeffStorageType(0)};
   auto a = ozi::find_integer_basis(spec);
-  // a should divide 5 evenly; smallest a = 5 (since abs_min=5, k=1 → a=5, and 5/5=1 integer)
+  // a should divide 5 evenly; smallest a = 5 (since abs_min=5, k=1 -> a=5, and 5/5=1 integer)
   EXPECT_GT(a, CoeffStorageType(0));
   // All coeffs / a should be integers
   for (const auto &c : spec.coeffs) {

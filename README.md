@@ -1,96 +1,165 @@
 # OzakiStencil
 
-## Project Description
+An implementation of the Ozaki scheme for high-precision iterative stencil computations on GPUs. OzakiStencil decomposes high-precision floating-point numbers (FP64, FP128) into multiple INT8 slices and applies stencil operations to each slice independently using fast INT8 tensor core arithmetic, then reconstructs the result with full precision through careful accumulation and carry propagation.
 
-This is an exploration of what happens when you apply the Ozaki scheme to stencil computations. The Ozaki scheme breaks down high-precision numbers (FP64, FP128) into multiple INT8 slices, essentially reconstructing precision through decomposition and careful accumulation. The idea here is to see if this approach can work for iterative stencil operations, using INT8 arithmetic on tensor cores while still maintaining the numerical properties needed for things like PDE solvers.
+This approach enables FP64-accurate (and beyond) stencil computations using the INT8 throughput of modern GPU tensor cores, which is an order of magnitude higher than native FP64 throughput on consumer GPUs.
 
-The implementation includes both CPU and GPU variants (using CUDA), so you can experiment with how the approach behaves across different hardware.
+## Features
 
-## Requirements & Build
+- **Multi-precision support**: FP64 (`double`) and FP128 (`__float128`) input data types
+- **GPU tensor core acceleration**: INT8 MMA (matrix multiply-accumulate) via inline PTX on NVIDIA GPUs
+- **Multi-dimensional stencils**: 1D, 2D, and 3D stencils with compile-time shape specialization
+- **Two GPU kernel implementations**:
+  - `stencil_v1`: General-purpose stencil kernel supporting arbitrary shapes (1D/2D/3D)
+  - `cvstencil`: Tensor-core-optimized kernel for 2D 7x7 stencils using the ConvStencil dual-tessellation approach
+- **Automatic precision management**: Dynamic range tracking, overflow detection, and slice count adjustment across iterations
+- **Integer basis optimization**: When stencil coefficients lie in a discrete subgroup of the reals, the scheme exploits this structure to reduce the number of required slices
+- **CPU reference implementation**: With optional OpenMP parallelization for validation
 
-### Requirements
+## Requirements
 
-**Essential:**
-- C++20 capable compiler (GCC 10+, Clang 12+, or MSVC 19.30+)
+**Required:**
+- C++20 compiler (GCC 10+)
 - CMake 3.23+
-- CUDA Toolkit 11.0+ (for GPU support)
-- Boost (program options library for command-line utilities)
+- CUDA Toolkit 12.0+
+- Boost (program_options)
+- cuDNN
 
-**Optional (but recommended):**
-- OpenMP (for CPU parallelization - auto-detected)
-- Google Test (gtest) for running unit tests
-- Eigen for linear algebra operations in tests/benchmarks (used as a reference)
+**Optional:**
+- OpenMP (CPU parallelization, auto-detected)
+- Google Test (unit tests, auto-fetched by CMake)
+- Boost.Multiprecision (high-precision scale factors, see below)
 
-### Build & Test
+## Build
 
-Run `bash run.sh` to:
-1. Configure the repository with CMake
-2. Build the library and tests
-3. Run tests with `ctest`
+```bash
+# Basic build and test
+sh run.sh -t
 
-For build options, run `bash run.sh -h`.
+# With a specific GPU architecture and high-precision scale factors
+sh run.sh -t -- -DCUDA_COMPUTE_CAPABILITY=120 -DOZAKI_USE_BOOST_MULTIPRECISION=ON
+```
 
-#### High-Precision Scale Factor (Optional)
+Supported GPU architectures: `sm_80` (Ampere), `sm_86` (default), `sm_89` (Ada), `sm_90` (Hopper), `sm_120` (Blackwell).
 
-At the end of the integration, we need to scale the result by `1/a^timesteps` where `a` is the stencil's L1 norm. When `a` is a power of 2, this is exact. When it's not (like the `random-box` stencil), computing this with `__float128` loses precision and becomes the main source of error.
+Run `sh run.sh -h` for all build options.
 
-You can fix this by using Boost.Multiprecision to compute the scale factor with way more precision (500 bits instead of 128):
+### High-Precision Scale Factors
+
+At the end of integration, the result is scaled by `1/a^timesteps` where `a` is the stencil's L1 norm. When `a` is not a power of 2, computing this scale factor with `__float128` loses precision and becomes the dominant source of error.
+
+Enable Boost.Multiprecision to compute scale factors with 500-bit precision:
 
 ```bash
 cmake -B build -DOZAKI_USE_BOOST_MULTIPRECISION=ON
 ```
 
-This only needs Boost headers (already required for other parts), and the extra computation happens once on the CPU, so there's basically no slowdown. If you're running the precision benchmarks, turn this on to see the full convergence.
+This only affects a single CPU computation and has negligible performance impact.
 
-## How OzakiStencil Works
+## Usage
 
-### The Basic Idea
+### Running the Precision Benchmark
 
-The Ozaki scheme breaks a high-precision number into multiple INT8 "slices":
+Three binaries form a sequential pipeline for measuring numerical accuracy:
+
+```bash
+# 1. Generate a high-precision reference solution
+./build/bin/compute-reference -i data/2D_128x128.dat \
+    --stencil-file data/stencils/3x3Lm2_0.stc -T 10
+
+# 2. Run the Ozaki stencil integration
+./build/bin/run-ozaki -i data/2D_128x128.dat \
+    --stencil-file data/stencils/3x3Lm2_0.stc -T 10 --save-tensors --slice-limit 18
+
+# 3. Compute RMSE between reference and Ozaki results
+./build/bin/compute-errors -e data/tensors/ref_Heat_fp128_10.dat \
+    -a data/tensors/oz_Heat_10_18.dat
 ```
-value = Σ(slice_i × 2^exponent_i)  for i = 0 to N
+
+### Running the Performance Benchmark
+
+```bash
+./build/bin/bench-stencil -S 4096x4096 -s 9 \
+    --stencil-file data/stencils/7x7Lm2_0.stc -W 2 -T 40 -R 5
 ```
 
-Each slice is an INT8 value (-127 to 127), and together they capture the full precision. For stencil computations, the approach is:
+### Running Tests
 
-1. **Decompose** the input data into INT8 slices
-2. **Apply the stencil** to each slice independently (using INT8 arithmetic)
-3. **Accumulate** the partial results with appropriate scaling
-4. **Reconstruct** the final answer by combining all slices back together
+```bash
+# All tests
+ctest --test-dir build
 
-So far I have proven that you can get FP64 or even higher precision using this scheme. But it remains to be seen if performance is faster or whether more optimizations are needed.
+# Specific test suites
+./build/bin/test-ozaki-cpu --gtest_filter=TestSuiteName.TestName
+./build/bin/test-ozaki-gpu --gtest_filter=TestSuiteName.TestName
+./build/bin/test-slice-stencil --gtest_filter=TestSuiteName.TestName
+```
 
-### Implementation Details
+## How It Works
 
-**CPU side** (`include/ozaki/cpu/`):
-- Slice decomposition using frexp and careful residual computation
-- Mending (reconstruction) by scaling and summing slices
-- Stencil kernels that work on the decomposed data
-- Optional OpenMP parallelization for slice-by-slice processing
+### The Ozaki Scheme for Stencils
 
-**GPU side** (`include/ozaki/gpu/`):
-- Dynamic range analysis to figure out how many slices are actually needed
-- CUDA kernels for decomposition and reconstruction
-- Stencil kernels that apply operations to INT8 data
-- Hysteresis and carry management to track numerical state across iterations
+The Ozaki scheme represents a high-precision value as a sum of INT8 slices:
 
-The GPU implementation is more experimental: it tracks slice shifts and overflow information as iterations progress, trying to maintain precision without exploding the number of slices needed.
-It also manages to avoid slicing and mending at every time step by carefully computing the slices by shifting and accumulating.
+```
+value = sum(slice_i * 2^exponent_i)  for i = 0..N
+```
 
-### Binary Tensor Files
+Each slice is an INT8 value (-127 to 127). The number of slices N is determined dynamically from the data's exponent range. For stencil computations:
 
-This project makes use of a simple in-house binary tensor format for IO. The format is `[ndim, type, dim1, dim2, ... , dimn, v0, v1, v2, v3, ...]`.
-- `ndim` is the amount of dimensions (uint64t).
-- `type` is an enumeration describing the tensor type (uint64t).
-- `dimx` the number of elements on the x-th dimension (uint64t).
-- `vx` tensor values (their type depends on `type`).
+1. **Decompose** input data into INT8 slices based on dynamic range analysis
+2. **Apply the stencil** to each data slice independently using INT8 arithmetic
+3. **Propagate carries** between slice positions using a sliding window accumulator
+4. **Reconstruct** the result by scaling and summing all output slices
 
-Binary tensor format type IDs:
-- `0` = `float` (32-bit)
-- `1` = `double` (64-bit)
-- `2` = `long double` (platform-dependent: 80/96/128-bit)
-- `3` = `__float128` (128-bit IEEE 754 quadruple precision)
+The key insight is that stencil application on INT8 slices can leverage tensor core MMA instructions, which offer significantly higher throughput than scalar FP64 operations on modern GPUs.
 
-**Note**: __float128 support requires GCC (uses GNU extensions). The reference solver will fall back to `long double` on non-GCC compilers.
+### Avoiding Per-Step Decomposition
 
-Study @include/ozaki/gpu/ozi_stencil_plain.cuh , @include/ozaki/gpu/ozi.cuh and @include/ozaki/utils/stencil_registry.hpp . There is a bug somewhere in the handling of the boundary when a basis for a stencil is discovered, which causes boundaries to be computed wrongly. Evidence for this includes (a) that the error disappears when using Dirichlet boundary conditions (boundary = 0) and that stencils for which a basis is *not* found have no errors at the boundary even when it's non-zero. The error seems to be introduced gradually rather than introduced during the final scaling step, but for completeness this should also be scrutinized. Your tasks is to find the issue, by carefully examining and tracing this execution path while questioning everything that is currently implemented. Use subagents to parallelize your workflow and maintain context under control. Be thorough and attentive.
+Rather than decomposing and reconstructing at every timestep, the GPU implementation maintains the INT8 slice representation across iterations. An `OzakiDescriptor` tracks per-integration state (exponent range, slice count, overflow flags) and triggers re-decomposition only when numerical overflow is detected, amortizing the decomposition cost.
+
+## Project Structure
+
+```
+include/ozaki/
+  core/           # Type traits, stencil representation, concepts
+  cpu/            # CPU implementation (slice, mend, stencil)
+  gpu/            # GPU kernels and runtime state management
+  utils/          # Stencil registry, spec parsing, tensor I/O
+benchmark/
+  performance/    # GPU kernel timing benchmarks
+  precision/      # Numerical accuracy measurement pipeline
+  cudnn/          # cuDNN convolution comparison benchmark
+test/
+  core/           # Stencil and tensor I/O tests
+  cpu/            # CPU Ozaki correctness tests
+  gpu/            # GPU kernel correctness tests
+data/
+  stencils/       # Stencil specification files (.stc format)
+scripts/          # Plotting and analysis utilities
+```
+
+### Stencil Specification Format
+
+Stencils are defined in `.stc` text files with the following format:
+
+```
+name Heat
+shape 3 3
+coefficients 0 1 0 1 -4 1 0 1 0
+```
+
+Inline specifications are also supported: `"3x3:0,1,0,1,-4,1,0,1,0"`.
+
+### Binary Tensor Format
+
+Input/output data uses a binary tensor format: `[ndim, type, dim0, ..., dimN, values...]`
+
+- `ndim`: number of dimensions (uint64)
+- `type`: 0=float, 1=double, 2=long double, 3=__float128 (uint64)
+- `dimX`: size of each dimension (uint64)
+- `values`: tensor data in row-major order
+
+## License
+
+This project is research software. See LICENSE for details.

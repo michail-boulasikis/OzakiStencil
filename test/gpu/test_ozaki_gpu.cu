@@ -20,21 +20,6 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-template <typename T> struct get_uint_same_size {
-  // Ensure we only pass floating point types
-  static_assert(std::is_floating_point_v<T>, "Type must be floating point");
-
-  using type =
-      typename std::conditional<sizeof(T) == sizeof(std::uint32_t), std::uint32_t,
-                                typename std::conditional<sizeof(T) == sizeof(std::uint64_t), std::uint64_t,
-                                                          typename std::conditional<sizeof(T) == sizeof(std::uint16_t),
-                                                                                    std::uint16_t, // For half-floats
-                                                                                    void>::type>::type>::type;
-
-  // Ensure we actually found a match
-  static_assert(!std::is_void_v<type>, "No uint type of same size found for this float");
-};
-
 template <typename T> int32_t get_slice_max_normal() {
   if constexpr (std::is_same_v<T, float>) {
     return 9;
@@ -55,12 +40,9 @@ template <typename T> int32_t get_slice_max_beta() {
   }
 }
 
-template <typename T> using get_uint_same_size_t = typename get_uint_same_size<T>::type;
-
 template <typename T> class OzakiTestGPU : public ::testing::Test {
 public:
   static constexpr uint64_t SEED = 0x123456789;
-  static constexpr T CVAL = static_cast<T>(0xDEADBEEF);
   static constexpr size_t N_SMALL = 1024;
   static constexpr size_t N = N_SMALL * N_SMALL;
   T *h_data, *d_data;
@@ -122,6 +104,7 @@ protected:
     for (size_t i = 0; i < this->N; ++i)
       ASSERT_EQ(h_op_result[i], this->h_data[i]) << "Iter[" << i << "]";
 
+    delete[] h_op_result;
     cudaFree(d_slices);
   }
 

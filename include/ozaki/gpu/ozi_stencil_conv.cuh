@@ -36,7 +36,7 @@ constexpr int32_t DATA_TILE_SIZE_COL = TILE_SIZE_COL + 2 * HALO; // = 134
 // Stencil2row shared memory dimensions (row-major: K is fast dim, XOR-swizzled)
 // SMEM_ROWS = number of column groups = floor(DATA_TILE_SIZE_COL / STRIDE) = MMA_M = 16
 // SMEM_K_EXTENT = K-extent covering all output rows' stencil windows + MMA tile padding
-// K_STRIDE = physical row stride in bytes (must satisfy K_STRIDE/4 % 32 == 8 for swizzle)
+// K_STRIDE = physical row stride in bytes (must be a multiple of 4 and K_STRIDE/4 % 32 != 0 for swizzle)
 constexpr int32_t SMEM_ROWS = DATA_TILE_SIZE_COL / STRIDE;                        // = 16
 constexpr int32_t K_STRIDE = 352;                                                 // 352/4=88, 88%32=24
 constexpr int32_t SMEM_K_EXTENT = (TILE_SIZE_ROW - 1) * STRIDE + MMA_NUM * MMA_K; // = 312
@@ -142,7 +142,7 @@ template <int32_t M> inline void build_param_matrix(int8_t *param_out, const int
               valid = (stencil_col < n_col);
               coeff_col = stencil_col - n_col + STENCIL_SIDE;
             }
-            // When valid is true, coeff_col is always in [0, STENCIL_SIDE) — guaranteed
+            // When valid is true, coeff_col is always in [0, STENCIL_SIDE) -- guaranteed
             // by the tessellation geometry (upper: j >= n_col implies j - n_col >= 0;
             // lower: j < n_col implies j - n_col + 7 in [0, 6]).
             if (valid)

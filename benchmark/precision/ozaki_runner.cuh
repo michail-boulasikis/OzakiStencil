@@ -269,7 +269,7 @@ public:
 };
 
 // Concrete runner using the ConvStencil WMMA tensor core kernel.
-// Only supports 2D 7×7 stencils (hardcoded STENCIL_SIDE=7, HALO=3).
+// Only supports 2D 7x7 stencils (hardcoded STENCIL_SIDE=7, HALO=3).
 template <int32_t M> class OzakiRunnerConvStencil : public OzakiRunnerBase {
   using IntStencilType = ozi::Stencil<int8_t, 7, 7>;
   ozi::StencilSlices<IntStencilType, M> stencil_slices_;

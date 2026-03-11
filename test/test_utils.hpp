@@ -119,7 +119,7 @@ std::vector<T> compute_gold_standard_multistep(const ozi::Stencil<T, Dims...> &s
 
   for (int32_t t = 0; t < timesteps; ++t) {
     // Copy buf_a to buf_b so boundary cells are preserved (matches GPU
-    // behavior where emulated_gain keeps boundary cells ≈ constant).
+    // behavior where emulated_gain keeps boundary cells ~= constant).
     // apply_to only overwrites interior cells.
     buf_b = buf_a;
     s_high.template apply_to<HighPrec>(buf_b, buf_a, shape);
@@ -129,72 +129,6 @@ std::vector<T> compute_gold_standard_multistep(const ozi::Stencil<T, Dims...> &s
   std::vector<T> result(n);
   for (size_t i = 0; i < n; ++i)
     result[i] = static_cast<T>(buf_a[i]);
-  return result;
-}
-
-/**
- * Gold standard for boundary cells: applies stencil to a zero-padded input.
- * Returns the full output including boundary cells (which are computed by
- * reading zeros for out-of-bounds neighbors).
- */
-template <typename T, size_t... Dims>
-std::vector<T> compute_gold_standard_with_boundary(const ozi::Stencil<T, Dims...> &stencil,
-                                                   const std::vector<T> &input,
-                                                   const std::array<size_t, sizeof...(Dims)> &shape) {
-#ifdef __GNUC__
-  using HighPrec = __float128;
-#else
-  using HighPrec = long double;
-#endif
-
-  constexpr size_t ndims = sizeof...(Dims);
-  constexpr auto s_shape = ozi::Stencil<T, Dims...>::get_shape();
-
-  // Create padded shape: add stencil extent on each side
-  std::array<size_t, ndims> padded_shape{};
-  for (size_t d = 0; d < ndims; ++d)
-    padded_shape[d] = shape[d] + s_shape[d] - 1;
-
-  size_t padded_total = 1;
-  for (auto s : padded_shape)
-    padded_total *= s;
-
-  // Create padded input (zero-filled, original data in center)
-  std::vector<HighPrec> padded_in(padded_total, HighPrec(0));
-  auto strides = ozi::make_strides_from_shape(shape);
-  auto padded_strides = ozi::make_strides_from_shape(padded_shape);
-
-  size_t total = 1;
-  for (auto s : shape)
-    total *= s;
-
-  for (size_t lin = 0; lin < total; ++lin) {
-    auto idx = ozi::multi_from_linear(lin, shape);
-    size_t padded_lin = 0;
-    for (size_t d = 0; d < ndims; ++d)
-      padded_lin += (idx[d] + stencil.offsets[d]) * padded_strides[d];
-    padded_in[padded_lin] = static_cast<HighPrec>(input[lin]);
-  }
-
-  // Apply stencil on padded domain with centered offsets
-  ozi::Stencil<HighPrec, Dims...> s_high;
-  s_high.offsets = stencil.offsets;
-  for (size_t i = 0; i < stencil.coeffs.size(); ++i)
-    s_high.coeffs[i] = static_cast<HighPrec>(stencil.coeffs[i]);
-
-  std::vector<HighPrec> padded_out(padded_total, HighPrec(0));
-  s_high.template apply_to<HighPrec>(padded_out, padded_in, padded_shape);
-
-  // Extract the original-sized region from the padded output
-  std::vector<T> result(total);
-  for (size_t lin = 0; lin < total; ++lin) {
-    auto idx = ozi::multi_from_linear(lin, shape);
-    size_t padded_lin = 0;
-    for (size_t d = 0; d < ndims; ++d)
-      padded_lin += (idx[d] + stencil.offsets[d]) * padded_strides[d];
-    result[lin] = static_cast<T>(padded_out[padded_lin]);
-  }
-
   return result;
 }
 

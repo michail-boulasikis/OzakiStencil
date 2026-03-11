@@ -1,11 +1,13 @@
 /**
  * GPU stencil kernel test suite.
  *
- * Tests five GPU stencil code paths:
+ * Test suites:
  *   1. NaiveGPUStencil  - FP64 shared-memory stencil (ozi::stencil)
  *   2. OzakiStencilV1   - Ozaki INT8 scalar stencil (ozigpu::stencil_v1)
  *   3. ConvStencilWMMA  - Ozaki INT8 tensor-core stencil (ozigpu::cvstencil)
  *   4. BoundaryTests    - Boundary cell correctness across kernels
+ *   6. M > 1 Stencil Tests (multi-slice precision)
+ *   7. Overflow/Shift Mechanism Tests
  */
 
 #include <gtest/gtest.h>
@@ -181,7 +183,7 @@ protected:
     constexpr size_t ndims = sizeof...(Dims);
     dim3 block, grid;
 
-    // Grid config: i→fastest dim (last), j→second, k→slowest (first)
+    // Grid config: i->fastest dim (last), j->second, k->slowest (first)
     if constexpr (ndims == 1) {
       block = dim3(256);
       grid = dim3((shape[0] + 255) / 256);
@@ -822,7 +824,7 @@ TEST_F(StencilGPUTest, Boundary_StencilV1_1D) {
   auto result =
       run_full_ozaki_v1<1>(d2x, input, {N}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
 
-  // GPU boundary path preserves boundary cells ≈ original input via emulated_gain
+  // GPU boundary path preserves boundary cells ~= original input via emulated_gain
   double rmse = test_utils::boundary_relative_rmse<Real, 1>(result, input, {N}, d2x.offsets);
   EXPECT_LT(rmse, 1e-10) << "1D boundary RMSE: " << rmse;
 }
@@ -837,7 +839,7 @@ TEST_F(StencilGPUTest, Boundary_StencilV1_2D) {
   auto result =
       run_full_ozaki_v1<1>(heat, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
 
-  // GPU boundary path preserves boundary cells ≈ original input via emulated_gain
+  // GPU boundary path preserves boundary cells ~= original input via emulated_gain
   double rmse = test_utils::boundary_relative_rmse<Real, 2>(result, input, {H, W}, heat.offsets);
   EXPECT_LT(rmse, 1e-10) << "2D boundary RMSE: " << rmse;
 }
@@ -855,7 +857,7 @@ TEST_F(StencilGPUTest, Boundary_StencilV1_3D) {
   auto result = run_full_ozaki_v1<1>(box, input, {D, H, W}, 1, setup.a_coeff, setup.scaling_factor,
                                      setup.extra_msb_shift);
 
-  // GPU boundary path preserves boundary cells ≈ original input via emulated_gain
+  // GPU boundary path preserves boundary cells ~= original input via emulated_gain
   double rmse = test_utils::boundary_relative_rmse<Real, 3>(result, input, {D, H, W}, box.offsets);
   EXPECT_LT(rmse, 1e-10) << "3D boundary RMSE: " << rmse;
 }
@@ -873,7 +875,7 @@ TEST_F(StencilGPUTest, Boundary_CvStencil_2D) {
   auto result =
       run_full_cvstencil<1>(box, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
 
-  // GPU boundary path preserves boundary cells ≈ original input via emulated_gain
+  // GPU boundary path preserves boundary cells ~= original input via emulated_gain
   // For 7x7 on 16x16, most cells are boundary (interior is only 4x4)
   double rmse = test_utils::boundary_relative_rmse<Real, 2>(result, input, {H, W}, box.offsets);
   EXPECT_LT(rmse, 1e-10) << "CvStencil 2D boundary RMSE: " << rmse;
@@ -891,7 +893,7 @@ TEST_F(StencilGPUTest, Boundary_StencilV1_AllBoundary) {
   auto result =
       run_full_ozaki_v1<1>(heat, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
 
-  // GPU boundary path preserves boundary cells ≈ original input via emulated_gain
+  // GPU boundary path preserves boundary cells ~= original input via emulated_gain
   // Offsets are {1,1}, so interior is [1,3) x [1,3) = 4 cells. Boundary is remaining 12 cells.
   double rmse = test_utils::boundary_relative_rmse<Real, 2>(result, input, {H, W}, heat.offsets);
   EXPECT_LT(rmse, 1e-10) << "All-boundary RMSE: " << rmse;
@@ -1071,7 +1073,7 @@ TEST_F(StencilGPUTest, OzakiV1_NoShift_D2x) {
   auto input = generate_random(N);
 
   // {1,-2,1}: M=1, sf=1 (log2_sf=0), no proactive shifts.
-  // Slice L1=4, threshold=floor(127/4)-1=30. N(0,1) data stays bounded → no reactive shifts.
+  // Slice L1=4, threshold=floor(127/4)-1=30. N(0,1) data stays bounded -> no reactive shifts.
   ozi::Stencil<Real, 3> s({1.0, -2.0, 1.0});
   auto setup = compute_ozaki_setup(s);
   ASSERT_EQ(setup.m, 1);
@@ -1094,7 +1096,7 @@ TEST_F(StencilGPUTest, OzakiV1_CarrySliceIndex_Rotates) {
   ozi::Stencil<Real, 3, 3> heat({0, 3.0 / 16, 0, 3.0 / 16, 4.0 / 16, 3.0 / 16, 0, 3.0 / 16, 0});
   auto setup = compute_ozaki_setup(heat);
 
-  // Heat T=3: ceil(3*4/7)=2 proactive shifts → carry_slice_index should rotate
+  // Heat T=3: ceil(3*4/7)=2 proactive shifts -> carry_slice_index should rotate
   auto result =
       run_full_ozaki_v1<1>(heat, input, {H, W}, T, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
 

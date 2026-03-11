@@ -205,7 +205,7 @@ slice_stencil(StencilType s, HighPrec a, int32_t extra_msb_shift = 0, int32_t n_
   constexpr int64_t HI = static_cast<int64_t>(std::numeric_limits<Target>::max());
 
   std::array<int64_t, StencilType::size> high_prec_int_coeffs{};
-  // range_msb = min(countl_zero(|coeff_i|)) — equals 64 when all coefficients are zero.
+  // range_msb = min(countl_zero(|coeff_i|)) -- equals 64 when all coefficients are zero.
   int32_t range_msb = 64;
 
   for (size_t i = 0; i < StencilType::size; ++i) {
@@ -258,7 +258,7 @@ slice_stencil(StencilType s, HighPrec a, int32_t extra_msb_shift = 0, int32_t n_
   //
   // The GPU kernel's multi-digit multiplication of data (N digits) by
   // boundary_gain (N digits) produces a 2N-1 digit product, but only the
-  // upper N digits are stored — the lower N-1 digits are truncated. This
+  // upper N digits are stored -- the lower N-1 digits are truncated. This
   // implicit division by 128^(N-1) means the effective per-iteration
   // boundary scaling is: boundary_gain_combined / 128^(N-1).
   //
@@ -337,34 +337,6 @@ template <OzakiPair O> void mend(std::span<typename O::data_type> out, const Oza
       out[j] += OzakiPairTraits<O>::up_cast(sptr[j], scale);
     }
   }
-}
-
-template <OzakiPair O>
-void mul(std::span<typename O::data_type> out, const OzakiSlices<O> &a, const OzakiSlices<O> &b, size_t m, size_t n,
-         size_t k) {
-  using std::max;
-  using Data = typename O::data_type;
-  using Target = typename O::target_type;
-  using Accumulator = typename O::acc_type;
-
-  if (out.size() != m * n) {
-    throw std::runtime_error("Output buffer is not adequately sized.");
-  }
-
-  std::vector<Accumulator> temp(m * n);
-  std::fill(out.begin(), out.end(), static_cast<Data>(0));
-  size_t max_slices = max(a.exponents.size(), b.exponents.size());
-
-  for (size_t sA = 0; sA < a.exponents.size(); ++sA)
-    for (size_t sB = 0; sB < b.exponents.size(); ++sB) {
-      if (sA + sB + 1 <= max_slices) {
-        OzakiPairTraits<O>::matmul(temp.data(), a.get_slice(sA).data(), b.get_slice(sB).data(), m, n, k);
-        for (size_t i = 0; i < m; ++i)
-          for (size_t j = 0; j < n; ++j)
-            out[i + j * m] +=
-                OzakiPairTraits<O>::up_cast_acc(temp[i + j * m], a.exponents[sA] + b.exponents[sB], 2);
-      }
-    }
 }
 
 template <std::floating_point T, size_t... Dims>

@@ -58,14 +58,14 @@ dispatch_m(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Rea
                                 extra_msb_shift);
   default:
     throw std::invalid_argument("  Stencil requires M=" + std::to_string(m) +
-                                " slices, but only M <= 12 is supported. "
-                                "Scaled integer coefficients are too large.");
+                                " slices, but M=" + std::to_string(m) +
+                                " is not a supported instantiation.");
   }
 }
 
 // ==================== ConvStencil (WMMA) dispatch ====================
 
-// Helper: constructs OzakiRunnerConvStencil<M> only for 2D 7×7 stencils.
+// Helper: constructs OzakiRunnerConvStencil<M> only for 2D 7x7 stencils.
 // Uses if constexpr to avoid instantiation errors for other shapes.
 template <int32_t M, typename CoeffT, size_t... Dims>
 std::unique_ptr<OzakiRunnerBase>
@@ -112,8 +112,8 @@ dispatch_m_convstencil(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, cons
                                             a_coeff, extra_msb_shift);
   default:
     throw std::invalid_argument("  Stencil requires M=" + std::to_string(m) +
-                                " slices, but only M <= 12 is supported. "
-                                "Scaled integer coefficients are too large.");
+                                " slices, but M=" + std::to_string(m) +
+                                " is not a supported instantiation.");
   }
 }
 

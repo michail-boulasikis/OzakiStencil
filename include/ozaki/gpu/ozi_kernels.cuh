@@ -39,69 +39,11 @@ inline void upload_slice_phys_lut(int32_t total_slices) {
   }
   cudaMemcpyToSymbol(phys_lut_cmem, lut, total_slices * PHYS_LUT_MAX_SLICES * sizeof(int32_t));
 }
-template <typename T> __global__ void fill(T *__restrict__ in, const T val, size_t n) {
-  const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
-  if (tid < n)
-    in[tid] = val;
-}
 
 template <typename T, typename ScaleT = double> __global__ void scale(T *__restrict__ in, const ScaleT val, size_t n) {
   const uint32_t tid = threadIdx.x + blockIdx.x * blockDim.x;
   if (tid < n)
     in[tid] = static_cast<T>(static_cast<ScaleT>(in[tid]) * val);
-}
-
-template <typename T, typename Dst = T, typename Acc = T>
-  requires(!std::is_same_v<Dst, __float128>) // atomic operations not supported for FP128
-__global__ void mse(Dst *__restrict__ out, const T *__restrict__ x, const T *__restrict__ y, size_t n) {
-  constexpr uint32_t ELEMENTS_PER_VECTORIZED_LOAD = 16 / sizeof(T);
-  constexpr uint32_t WARPS_PER_BLOCK = RDC_THREADS_PER_BLOCK / WARP_SIZE;
-  constexpr uint32_t BLOCK_STRIDE = RDC_THREADS_PER_BLOCK;
-  using VectorizedT = struct {
-    T a[ELEMENTS_PER_VECTORIZED_LOAD];
-  };
-
-  __shared__ T smem[WARPS_PER_BLOCK];
-
-  const uint32_t GRID_SIZE = BLOCK_STRIDE * gridDim.x;
-  size_t i = threadIdx.x + blockIdx.x * BLOCK_STRIDE;
-  Acc local_val = static_cast<T>(0);
-
-#pragma unroll 4
-  while (ELEMENTS_PER_VECTORIZED_LOAD * i < n) {
-    const VectorizedT xv = *reinterpret_cast<const VectorizedT *>(x + ELEMENTS_PER_VECTORIZED_LOAD * i);
-    const VectorizedT yv = *reinterpret_cast<const VectorizedT *>(y + ELEMENTS_PER_VECTORIZED_LOAD * i);
-#pragma unroll
-    for (uint32_t j = 0; j < ELEMENTS_PER_VECTORIZED_LOAD; ++j) {
-      local_val += static_cast<Acc>(xv[j] - yv[j]) * static_cast<Acc>(xv[j] - yv[j]);
-    }
-    i += GRID_SIZE;
-  }
-
-  constexpr uint32_t FULL_MASK = 0xFFFF'FFFF;
-#pragma unroll
-  for (uint32_t offset = 16; offset > 0; offset /= 2) {
-    local_val += shfl_down_sync_wrapper(FULL_MASK, local_val, offset);
-  }
-
-  const uint32_t WARP_ID = threadIdx.x / WARP_SIZE;
-  const uint32_t LANE_ID = threadIdx.x % WARP_SIZE;
-  if (LANE_ID == 0) {
-    smem[WARP_ID] = local_val;
-  }
-  __syncthreads();
-
-  if ((WARP_ID == 0) && (LANE_ID < WARPS_PER_BLOCK)) {
-    uint32_t mask = __activemask();
-    local_val = smem[LANE_ID];
-#pragma unroll
-    for (uint32_t offset = WARPS_PER_BLOCK / 2; offset > 0; offset /= 2) {
-      local_val += shfl_down_sync_wrapper(mask, local_val, offset);
-    }
-    if (LANE_ID == 0) {
-      atomicAdd(out, static_cast<Dst>(local_val));
-    }
-  }
 }
 
 /** Finds the dynamic range [pos(MSB), pos(LSB)] of a set of numbers */

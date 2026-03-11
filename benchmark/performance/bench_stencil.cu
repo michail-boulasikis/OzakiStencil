@@ -597,7 +597,7 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
     result.slice_ms.push_back(ev_phase.elapsed_ms());
   }
 
-  // Set up ping-pong buffer (not part of slice timing — benchmark infrastructure)
+  // Set up ping-pong buffer (not part of slice timing -- benchmark infrastructure)
   CUDA_CHECK(cudaDeviceSynchronize());
   CUDA_CHECK(cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
   NVTX_POP();
@@ -756,7 +756,7 @@ PhaseTimings dispatch_bench_direct(int m, const ozi::Stencil<CoeffStorageType, D
   case 10:
     return do_bench.template operator()<10>();
   default:
-    throw std::invalid_argument("M=" + std::to_string(m) + " not supported (max 10)");
+    throw std::invalid_argument("M=" + std::to_string(m) + " is not a supported instantiation");
   }
 }
 
@@ -809,7 +809,7 @@ PhaseTimings dispatch_bench_conv(int m, const ozi::Stencil<CoeffStorageType, Dim
       case 10:
         return do_bench.template operator()<10>();
       default:
-        throw std::invalid_argument("M=" + std::to_string(m) + " not supported (max 9)");
+        throw std::invalid_argument("M=" + std::to_string(m) + " is not a supported instantiation");
       }
     }
   }

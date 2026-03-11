@@ -103,7 +103,7 @@ TYPED_TEST(SliceStencilTest, OffsetPreservation) {
   EXPECT_EQ(slices.slices[0].offsets, s.offsets);
 }
 
-// ---- Test 3: 2nd-order central FD — exact N=1 slice ------------------------
+// ---- Test 3: 2nd-order central FD -- exact N=1 slice ------------------------
 // Stencil {1, -2, 1} (a = 1): int_coeffs = {1, -2, 1}.
 // p_max = 1 (MSB of |2|), shift_0 = max(0, 1-6) = 0 -> slice_0 = {1, -2, 1}.
 TYPED_TEST(SliceStencilTest, SecondOrderFDSingleSlice) {
@@ -122,7 +122,7 @@ TYPED_TEST(SliceStencilTest, SecondOrderFDSingleSlice) {
   EXPECT_EQ(slices.slices[0].offsets, s.offsets);
 }
 
-// ---- Test 4: 4th-order central FD — exact N=1 slice ------------------------
+// ---- Test 4: 4th-order central FD -- exact N=1 slice ------------------------
 // Stencil {-1, 16, -30, 16, -1} (a = 1): int_coeffs fit in a single int8_t
 // slice because |30| < 64 < 127 (MSB at bit 4, shift_0 = max(0, 4-6) = 0).
 TYPED_TEST(SliceStencilTest, FourthOrderFDExactSingleSlice) {
@@ -148,10 +148,10 @@ TYPED_TEST(SliceStencilTest, FourthOrderFDExactSingleSlice) {
   EXPECT_EQ(slices.slices[0].offsets, s.offsets);
 }
 
-// ---- Test 5: Physical 4th-order FD with h² normalization -------------------
-// The canonical finite-difference approximation to d²u/dx² of order 4 is
+// ---- Test 5: Physical 4th-order FD with h^2 normalization -------------------
+// The canonical finite-difference approximation to d^2u/dx^2 of order 4 is
 //
-//   (d2u/dx2)_i ≈ (-u_{i-2} + 16 u_{i-1} - 30 u_i + 16 u_{i+1} - u_{i+2})
+//   (d2u/dx2)_i ~= (-u_{i-2} + 16 u_{i-1} - 30 u_i + 16 u_{i+1} - u_{i+2})
 //                  / (12 h2)
 //
 // Written as a stencil, its coefficients are
@@ -192,7 +192,7 @@ TYPED_TEST(SliceStencilTest, FourthOrderFDPhysicalNormalization) {
         << "Mismatch at coefficient index " << i;
 }
 
-// ---- Test 6: N=2 — coefficients that need two slices -----------------------
+// ---- Test 6: N=2 -- coefficients that need two slices -----------------------
 // Stencil {100, -511, 100} (a = 1):
 //   |511| = 0x1FF (9 bits) -> p_max = 8, shift_0 = max(0, 8-6) = 2
 //   Slice 0:  100>>2 = 25,  (-511)>>2 = -128 -> clamped -127,  100>>2 = 25

@@ -49,7 +49,6 @@ add_library(ozaki_cuda_common INTERFACE)
 target_link_libraries(ozaki_cuda_common INTERFACE ozaki_common ${CUDAToolkit_NVTX_LIBRARY} CUDA::cuda_driver CUDA::cudart)
 set_target_properties(ozaki_cuda_common PROPERTIES
   CUDA_ARCHITECTURES ${CUDA_COMPUTE_CAPABILITY}
-  #CUDA_SEPARABLE_COMPILATION ON
 )
 target_compile_options(ozaki_cuda_common INTERFACE
   $<$<COMPILE_LANGUAGE:CUDA>:--generate-line-info --expt-relaxed-constexpr --extended-lambda>
@@ -89,7 +88,6 @@ function(add_gpu_app name)
   target_link_libraries(${name} PRIVATE ozaki_cuda_common Boost::program_options)
   set_target_properties(${name} PROPERTIES
     CUDA_ARCHITECTURES ${CUDA_COMPUTE_CAPABILITY}
-    #CUDA_SEPARABLE_COMPILATION ON
   )
 endfunction()
 

@@ -30,7 +30,7 @@ static constexpr size_t STENCIL_V1_ALLOC_PAD = 16;
 // bytes via PRMT, and feeds them to __dp4a together with pre-packed coefficient
 // words read directly from __constant__ memory as uint32_t (LDC.U32).
 //
-// The coefficient packing (int8 → uint32) is done once on the host by
+// The coefficient packing (int8 -> uint32) is done once on the host by
 // StencilSlices::compute_packed_coeffs() and uploaded as part of the struct.
 // This eliminates the runtime byte-load + shift/OR packing that previously
 // dominated math-pipe time.
@@ -169,7 +169,7 @@ __device__ __forceinline__ AccType apply_stencil_vec(const uint32_t *__restrict_
  * positions.
  *
  * Uses int32 vectorized global loads (via detail::apply_stencil_vec) instead
- * of individual byte loads, reducing LDG instruction count by ~2-3× while
+ * of individual byte loads, reducing LDG instruction count by ~2-3x while
  * keeping the barrier-free, L1-cache-friendly structure.
  *
  * Stencil data is read from __constant__ memory (stencil_v1_cmem). Callers
@@ -185,7 +185,7 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
   using StencilType = Stencil<Target, Dims...>;
   using StencilSlices_type = ozi::StencilSlices<StencilType, M>;
 
-  // Access stencil data directly from constant memory — no struct copy
+  // Access stencil data directly from constant memory -- no struct copy
   const auto *s = reinterpret_cast<const StencilSlices_type *>(stencil_v1_cmem);
 
   const int32_t total_slices = desc->n_slices_input;
@@ -348,7 +348,7 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
       }
 
     } else {
-      // ========= BOUNDARY PATH: full N×N_bg multiplication with emulated_gain =========
+      // ========= BOUNDARY PATH: full NxN_bg multiplication with emulated_gain =========
       // Streaming formulation: process output positions from LSB to MSB,
       // fusing accumulation with carry propagation. Uses O(1) stack instead
       // of O(total_slices) for the boundary_result array.

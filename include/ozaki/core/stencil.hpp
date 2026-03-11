@@ -130,7 +130,7 @@ public:
     return coeffs[multi_to_linear(idx)];
   }
 
-  // these two functions overflow and yet they work. I need a smarter way to handle them.
+  // These overflow by design: the result modulo 2^64 is the correct coefficient.
   template <typename... Idx>
     requires(sizeof...(Idx) == dims)
   HD constexpr const T &cfrel(Idx... relidxs) const noexcept {

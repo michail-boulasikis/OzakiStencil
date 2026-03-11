@@ -189,9 +189,6 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
     } else {
       p.a_coeff = CoeffStorageType(1);
     }
-    fprintf(stderr, "Note: no exact integer basis found for stencil '%s'; "
-                    "using Ozaki slicing (M may be higher)\n",
-            spec.name.c_str());
   }
 
   // Step 2: determine the number of int8 slices needed.
@@ -243,9 +240,8 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
   }
 
   // Step 3: compute the scaling factor.
-  // The digit-domain stencil has per-iteration growth = 1 / effective_a,
-  // where effective_a = a_coeff * 2^shift0.
-  // total_integration_scale_factor_quad(scaling_factor, N, shifts) = 2^(7*shifts) / scaling_factor^N
+  // effective_a = a_coeff * 2^shift0, where shift0 accounts for the MSB right-shift.
+  // scaling_factor = 1 / effective_a; used by the runner to rescale reconstructed output.
   CoeffStorageType effective_a = p.a_coeff;
   {
     int32_t shift0 = std::max(0, p_max - (target_bits - 1) + p.extra_msb_shift);

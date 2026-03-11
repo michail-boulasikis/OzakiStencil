@@ -9,8 +9,7 @@
 #define CUDA_HOST __host__
 #define CUDA_FORCEINLINE __forceinline__
 
-// CUDA/CUBLAS/CUDNN Check macros — always enabled.
-#include <cublas_v2.h>
+// CUDA/CUDNN Check macros -- always enabled.
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cudnn.h>
@@ -21,15 +20,6 @@
     cudaError_t err = (call);                                                                                          \
     if (cudaSuccess != err) {                                                                                          \
       std::cerr << "[FATAL] CUDA: " << cudaGetErrorString(err) << " (code " << err << ") at " << __FILE__ << ":"       \
-                << __LINE__ << '\n';                                                                                   \
-      std::abort();                                                                                                    \
-    }                                                                                                                  \
-  } while (0)
-#define CUBLAS_CHECK(call)                                                                                             \
-  do {                                                                                                                 \
-    cublasStatus_t err = (call);                                                                                       \
-    if (err != CUBLAS_STATUS_SUCCESS) {                                                                                \
-      std::cerr << "[FATAL] CUBLAS: " << cublasGetStatusString(err) << " (code " << err << ") at " << __FILE__ << ":"  \
                 << __LINE__ << '\n';                                                                                   \
       std::abort();                                                                                                    \
     }                                                                                                                  \

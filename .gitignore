@@ -4,7 +4,7 @@ Testing/
 benchmark/ConvStencil/
 benchmark/DRStencil/
 benchmark/LoRAStencil/
-benchmark/TCstencil/
+benchmark/TCStencil/
 data/
 
 .cache/
@@ -17,3 +17,7 @@ CLAUDE.md
 *.dat
 *.nsys-rep
 *.ncu-rep
+*.png
+*.sqlite
+temp.txt
+docs/
