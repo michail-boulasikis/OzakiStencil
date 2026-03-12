@@ -37,10 +37,10 @@ This approach enables FP64-accurate (and beyond) stencil computations using the 
 sh run.sh -t
 
 # With a specific GPU architecture and high-precision scale factors
-sh run.sh -t -- -DCUDA_COMPUTE_CAPABILITY=120 -DOZAKI_USE_BOOST_MULTIPRECISION=ON
+sh run.sh -t -- -DCUDA_COMPUTE_CAPABILITY="80;90;100;120" -DOZAKI_USE_BOOST_MULTIPRECISION=ON
 ```
 
-Supported GPU architectures: `sm_80` (Ampere), `sm_86` (default), `sm_89` (Ada), `sm_90` (Hopper), `sm_120` (Blackwell).
+Supported GPU architectures: `sm_80` (Ampere), `sm_90` (Hopper), `sm_100` (Blackwell datacenter), `sm_120` (Blackwell consumer). Multiple architectures can be specified as a semicolon-separated list for fat binary builds.
 
 Run `sh run.sh -h` for all build options.
 

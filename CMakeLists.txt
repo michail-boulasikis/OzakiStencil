@@ -14,7 +14,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/lib")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # options
-set(CUDA_COMPUTE_CAPABILITY "86" CACHE STRING "The CUDA Compute capability to target.")
+set(CUDA_COMPUTE_CAPABILITY "80;90;100;120" CACHE STRING "Target CUDA compute capabilities (semicolon-separated list, e.g. '80;90;100;120').")
 option(BUILD_TESTING "Build the project's tests" ON)
 option(OZAKI_NVTX_EVENTS "Whether to record NVTX events" ON)
 option(OZAKI_USE_BOOST_MULTIPRECISION "Use Boost.Multiprecision for high-precision scale factor computation" OFF)
@@ -49,13 +49,20 @@ endif()
 add_library(ozaki_cuda_common INTERFACE)
 target_link_libraries(ozaki_cuda_common INTERFACE ozaki_common ${CUDAToolkit_NVTX_LIBRARY} CUDA::cuda_driver CUDA::cudart)
 set_target_properties(ozaki_cuda_common PROPERTIES
-  CUDA_ARCHITECTURES ${CUDA_COMPUTE_CAPABILITY}
+  CUDA_ARCHITECTURES "${CUDA_COMPUTE_CAPABILITY}"
 )
 target_compile_options(ozaki_cuda_common INTERFACE
   $<$<COMPILE_LANGUAGE:CUDA>:--generate-line-info --expt-relaxed-constexpr --extended-lambda>
 )
 
-target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_CUDA_ARCH=${CUDA_COMPUTE_CAPABILITY})
+# OZAKI_CUDA_ARCH = minimum target arch. Host-side guards (e.g. __float128
+# AccumulatorType) use this so that features are only enabled when ALL targets
+# support them.  Fat binaries require every arch to compile every kernel
+# instantiation, so the minimum is the correct conservative choice.
+set(CUDA_ARCH_LIST ${CUDA_COMPUTE_CAPABILITY})
+list(SORT CUDA_ARCH_LIST COMPARE NATURAL ORDER ASCENDING)
+list(GET CUDA_ARCH_LIST 0 OZAKI_MIN_CUDA_ARCH)
+target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_CUDA_ARCH=${OZAKI_MIN_CUDA_ARCH})
 
 if(OZAKI_NVTX_EVENTS)
   target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_NVTX_EVENTS)
@@ -81,7 +88,7 @@ function(add_gpu_lib name)
   add_library(${name} ${ARGN})
   target_link_libraries(${name} PUBLIC ozaki_cuda_common)
   set_target_properties(${name} PROPERTIES
-    CUDA_ARCHITECTURES ${CUDA_COMPUTE_CAPABILITY}
+    CUDA_ARCHITECTURES "${CUDA_COMPUTE_CAPABILITY}"
     CUDA_SEPARABLE_COMPILATION ON
   )
 endfunction()
@@ -90,7 +97,7 @@ function(add_gpu_app name)
   add_executable(${name} ${ARGN})
   target_link_libraries(${name} PRIVATE ozaki_cuda_common Boost::program_options)
   set_target_properties(${name} PROPERTIES
-    CUDA_ARCHITECTURES ${CUDA_COMPUTE_CAPABILITY}
+    CUDA_ARCHITECTURES "${CUDA_COMPUTE_CAPABILITY}"
   )
 endfunction()
 
