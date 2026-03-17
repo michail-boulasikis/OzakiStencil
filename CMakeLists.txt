@@ -14,7 +14,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/lib")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # options
-set(CUDA_COMPUTE_CAPABILITY "80;90;100;120" CACHE STRING "Target CUDA compute capabilities (semicolon-separated list, e.g. '80;90;100;120').")
+set(CUDA_COMPUTE_CAPABILITY "90a;100;120" CACHE STRING "Target CUDA compute capabilities (semicolon-separated list, e.g. '90a;100;120').")
 option(BUILD_TESTING "Build the project's tests" ON)
 option(OZAKI_NVTX_EVENTS "Whether to record NVTX events" ON)
 option(OZAKI_USE_BOOST_MULTIPRECISION "Use Boost.Multiprecision for high-precision scale factor computation" OFF)
@@ -62,7 +62,10 @@ target_compile_options(ozaki_cuda_common INTERFACE
 set(CUDA_ARCH_LIST ${CUDA_COMPUTE_CAPABILITY})
 list(SORT CUDA_ARCH_LIST COMPARE NATURAL ORDER ASCENDING)
 list(GET CUDA_ARCH_LIST 0 OZAKI_MIN_CUDA_ARCH)
-target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_CUDA_ARCH=${OZAKI_MIN_CUDA_ARCH})
+# Strip architecture suffixes (e.g. "90a" -> "90") so the define is a plain integer
+# usable in #if preprocessor expressions.
+string(REGEX REPLACE "[a-zA-Z]" "" OZAKI_MIN_CUDA_ARCH_NUM "${OZAKI_MIN_CUDA_ARCH}")
+target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_CUDA_ARCH=${OZAKI_MIN_CUDA_ARCH_NUM})
 
 if(OZAKI_NVTX_EVENTS)
   target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_NVTX_EVENTS)

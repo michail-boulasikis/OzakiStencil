@@ -69,9 +69,9 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    // Load reference tensor at highest available precision
-    auto ref = read_tensor<HIGH_PREC>(reference_file);
-    auto result = read_tensor<HIGH_PREC>(result_file);
+    // Load tensors at highest available precision, widening if stored type differs
+    auto ref = read_tensor_as<HIGH_PREC>(reference_file);
+    auto result = read_tensor_as<HIGH_PREC>(result_file);
     if (scaled) {
       auto scale = absmax(ref);
       div_tensors(ref, scale);

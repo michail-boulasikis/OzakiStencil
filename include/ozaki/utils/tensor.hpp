@@ -65,6 +65,53 @@ template <typename T> Tensor<T> read_tensor(const std::string &filepath) {
   return {shape, data};
 }
 
+// Read a tensor file and widen/narrow its elements to type T regardless of the stored type.
+template <typename T> Tensor<T> read_tensor_as(const std::string &filepath) {
+  std::ifstream f(filepath, std::ios::in | std::ios::binary);
+  if (!f.is_open())
+    throw std::runtime_error("Could not open file at " + filepath + ".");
+
+  size_t n_dims;
+  f.read(reinterpret_cast<char *>(&n_dims), sizeof(size_t));
+
+  size_t type_id;
+  f.read(reinterpret_cast<char *>(&type_id), sizeof(size_t));
+
+  std::vector<size_t> shape(n_dims);
+  f.read(reinterpret_cast<char *>(shape.data()), n_dims * sizeof(size_t));
+
+  size_t n_elems = 1;
+  for (const auto &dim : shape)
+    n_elems *= dim;
+
+  // If the stored type matches T, read directly.
+  if (type_id == get_type_id<T>()) {
+    std::vector<T> data(n_elems);
+    f.read(reinterpret_cast<char *>(data.data()), n_elems * sizeof(T));
+    return {shape, data};
+  }
+
+  // Otherwise, read raw bytes and convert element-by-element.
+  std::vector<T> data(n_elems);
+  auto read_and_convert = [&]<typename StoredT>() {
+    std::vector<StoredT> raw(n_elems);
+    f.read(reinterpret_cast<char *>(raw.data()), n_elems * sizeof(StoredT));
+    for (size_t i = 0; i < n_elems; ++i)
+      data[i] = static_cast<T>(raw[i]);
+  };
+
+  switch (type_id) {
+  case 0: read_and_convert.template operator()<float>(); break;
+  case 1: read_and_convert.template operator()<double>(); break;
+  case 2: read_and_convert.template operator()<long double>(); break;
+#ifdef OZAKI_HAVE_FLOAT128
+  case 3: read_and_convert.template operator()<__float128>(); break;
+#endif
+  default: throw std::runtime_error("Unknown type_id " + std::to_string(type_id) + " in " + filepath);
+  }
+  return {shape, data};
+}
+
 template <typename T> void write_tensor(const std::string &filepath, const Tensor<T> &tensor) {
   std::ofstream f(filepath, std::ios::out | std::ios::binary);
   if (!f.is_open()) {

@@ -6,6 +6,7 @@ benchmark/DRStencil/
 benchmark/LoRAStencil/
 benchmark/TCStencil/
 data/
+temp/
 
 .cache/
 

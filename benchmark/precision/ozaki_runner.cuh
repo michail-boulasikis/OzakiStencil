@@ -360,10 +360,16 @@ public:
 
     ozigpu::upload_slice_phys_lut(active_slices);
 
+    ozigpu::convstencil::TmaDescriptors tma;
+    size_t total_height = static_cast<size_t>(num_slices_total) * height;
+    bool tma_ok = ozigpu::convstencil::create_tma_descriptors(tma, d_slices_1, d_slices_2, total_height, ldm);
+    if (!tma_ok)
+      throw std::runtime_error("cvstencil requires ldm >= 128 and ldm % 16 == 0");
+
     NVTX_PUSH("Integration Loop");
     for (int32_t t = 0; t < n_iterations; ++t) {
       ozigpu::cvstencil<ozigpu::OzakiFP_Int8<Real>, M>
-          <<<grid, block>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary_);
+          <<<grid, block>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary_, tma.d_main[0], tma.d_extra[0]);
 
       if (t < n_iterations - 1) {
         int32_t min_shifts_now;
@@ -378,9 +384,12 @@ public:
       }
 
       std::swap(d_slices_1, d_slices_2);
+      tma.swap();
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     NVTX_POP();
+
+    tma.free();
 
     // Mend slices back to floating point and apply scale factor
     const int32_t nThreadsMend = std::min(static_cast<size_t>(RDC_THREADS), n_elems / 4);

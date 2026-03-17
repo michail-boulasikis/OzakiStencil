@@ -7,7 +7,9 @@
 
 #include <climits>
 #include <concepts>
+#include <cstdint>
 #include <cstring>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <type_traits>
 
@@ -33,27 +35,37 @@ constexpr int32_t TILE_SIZE_COL = MMA_M * MMA_N;                 // = 128
 constexpr int32_t DATA_TILE_SIZE_ROW = TILE_SIZE_ROW + 2 * HALO; // = 38
 constexpr int32_t DATA_TILE_SIZE_COL = TILE_SIZE_COL + 2 * HALO; // = 134
 
-// Stencil2row shared memory dimensions (row-major: K is fast dim, XOR-swizzled)
-// SMEM_ROWS = number of column groups = floor(DATA_TILE_SIZE_COL / STRIDE) = MMA_M = 16
-// SMEM_K_EXTENT = K-extent covering all output rows' stencil windows + MMA tile padding
-// K_STRIDE = physical row stride in bytes (must be a multiple of 4 and K_STRIDE/4 % 32 != 0 for swizzle)
-constexpr int32_t SMEM_ROWS = DATA_TILE_SIZE_COL / STRIDE;                        // = 16
-constexpr int32_t K_STRIDE = 352;                                                 // 352/4=88, 88%32=24
-constexpr int32_t SMEM_K_EXTENT = (TILE_SIZE_ROW - 1) * STRIDE + MMA_NUM * MMA_K; // = 312
-
 constexpr int32_t COEFF_LD = MMA_N;                      // = 8 (weight matrix leading dim)
-constexpr int32_t WT_SIZE = MMA_NUM * MMA_K * COEFF_LD;  // = 512 (per-tessellation weight size in bytes)
+constexpr int32_t WT_SIZE = MMA_NUM * MMA_K * COEFF_LD;  // per-tessellation weight size in bytes (512 bytes)
 constexpr int32_t PACKED_WT_WORDS = MMA_NUM * WARP_SIZE; // = 128 (uint32 words per tessellation per slice)
 static_assert(PACKED_WT_WORDS * 4 == WT_SIZE, "Packed weight size must match WT_SIZE in bytes");
-constexpr int32_t ACC_TILE_SIZE = MMA_M * MMA_N;                // = 128 (elements per MMA tile)
-constexpr int32_t ELEMS_PER_THREAD = ACC_TILE_SIZE / WARP_SIZE; // = 4
-constexpr int32_t MAX_M = 12;                                   // max supported stencil slices
-constexpr int32_t MAX_DATA_SLICES = 24;                         // matches StencilSlices::MAX_DATA_SLICES
+constexpr int32_t ACC_TILE_SIZE = MMA_M * MMA_N; // = 128 (elements per MMA tile)
+constexpr int32_t ELEMS_PER_THREAD = ACC_TILE_SIZE / WARP_SIZE;
+constexpr int32_t MAX_M = 12;           // max supported stencil slices
+constexpr int32_t MAX_DATA_SLICES = 24; // matches StencilSlices::MAX_DATA_SLICES
 
-// Shared memory sink index: invalid tessellation positions write here instead of
-// corrupting real data. Sits at the last byte of the sm_data allocation, which is
-// never read by the MMA. Zeroed before each slice iteration.
-constexpr int32_t SMEM_SINK = SMEM_ROWS * K_STRIDE - 1;
+// TMA row-major layout constants (Section 5.4 of TMA.md).
+// Each tessellation stores [128 bytes/row x (DTR+1) rows] in plain row-major order.
+// The +1 row absorbs MMA overreads at K positions with zero weights (Section 5.6).
+constexpr int32_t SMEM_ROW_BYTES = 128;                               // = TILE_SIZE_COL
+constexpr int32_t SMEM_ROWS_TMA = DATA_TILE_SIZE_ROW + 1;             // 39 for NUM_WARPS=4
+constexpr int32_t SMEM_TESS_BYTES = SMEM_ROW_BYTES * SMEM_ROWS_TMA;   // 4,992 B per tess
+constexpr int32_t TMA_TX_BYTES = SMEM_ROW_BYTES * DATA_TILE_SIZE_ROW; // 4,864 B per TMA call
+
+// TMA split-buffer constants: cp.async.bulk.tensor.2d requires the dim0 (column)
+// coordinate to be 16-byte aligned for SWIZZLE_NONE. Since data_col_start includes
+// a HALO offset that is not 16-aligned, we round down to the nearest 16-byte boundary
+// for the main 128-byte load and issue a supplementary 16-byte load at
+// main_aligned + 128 to cover the tail columns past the main buffer.
+// A-fragment reads use byte-level access when the halo offset is not 4-byte-aligned
+// (upper tessellation, halo_off=13) to avoid misaligned uint32_t loads.
+constexpr int32_t TMA_EXTRA_TILE = 16; // extra tile width (bytes)
+// Pad to 128-byte multiple so sm_extra[1] stays 128-byte aligned (TMA requirement).
+constexpr int32_t SMEM_EXTRA_BYTES = ((TMA_EXTRA_TILE * SMEM_ROWS_TMA + 127) / 128) * 128; // 640 B per tess
+constexpr int32_t TMA_EXTRA_TX_BYTES = TMA_EXTRA_TILE * DATA_TILE_SIZE_ROW;                // 608 B per TMA call
+// Compile-time halo offsets: how far data_col_start is past the 16-aligned TMA coord.
+constexpr int32_t UPPER_HALO_OFF = (-HALO) & 15;               // = 13 for HALO=3
+constexpr int32_t LOWER_HALO_OFF = (STENCIL_SIDE - HALO) & 15; // = 4 for HALO=3
 
 // Chunking constants: the 8 output rows (MMA_N) per warp are split into chunks.
 // One chunk's accumulator state lives in registers; the rest are swapped in/out
@@ -68,35 +80,164 @@ struct BoundaryGainData {
   int32_t n_slices;
 };
 
-// ========== Shared memory index computation ==========
-// Compute the swizzled sm_data index for a data element at (data_row, data_col)
-// within the data tile. Uses row-major layout with Swizzle<3,0,0> (word-level XOR).
-// Returns SMEM_SINK for positions outside the valid tessellation range.
-// Valid only for STRIDE = 8 (power of 2); other stencil sizes need integer division.
+// Create a 2D TMA tensor descriptor for the stacked int8 slice buffer.
+// globalDim = [ldm, total_height], boxDim = [tile_width, DTR].
+// Requires ldm % 16 == 0. Uses SWIZZLE_NONE with FILL_NONE.
+inline CUresult create_tma_descriptor_impl(CUtensorMap *out, const int8_t *base_ptr, size_t total_height, size_t ldm,
+                                           uint32_t tile_width) {
+  assert(ldm % 16 == 0 && "TMA requires ldm to be a multiple of 16");
+  assert(reinterpret_cast<uintptr_t>(base_ptr) % 16 == 0 && "TMA requires 16-byte-aligned base pointer");
+  assert(tile_width % 16 == 0 && tile_width <= 128 && "TMA tile width must be a multiple of 16 and <= 128");
 
-/** Upper tessellation (sm_data[0]): each STRIDE-wide column group maps the upper
- *  portion of the stencil's column overlap pattern. */
-__device__ __forceinline__ int32_t smem_index_upper(int32_t data_row, int32_t data_col) {
-  bool valid = (((data_col + 1) & (STRIDE - 1)) != 0) && (data_col < DATA_TILE_SIZE_COL - 2 * HALO - 1);
-  int32_t sm_row = data_col >> 3;
-  int32_t sm_col = STRIDE * data_row + (data_col & (STRIDE - 1));
-  int32_t word = sm_col >> 2;
-  int32_t byte_in_word = sm_col & 3;
-  int32_t swizzled_word = word ^ (sm_row & 7);
-  return valid ? (sm_row * K_STRIDE + swizzled_word * 4 + byte_in_word) : SMEM_SINK;
+  uint64_t gDim[2] = {ldm, total_height};
+  uint64_t gStrides[1] = {ldm};
+  uint32_t tileDim[2] = {tile_width, static_cast<uint32_t>(DATA_TILE_SIZE_ROW)};
+  uint32_t elemStrides[2] = {1, 1};
+  return cuTensorMapEncodeTiled(out, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
+                                const_cast<void *>(static_cast<const void *>(base_ptr)), gDim, gStrides, tileDim,
+                                elemStrides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+                                CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
-/** Lower tessellation (sm_data[1]): each STRIDE-wide column group maps the lower
- *  portion of the stencil's column overlap pattern, shifted by STENCIL_SIDE. */
-__device__ __forceinline__ int32_t smem_index_lower(int32_t data_row, int32_t data_col) {
-  bool valid = (((data_col + 2) & (STRIDE - 1)) != 0) && (data_col > 2 * HALO);
-  int32_t col_shifted = data_col - STENCIL_SIDE;
-  int32_t sm_row = col_shifted >> 3;
-  int32_t sm_col = STRIDE * data_row + (col_shifted & (STRIDE - 1));
-  int32_t word = sm_col >> 2;
-  int32_t byte_in_word = sm_col & 3;
-  int32_t swizzled_word = word ^ (sm_row & 7);
-  return valid ? (sm_row * K_STRIDE + swizzled_word * 4 + byte_in_word) : SMEM_SINK;
+// Ping-pong pair of main + extra TMA descriptors (device pointers).
+struct TmaDescriptors {
+  CUtensorMap *d_main[2] = {};
+  CUtensorMap *d_extra[2] = {};
+
+  void swap() {
+    std::swap(d_main[0], d_main[1]);
+    std::swap(d_extra[0], d_extra[1]);
+  }
+
+  void free() {
+    for (auto *&p : d_main) {
+      cudaFree(p);
+      p = nullptr;
+    }
+    for (auto *&p : d_extra) {
+      cudaFree(p);
+      p = nullptr;
+    }
+  }
+};
+
+// Create main (128B) + extra (16B) TMA descriptors for two ping-pong slice buffers,
+// allocate device copies, and upload. Returns true on success; callers must check
+// the return value since the software fallback has been removed.
+inline bool create_tma_descriptors(TmaDescriptors &out, const int8_t *buf_a, const int8_t *buf_b, size_t total_height,
+                                   size_t ldm) {
+  if (ldm % 16 != 0 || ldm < SMEM_ROW_BYTES)
+    return false;
+  CUtensorMap h[4]{};
+  if (create_tma_descriptor_impl(&h[0], buf_a, total_height, ldm, SMEM_ROW_BYTES) != CUDA_SUCCESS ||
+      create_tma_descriptor_impl(&h[1], buf_b, total_height, ldm, SMEM_ROW_BYTES) != CUDA_SUCCESS ||
+      create_tma_descriptor_impl(&h[2], buf_a, total_height, ldm, TMA_EXTRA_TILE) != CUDA_SUCCESS ||
+      create_tma_descriptor_impl(&h[3], buf_b, total_height, ldm, TMA_EXTRA_TILE) != CUDA_SUCCESS)
+    return false;
+  cudaMalloc(&out.d_main[0], sizeof(CUtensorMap));
+  cudaMalloc(&out.d_main[1], sizeof(CUtensorMap));
+  cudaMalloc(&out.d_extra[0], sizeof(CUtensorMap));
+  cudaMalloc(&out.d_extra[1], sizeof(CUtensorMap));
+  cudaMemcpy(out.d_main[0], &h[0], sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+  cudaMemcpy(out.d_main[1], &h[1], sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+  cudaMemcpy(out.d_extra[0], &h[2], sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+  cudaMemcpy(out.d_extra[1], &h[3], sizeof(CUtensorMap), cudaMemcpyHostToDevice);
+  return true;
+}
+
+__device__ __forceinline__ void shmem_barrier_init(uint64_t *bar, uint32_t arrive_count) {
+  const uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(smem_addr), "r"(arrive_count));
+}
+
+__device__ __forceinline__ void shmem_barrier_arrive_expect_tx(uint64_t *bar, uint32_t tx_count) {
+  const uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(smem_addr), "r"(tx_count));
+}
+
+__device__ __forceinline__ void shmem_barrier_spin(uint64_t *bar, uint32_t phase_bit) {
+  const uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  asm volatile("{\n\t"
+               ".reg .pred P_%=;\n\t"
+               "WAIT_%=:\n\t"
+               "mbarrier.try_wait.parity.shared::cta.b64 P_%=, [%0], %1;\n\t"
+               "@!P_%=  bra WAIT_%=;\n\t"
+               "}\n\t" ::"r"(smem_addr),
+               "r"(phase_bit)
+               : "memory");
+}
+
+__device__ __forceinline__ void tma_load_tile_2d(void *smem_dst, const void *tensor_map, int32_t col, int32_t row,
+                                                 uint64_t *bar) {
+  uint32_t smem_dst_addr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_dst));
+  uint32_t bar_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+  uint64_t tmap_addr = reinterpret_cast<uint64_t>(tensor_map);
+
+  asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
+               " [%0], [%1, {%2, %3}], [%4];" ::"r"(smem_dst_addr),
+               "l"(tmap_addr),     // 64-bit address of CUtensorMap
+               "r"(col), "r"(row), // {dim0_coord, dim1_coord}
+               "r"(bar_addr)
+               : "memory");
+}
+
+/** Load A-fragment from split TMA buffers (main 128B + extra 16B per row).
+ *
+ *  The main TMA loads at a 16-byte-aligned column (floor16(data_col_start)),
+ *  so the useful data starts at byte HALO_OFF within each 128-byte smem row.
+ *  The extra buffer covers the tail beyond byte 128 of the main buffer.
+ *
+ *  When HALO_OFF is 4-byte-aligned (lower tessellation, HALO_OFF=4), direct
+ *  uint32_t reads are used. When HALO_OFF is not 4-byte-aligned (upper
+ *  tessellation, HALO_OFF=13), two bracketing aligned uint32_t loads are
+ *  combined via __byte_perm (PTX prmt) to extract the misaligned 4 bytes.
+ *  The sm_main/sm_extra boundary is resolved per-address with a conditional
+ *  that compiles to a SELP (no branch divergence within the warp).
+ */
+template <int32_t HALO_OFF>
+__device__ __forceinline__ void load_a_frag_tma_split(uint32_t (&A)[2], const int8_t *sm_main, const int8_t *sm_extra,
+                                                      int32_t k_start, int32_t lane_id) {
+  const int32_t groupID = lane_id >> 2;
+  const int32_t tIG = lane_id & 3;
+  const int32_t col_offset = (tIG & 1) * 4;
+  const int32_t row_main = ((k_start >> 3) + (tIG >> 1)) * SMEM_ROW_BYTES;
+  const int32_t row_extra = ((k_start >> 3) + (tIG >> 1)) * TMA_EXTRA_TILE;
+
+#pragma unroll
+  for (int32_t r = 0; r < 2; ++r) {
+    const int32_t m = groupID + r * 8;
+    const int32_t eff_col = HALO_OFF + m * 8 + col_offset;
+
+    if constexpr ((HALO_OFF & 3) == 0) {
+      // Aligned path: HALO_OFF is 4-byte-aligned, so eff_col is always 4-byte-aligned.
+      if (eff_col < SMEM_ROW_BYTES) {
+        A[r] = *reinterpret_cast<const uint32_t *>(sm_main + row_main + eff_col);
+      } else {
+        A[r] = *reinterpret_cast<const uint32_t *>(sm_extra + row_extra + (eff_col - SMEM_ROW_BYTES));
+      }
+    } else {
+      // Misaligned path: eff_col % 4 == (HALO_OFF & 3), a non-zero constant.
+      // Load two aligned uint32 words that bracket the desired 4 bytes,
+      // then use __byte_perm to extract the correctly shifted result.
+      // This replaces 4 byte-level loads with 2 aligned word loads + 1 prmt.
+      constexpr int32_t MISALIGN = HALO_OFF & 3;
+      constexpr uint32_t PRMT_SEL = MISALIGN | ((MISALIGN + 1) << 4) | ((MISALIGN + 2) << 8) | ((MISALIGN + 3) << 12);
+
+      const int32_t aligned = eff_col - MISALIGN; // 4-byte-aligned floor of eff_col
+      const int32_t aligned_next = aligned + 4;
+
+      // Each aligned address resolves independently to sm_main or sm_extra.
+      const uint32_t w0 = (aligned < SMEM_ROW_BYTES)
+                              ? *reinterpret_cast<const uint32_t *>(sm_main + row_main + aligned)
+                              : *reinterpret_cast<const uint32_t *>(sm_extra + row_extra + (aligned - SMEM_ROW_BYTES));
+      const uint32_t w1 =
+          (aligned_next < SMEM_ROW_BYTES)
+              ? *reinterpret_cast<const uint32_t *>(sm_main + row_main + aligned_next)
+              : *reinterpret_cast<const uint32_t *>(sm_extra + row_extra + (aligned_next - SMEM_ROW_BYTES));
+
+      A[r] = __byte_perm(w0, w1, PRMT_SEL);
+    }
+  }
 }
 
 // ========== Weight matrix builder for M stencil slices ==========
@@ -172,27 +313,6 @@ template <int32_t M> inline void build_param_matrix(int8_t *param_out, const int
 
 // ========== Inline PTX helpers ==========
 
-/** Load A-fragment (m16n8k16) from swizzled row-major sm_data using 2x LDS.32.
- *  Zero bank conflicts with Swizzle<3,0,0> and K_STRIDE where K_STRIDE/4 % 32 == 8.
- *
- *  @param A         Output: 2 registers (one per m8-row group)
- *  @param sm_base   Base pointer to sm_data[tessellation]
- *  @param k_start   Starting K-byte offset (must be a multiple of 4)
- *  @param lane_id   Thread lane within warp
- */
-__device__ __forceinline__ void load_a_frag_swizzled(uint32_t (&A)[2], const int8_t *sm_base, int32_t k_start,
-                                                     int32_t lane_id) {
-  const int32_t groupID = lane_id >> 2;
-  const int32_t tIG = lane_id & 3;
-  const int32_t base_word = (k_start >> 2) + tIG;
-#pragma unroll
-  for (int32_t r = 0; r < 2; ++r) {
-    int32_t m = groupID + r * 8;
-    int32_t swizzled_word = base_word ^ (m & 7);
-    A[r] = *reinterpret_cast<const uint32_t *>(sm_base + m * K_STRIDE + swizzled_word * 4);
-  }
-}
-
 /** Compute the output column for accumulator element `elem` held by the given lane.
  *  Based on the m16n8k16 accumulator fragment mapping:
  *    MMA tile row: groupID + 8 * (elem >> 1)
@@ -262,11 +382,11 @@ using namespace ozi;
  */
 template <OzakiPair O, int32_t M = 1>
   requires(std::is_same_v<typename O::target_type, int8_t>) && (M >= 1)
-__global__ __launch_bounds__(128) void cvstencil(typename O::target_type *__restrict__ out,
-                                                 const typename O::target_type *__restrict__ in,
-                                                 const typename O::target_type *__restrict__ weight, const size_t ldm,
-                                                 const size_t height, OzakiDescriptor<O> *__restrict__ desc,
-                                                 __grid_constant__ const convstencil::BoundaryGainData boundary) {
+__global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE) void cvstencil(
+    typename O::target_type *__restrict__ out, const typename O::target_type *__restrict__ in,
+    const typename O::target_type *__restrict__ weight, const size_t ldm, const size_t height,
+    OzakiDescriptor<O> *__restrict__ desc, __grid_constant__ const convstencil::BoundaryGainData boundary,
+    const CUtensorMap *__restrict__ d_t_map, const CUtensorMap *__restrict__ d_t_map_extra) {
   asm volatile(".pragma \"enable_smem_spilling\";");
   using namespace convstencil;
   using Target = typename O::target_type;
@@ -287,7 +407,12 @@ __global__ __launch_bounds__(128) void cvstencil(typename O::target_type *__rest
   const size_t slice_stride = ldm * height;
 
   // ======================== Shared memory ========================
-  __shared__ __align__(16) int8_t sm_data[2][SMEM_ROWS * K_STRIDE];
+  // TMA row-major layout: main buffer 128 bytes/row, extra buffer 16 bytes/row.
+  // DTR+1 rows per tessellation (extra row absorbs MMA overreads at zero-weight K).
+  __shared__ __align__(128) int8_t sm_data[2][SMEM_TESS_BYTES];
+  __shared__ __align__(128) int8_t sm_extra[2][SMEM_EXTRA_BYTES];
+  __shared__ __align__(8) uint64_t tma_mbar;
+  uint32_t phase_bit = 0;
   __shared__ __align__(16) uint32_t sm_weight[M * 2 * PACKED_WT_WORDS];
   __shared__ int32_t sm_overflow[NUM_WARPS];
 
@@ -309,16 +434,8 @@ __global__ __launch_bounds__(128) void cvstencil(typename O::target_type *__rest
   constexpr int32_t LANES_PER_ROW = MMA_N;              // = 8
   constexpr int32_t GROUPS = WARP_SIZE / LANES_PER_ROW; // = 4
 
-  // Zero-initialize sm_data. Padded regions (K_STRIDE gap, STRIDE-1 padding) are
-  // read by MMA but never written by smem_index_upper/lower; the matching weight
-  // entries are zero, so zero padding is both safe and required.
-  static_assert(2 * SMEM_ROWS * K_STRIDE % 4 == 0);
-  {
-    int32_t *sm_flat = reinterpret_cast<int32_t *>(sm_data);
-    constexpr int32_t SM_WORDS = 2 * SMEM_ROWS * K_STRIDE / 4;
-    for (int32_t idx = tid; idx < SM_WORDS; idx += blockDim.x)
-      sm_flat[idx] = 0;
-  }
+  if (tid == 0)
+    shmem_barrier_init(&tma_mbar, 1); // 1 arrival = thread 0 dispatches TMA
 
   // Load weight matrices from global to shared memory (eliminates repeated
   // global reads during the MMA inner loop).
@@ -329,6 +446,8 @@ __global__ __launch_bounds__(128) void cvstencil(typename O::target_type *__rest
       sm_weight[idx] = wt_src[idx];
   }
 
+  __syncthreads(); // Ensure weights loaded and mbarrier initialized before main loop
+
   // ====================================================================
   // ROTATED CHUNK PROCESSING
   //
@@ -338,99 +457,36 @@ __global__ __launch_bounds__(128) void cvstencil(typename O::target_type *__rest
   // ====================================================================
 
   // Active chunk state (persists in registers)
-  int32_t acc_reg[M][ROWS_PER_CHUNK][ELEMS_PER_THREAD];
-  int32_t carry_reg[ROWS_PER_CHUNK][ELEMS_PER_THREAD];
+  int32_t acc_reg[M][ROWS_PER_CHUNK][ELEMS_PER_THREAD] = {0};
+  int32_t carry_reg[ROWS_PER_CHUNK][ELEMS_PER_THREAD] = {0};
 
   // Inactive chunk state (in local memory, one buffer per inactive chunk)
-  int32_t saved_acc[NUM_CHUNKS - 1][M][ROWS_PER_CHUNK][ELEMS_PER_THREAD];
-  int32_t saved_carry[NUM_CHUNKS - 1][ROWS_PER_CHUNK][ELEMS_PER_THREAD];
+  int32_t saved_acc[NUM_CHUNKS - 1][M][ROWS_PER_CHUNK][ELEMS_PER_THREAD] = {0};
+  int32_t saved_carry[NUM_CHUNKS - 1][ROWS_PER_CHUNK][ELEMS_PER_THREAD] = {0};
 
   int32_t active_chunk = 0;
-
-  // Zero-initialize all chunk state
-#pragma unroll
-  for (int32_t ws = 0; ws < M; ++ws)
-#pragma unroll
-    for (int32_t r = 0; r < ROWS_PER_CHUNK; ++r)
-#pragma unroll
-      for (int32_t elem = 0; elem < ELEMS_PER_THREAD; ++elem)
-        acc_reg[ws][r][elem] = 0;
-
-#pragma unroll
-  for (int32_t r = 0; r < ROWS_PER_CHUNK; ++r)
-#pragma unroll
-    for (int32_t elem = 0; elem < ELEMS_PER_THREAD; ++elem)
-      carry_reg[r][elem] = 0;
-
-#pragma unroll
-  for (int32_t buf = 0; buf < NUM_CHUNKS - 1; ++buf)
-#pragma unroll
-    for (int32_t ws = 0; ws < M; ++ws)
-#pragma unroll
-      for (int32_t r = 0; r < ROWS_PER_CHUNK; ++r)
-#pragma unroll
-        for (int32_t elem = 0; elem < ELEMS_PER_THREAD; ++elem)
-          saved_acc[buf][ws][r][elem] = 0;
-
-#pragma unroll
-  for (int32_t buf = 0; buf < NUM_CHUNKS - 1; ++buf)
-#pragma unroll
-    for (int32_t r = 0; r < ROWS_PER_CHUNK; ++r)
-#pragma unroll
-      for (int32_t elem = 0; elem < ELEMS_PER_THREAD; ++elem)
-        saved_carry[buf][r][elem] = 0;
 
   // ---- Main data-slice loop (outer: load sm_data once per slice) ----
   for (int32_t slice_idx = total_slices - 1; slice_idx >= 0; --slice_idx) {
     const int32_t physical_slice = phys_lut[slice_idx];
     const bool skip_slice = (slice_idx == 0 && just_shifted);
 
-    // Load input data into shared memory (stencil2row transform)
+    // Load input data into shared memory via TMA.
+    // OOB fill (FILL_NONE) zero-fills boundary tiles, so no tile_in_bounds guard needed.
     if (!skip_slice) {
-      const Target *in_slice = in + slice_stride * physical_slice;
-
-      if (tile_in_bounds) {
-        // Fast path: sector-aligned loads, no bounds checking.
-        // data_col_start is offset by HALO=3 from a tile boundary; aligning
-        // the load pointer down to a 32-byte boundary avoids split sectors.
-        for (int32_t row = 0; row < DATA_TILE_SIZE_ROW; ++row) {
-          const Target *row_ptr = in_slice + (data_row_start + row) * ldm + data_col_start;
-          const int32_t pad = reinterpret_cast<uintptr_t>(row_ptr) & 31;
-          const Target *aligned_ptr = row_ptr - pad;
-          const int32_t total = DATA_TILE_SIZE_COL + pad;
-
-          for (int32_t pos = tid; pos < total; pos += blockDim.x) {
-            int8_t val = aligned_ptr[pos];
-            int32_t col = pos - pad;
-            if (col >= 0) {
-              sm_data[0][smem_index_upper(row, col)] = val;
-              sm_data[1][smem_index_lower(row, col)] = val;
-            }
-          }
-        }
-      } else {
-        // Slow path: bounds-checked element-by-element
-        for (int32_t row = 0; row < DATA_TILE_SIZE_ROW; ++row) {
-          int32_t global_row = data_row_start + row;
-          for (int32_t col = tid; col < DATA_TILE_SIZE_COL; col += blockDim.x) {
-            int32_t global_col = data_col_start + col;
-            int8_t val = 0;
-            if (global_row >= 0 && global_row < static_cast<int32_t>(height) && global_col >= 0 &&
-                global_col < static_cast<int32_t>(ldm)) {
-              val = in_slice[global_row * ldm + global_col];
-            }
-            sm_data[0][smem_index_upper(row, col)] = val;
-            sm_data[1][smem_index_lower(row, col)] = val;
-          }
-        }
-      }
-
+      const int32_t aligned_upper = data_col_start & ~15;
+      const int32_t aligned_lower = (data_col_start + STENCIL_SIDE) & ~15;
       if (tid == 0) {
-        sm_data[0][SMEM_SINK] = 0;
-        sm_data[1][SMEM_SINK] = 0;
+        shmem_barrier_arrive_expect_tx(&tma_mbar, 2 * TMA_TX_BYTES + 2 * TMA_EXTRA_TX_BYTES);
+        const int32_t tma_row = physical_slice * static_cast<int32_t>(height) + data_row_start;
+        tma_load_tile_2d(sm_data[0], d_t_map, aligned_upper, tma_row, &tma_mbar);
+        tma_load_tile_2d(sm_data[1], d_t_map, aligned_lower, tma_row, &tma_mbar);
+        tma_load_tile_2d(sm_extra[0], d_t_map_extra, aligned_upper + SMEM_ROW_BYTES, tma_row, &tma_mbar);
+        tma_load_tile_2d(sm_extra[1], d_t_map_extra, aligned_lower + SMEM_ROW_BYTES, tma_row, &tma_mbar);
       }
+      shmem_barrier_spin(&tma_mbar, phase_bit);
+      phase_bit ^= 1;
     }
-    __syncthreads();
 
     // Process all chunks via rotation
     for (int32_t pass = 0; pass < NUM_CHUNKS; ++pass) {
@@ -446,6 +502,23 @@ __global__ __launch_bounds__(128) void cvstencil(typename O::target_type *__rest
         if (!skip_slice) {
           const int32_t k_base = (warp_id * MMA_N + tile_row) * STRIDE;
 
+          // Pre-load A fragments once: they depend on (tess, k_tile, k_base, lane_id)
+          // but NOT on ws, so loading inside the ws loop would be redundant.
+          // 2 tessellations × MMA_NUM k-tiles × 2 registers = 16 uint32 registers.
+          uint32_t A_frags[2][MMA_NUM][2];
+#pragma unroll
+          for (int32_t tess = 0; tess < 2; ++tess) {
+#pragma unroll
+            for (int32_t k_tile = 0; k_tile < MMA_NUM; ++k_tile) {
+              if (tess == 0)
+                load_a_frag_tma_split<UPPER_HALO_OFF>(A_frags[0][k_tile], sm_data[0], sm_extra[0],
+                                                      k_base + k_tile * MMA_K, lane_id);
+              else
+                load_a_frag_tma_split<LOWER_HALO_OFF>(A_frags[1][k_tile], sm_data[1], sm_extra[1],
+                                                      k_base + k_tile * MMA_K, lane_id);
+            }
+          }
+
           for (int32_t ws = 0; ws < M; ++ws) {
             if (slice_idx + ws >= total_slices)
               continue;
@@ -459,14 +532,12 @@ __global__ __launch_bounds__(128) void cvstencil(typename O::target_type *__rest
             for (int32_t tess = 0; tess < 2; ++tess) {
 #pragma unroll
               for (int32_t k_tile = 0; k_tile < MMA_NUM; ++k_tile) {
-                uint32_t A[2];
-                load_a_frag_swizzled(A, sm_data[tess], k_base + k_tile * MMA_K, lane_id);
                 uint32_t B = sm_weight[(ws * 2 + tess) * PACKED_WT_WORDS + k_tile * WARP_SIZE + lane_id];
 
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
                              "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                              : "+r"(mma_accum[0]), "+r"(mma_accum[1]), "+r"(mma_accum[2]), "+r"(mma_accum[3])
-                             : "r"(A[0]), "r"(A[1]), "r"(B));
+                             : "r"(A_frags[tess][k_tile][0]), "r"(A_frags[tess][k_tile][1]), "r"(B));
               }
             }
 

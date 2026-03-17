@@ -618,6 +618,14 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
   dim3 grid_cv((height + ozigpu::convstencil::TILE_SIZE_ROW - 1) / ozigpu::convstencil::TILE_SIZE_ROW,
                (ldm + ozigpu::convstencil::TILE_SIZE_COL - 1) / ozigpu::convstencil::TILE_SIZE_COL);
 
+  ozigpu::convstencil::TmaDescriptors tma;
+  size_t total_height = static_cast<size_t>(actual_slices) * height;
+  bool tma_ok = ozigpu::convstencil::create_tma_descriptors(tma, d_slices_1, d_slices_2, total_height, ldm);
+  if (!tma_ok) {
+    std::cerr << "Skipping cvstencil: TMA requires ldm >= 128 and ldm % 16 == 0\n";
+    return {};
+  }
+
   for (int32_t r = 0; r < cfg.repeats; ++r) {
     // Reset state
     CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n_elems * sizeof(Real), cudaMemcpyHostToDevice));
@@ -645,10 +653,11 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
       NVTX_PUSH("Warmup");
       for (int32_t t = 0; t < cfg.warmup; ++t) {
         ozigpu::cvstencil<Oz, M>
-            <<<grid_cv, block_cv>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary);
+            <<<grid_cv, block_cv>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.d_main[0], tma.d_extra[0]);
         if (t < cfg.warmup - 1)
           ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, 0);
         std::swap(d_slices_1, d_slices_2);
+        tma.swap();
       }
       CUDA_CHECK(cudaDeviceSynchronize());
       NVTX_POP();
@@ -677,7 +686,7 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
     NVTX_PUSH("Integration");
     ev.record_start();
     for (int32_t t = 0; t < cfg.timesteps; ++t) {
-      ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary);
+      ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.d_main[0], tma.d_extra[0]);
       if (t < cfg.timesteps - 1) {
         int32_t min_shifts_now;
         if (t == cfg.timesteps - 2)
@@ -689,12 +698,15 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
         ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
       }
       std::swap(d_slices_1, d_slices_2);
+      tma.swap();
     }
     ev.record_stop();
     NVTX_POP();
 
     result.integration_ms.push_back(ev.elapsed_ms());
   }
+
+  tma.free();
 
   // -- Mend (with warmup + repetition) --
   NVTX_PUSH("Mend");
