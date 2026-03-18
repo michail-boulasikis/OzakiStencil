@@ -52,6 +52,15 @@ STENCIL_BASE="$1"
 DOMAIN="$2"
 shift 2
 
+# Select algorithm based on stencil dimensions
+if [[ "$STENCIL_BASE" =~ ^7x7 ]]; then
+    OZ_ALGO="convstencil"
+    OZ_LABEL="Ozaki ConvStencil"
+else
+    OZ_ALGO="direct"
+    OZ_LABEL="Ozaki Direct"
+fi
+
 # ---------- named options ----------
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -137,7 +146,7 @@ printf "    FP128: %s GStPt/s\n"  "$FP128_GSTP" >&2
 echo >&2
 
 # ---------- step 2: Ozaki Direct sweep ----------
-echo "==> Ozaki Direct sweep: s=${SLICE_MIN}..${SLICE_MAX}, M=(${PRESENT_M[*]})" >&2
+echo "==> ${OZ_LABEL} sweep: s=${SLICE_MIN}..${SLICE_MAX}, M=(${PRESENT_M[*]})" >&2
 echo "    ${TOTAL_RUNS} benchmark runs total" >&2
 echo >&2
 
@@ -164,8 +173,8 @@ run_idx=0
         for m in "${PRESENT_M[@]}"; do
             run_idx=$(( run_idx + 1 ))
             printf '  [%d/%d] s=%d M=%s ...' "$run_idx" "$TOTAL_RUNS" "$s" "$m" >&2
-            out=$(run_bench "${STC_FILE[$m]}" "direct" "$s")
-            gstp=$(extract_gstp "$out" "Ozaki Direct")
+            out=$(run_bench "${STC_FILE[$m]}" "$OZ_ALGO" "$s")
+            gstp=$(extract_gstp "$out" "$OZ_LABEL")
             printf ' %s GStPt/s\n' "$gstp" >&2
             row="${row}	${gstp}"
         done

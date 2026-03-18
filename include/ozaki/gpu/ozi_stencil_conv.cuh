@@ -68,8 +68,8 @@ constexpr int32_t UPPER_HALO_OFF = (-HALO) & 15;               // = 13 for HALO=
 constexpr int32_t LOWER_HALO_OFF = (STENCIL_SIDE - HALO) & 15; // = 4 for HALO=3
 
 // Chunking constants: the 8 output rows (MMA_N) per warp are split into chunks.
-// One chunk's accumulator state lives in registers; the rest are swapped in/out
-// of local memory (compiler-managed spills) via rotation.
+// Each chunk is processed serially through all data slices; accumulators live
+// entirely in registers with no local-memory spills.
 constexpr int32_t ROWS_PER_CHUNK = 2;
 constexpr int32_t NUM_CHUNKS = MMA_N / ROWS_PER_CHUNK; // = 4
 static_assert(MMA_N % ROWS_PER_CHUNK == 0, "MMA_N must be divisible by ROWS_PER_CHUNK");
@@ -99,49 +99,31 @@ inline CUresult create_tma_descriptor_impl(CUtensorMap *out, const int8_t *base_
                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 }
 
-// Ping-pong pair of main + extra TMA descriptors (device pointers).
+// Ping-pong pair of main + extra TMA descriptors (host-side, passed by value via __grid_constant__).
 struct TmaDescriptors {
-  CUtensorMap *d_main[2] = {};
-  CUtensorMap *d_extra[2] = {};
+  CUtensorMap h_main[2] = {};
+  CUtensorMap h_extra[2] = {};
 
   void swap() {
-    std::swap(d_main[0], d_main[1]);
-    std::swap(d_extra[0], d_extra[1]);
+    std::swap(h_main[0], h_main[1]);
+    std::swap(h_extra[0], h_extra[1]);
   }
 
-  void free() {
-    for (auto *&p : d_main) {
-      cudaFree(p);
-      p = nullptr;
-    }
-    for (auto *&p : d_extra) {
-      cudaFree(p);
-      p = nullptr;
-    }
-  }
+  void free() {} // No-op: host-side objects, no device allocation.
 };
 
-// Create main (128B) + extra (16B) TMA descriptors for two ping-pong slice buffers,
-// allocate device copies, and upload. Returns true on success; callers must check
-// the return value since the software fallback has been removed.
+// Create main (128B) + extra (16B) TMA descriptors for two ping-pong slice buffers.
+// Returns true on success. Descriptors are host-side and passed to the kernel by
+// value via __grid_constant__.
 inline bool create_tma_descriptors(TmaDescriptors &out, const int8_t *buf_a, const int8_t *buf_b, size_t total_height,
                                    size_t ldm) {
   if (ldm % 16 != 0 || ldm < SMEM_ROW_BYTES)
     return false;
-  CUtensorMap h[4]{};
-  if (create_tma_descriptor_impl(&h[0], buf_a, total_height, ldm, SMEM_ROW_BYTES) != CUDA_SUCCESS ||
-      create_tma_descriptor_impl(&h[1], buf_b, total_height, ldm, SMEM_ROW_BYTES) != CUDA_SUCCESS ||
-      create_tma_descriptor_impl(&h[2], buf_a, total_height, ldm, TMA_EXTRA_TILE) != CUDA_SUCCESS ||
-      create_tma_descriptor_impl(&h[3], buf_b, total_height, ldm, TMA_EXTRA_TILE) != CUDA_SUCCESS)
+  if (create_tma_descriptor_impl(&out.h_main[0], buf_a, total_height, ldm, SMEM_ROW_BYTES) != CUDA_SUCCESS ||
+      create_tma_descriptor_impl(&out.h_main[1], buf_b, total_height, ldm, SMEM_ROW_BYTES) != CUDA_SUCCESS ||
+      create_tma_descriptor_impl(&out.h_extra[0], buf_a, total_height, ldm, TMA_EXTRA_TILE) != CUDA_SUCCESS ||
+      create_tma_descriptor_impl(&out.h_extra[1], buf_b, total_height, ldm, TMA_EXTRA_TILE) != CUDA_SUCCESS)
     return false;
-  cudaMalloc(&out.d_main[0], sizeof(CUtensorMap));
-  cudaMalloc(&out.d_main[1], sizeof(CUtensorMap));
-  cudaMalloc(&out.d_extra[0], sizeof(CUtensorMap));
-  cudaMalloc(&out.d_extra[1], sizeof(CUtensorMap));
-  cudaMemcpy(out.d_main[0], &h[0], sizeof(CUtensorMap), cudaMemcpyHostToDevice);
-  cudaMemcpy(out.d_main[1], &h[1], sizeof(CUtensorMap), cudaMemcpyHostToDevice);
-  cudaMemcpy(out.d_extra[0], &h[2], sizeof(CUtensorMap), cudaMemcpyHostToDevice);
-  cudaMemcpy(out.d_extra[1], &h[3], sizeof(CUtensorMap), cudaMemcpyHostToDevice);
   return true;
 }
 
@@ -386,8 +368,7 @@ __global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE) void cvstencil(
     typename O::target_type *__restrict__ out, const typename O::target_type *__restrict__ in,
     const typename O::target_type *__restrict__ weight, const size_t ldm, const size_t height,
     OzakiDescriptor<O> *__restrict__ desc, __grid_constant__ const convstencil::BoundaryGainData boundary,
-    const CUtensorMap *__restrict__ d_t_map, const CUtensorMap *__restrict__ d_t_map_extra) {
-  asm volatile(".pragma \"enable_smem_spilling\";");
+    __grid_constant__ const CUtensorMap d_t_map, __grid_constant__ const CUtensorMap d_t_map_extra) {
   using namespace convstencil;
   using Target = typename O::target_type;
   using Acc = typename O::acc_type;
@@ -449,49 +430,43 @@ __global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE) void cvstencil(
   __syncthreads(); // Ensure weights loaded and mbarrier initialized before main loop
 
   // ====================================================================
-  // ROTATED CHUNK PROCESSING
+  // CHUNK-SERIAL PROCESSING
   //
   // The 8 output rows per warp are split into NUM_CHUNKS chunks of
-  // ROWS_PER_CHUNK rows. sm_data is loaded once per data slice (outer loop).
-  // For each slice, all chunks are processed via rotation one at a time.
+  // ROWS_PER_CHUNK rows. Each chunk is processed independently through
+  // all data slices before moving to the next chunk. sm_data is reloaded
+  // for each chunk (4x TMA) but no saved state or swaps are needed.
   // ====================================================================
 
-  // Active chunk state (persists in registers)
-  int32_t acc_reg[M][ROWS_PER_CHUNK][ELEMS_PER_THREAD] = {0};
-  int32_t carry_reg[ROWS_PER_CHUNK][ELEMS_PER_THREAD] = {0};
+  for (int32_t chunk = 0; chunk < NUM_CHUNKS; ++chunk) {
 
-  // Inactive chunk state (in local memory, one buffer per inactive chunk)
-  int32_t saved_acc[NUM_CHUNKS - 1][M][ROWS_PER_CHUNK][ELEMS_PER_THREAD] = {0};
-  int32_t saved_carry[NUM_CHUNKS - 1][ROWS_PER_CHUNK][ELEMS_PER_THREAD] = {0};
+    // Fresh accumulators for this chunk
+    int32_t acc_reg[M][ROWS_PER_CHUNK][ELEMS_PER_THREAD] = {0};
+    int32_t carry_reg[ROWS_PER_CHUNK][ELEMS_PER_THREAD] = {0};
 
-  int32_t active_chunk = 0;
+    // ---- Main data-slice loop ----
+    for (int32_t slice_idx = total_slices - 1; slice_idx >= 0; --slice_idx) {
+      const int32_t physical_slice = phys_lut[slice_idx];
+      const bool skip_slice = (slice_idx == 0 && just_shifted);
 
-  // ---- Main data-slice loop (outer: load sm_data once per slice) ----
-  for (int32_t slice_idx = total_slices - 1; slice_idx >= 0; --slice_idx) {
-    const int32_t physical_slice = phys_lut[slice_idx];
-    const bool skip_slice = (slice_idx == 0 && just_shifted);
-
-    // Load input data into shared memory via TMA.
-    // OOB fill (FILL_NONE) zero-fills boundary tiles, so no tile_in_bounds guard needed.
-    if (!skip_slice) {
-      const int32_t aligned_upper = data_col_start & ~15;
-      const int32_t aligned_lower = (data_col_start + STENCIL_SIDE) & ~15;
-      if (tid == 0) {
-        shmem_barrier_arrive_expect_tx(&tma_mbar, 2 * TMA_TX_BYTES + 2 * TMA_EXTRA_TX_BYTES);
-        const int32_t tma_row = physical_slice * static_cast<int32_t>(height) + data_row_start;
-        tma_load_tile_2d(sm_data[0], d_t_map, aligned_upper, tma_row, &tma_mbar);
-        tma_load_tile_2d(sm_data[1], d_t_map, aligned_lower, tma_row, &tma_mbar);
-        tma_load_tile_2d(sm_extra[0], d_t_map_extra, aligned_upper + SMEM_ROW_BYTES, tma_row, &tma_mbar);
-        tma_load_tile_2d(sm_extra[1], d_t_map_extra, aligned_lower + SMEM_ROW_BYTES, tma_row, &tma_mbar);
+      // Load input data into shared memory via TMA.
+      // OOB fill (FILL_NONE) zero-fills boundary tiles, so no tile_in_bounds guard needed.
+      if (!skip_slice) {
+        const int32_t aligned_upper = data_col_start & ~15;
+        const int32_t aligned_lower = (data_col_start + STENCIL_SIDE) & ~15;
+        if (tid == 0) {
+          shmem_barrier_arrive_expect_tx(&tma_mbar, 2 * TMA_TX_BYTES + 2 * TMA_EXTRA_TX_BYTES);
+          const int32_t tma_row = physical_slice * static_cast<int32_t>(height) + data_row_start;
+          tma_load_tile_2d(sm_data[0], &d_t_map, aligned_upper, tma_row, &tma_mbar);
+          tma_load_tile_2d(sm_data[1], &d_t_map, aligned_lower, tma_row, &tma_mbar);
+          tma_load_tile_2d(sm_extra[0], &d_t_map_extra, aligned_upper + SMEM_ROW_BYTES, tma_row, &tma_mbar);
+          tma_load_tile_2d(sm_extra[1], &d_t_map_extra, aligned_lower + SMEM_ROW_BYTES, tma_row, &tma_mbar);
+        }
+        shmem_barrier_spin(&tma_mbar, phase_bit);
+        phase_bit ^= 1;
       }
-      shmem_barrier_spin(&tma_mbar, phase_bit);
-      phase_bit ^= 1;
-    }
 
-    // Process all chunks via rotation
-    for (int32_t pass = 0; pass < NUM_CHUNKS; ++pass) {
-      const int32_t chunk = (active_chunk + pass) % NUM_CHUNKS;
-
+      // Process ONLY this chunk — no pass loop, no swaps
       for (int32_t row_in_chunk = 0; row_in_chunk < ROWS_PER_CHUNK; ++row_in_chunk) {
         const int32_t tile_row = chunk * ROWS_PER_CHUNK + row_in_chunk;
 
@@ -598,38 +573,11 @@ __global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE) void cvstencil(
         }
       } // end row_in_chunk loop
 
-      // Swap active chunk with next saved chunk (rotation)
-      if (pass < NUM_CHUNKS - 1) {
-#pragma unroll
-        for (int32_t ws = 0; ws < M; ++ws)
-#pragma unroll
-          for (int32_t r = 0; r < ROWS_PER_CHUNK; ++r)
-#pragma unroll
-            for (int32_t elem = 0; elem < ELEMS_PER_THREAD; ++elem) {
-              int32_t tmp = saved_acc[pass][ws][r][elem];
-              saved_acc[pass][ws][r][elem] = acc_reg[ws][r][elem];
-              acc_reg[ws][r][elem] = tmp;
-            }
-#pragma unroll
-        for (int32_t r = 0; r < ROWS_PER_CHUNK; ++r)
-#pragma unroll
-          for (int32_t elem = 0; elem < ELEMS_PER_THREAD; ++elem) {
-            int32_t tmp = saved_carry[pass][r][elem];
-            saved_carry[pass][r][elem] = carry_reg[r][elem];
-            carry_reg[r][elem] = tmp;
-          }
-      }
-    } // end pass loop
+      __syncthreads(); // protect sm_data for next TMA load
 
-    active_chunk = (active_chunk + NUM_CHUNKS - 1) % NUM_CHUNKS;
+    } // end slice loop
 
-    __syncthreads(); // protect sm_data for next slice iteration
-  } // end slice loop
-
-  // ---- Cleanup: flush M-1 remaining output positions for all chunks ----
-  for (int32_t cleanup_pass = 0; cleanup_pass < NUM_CHUNKS; ++cleanup_pass) {
-    const int32_t chunk = (active_chunk + cleanup_pass) % NUM_CHUNKS;
-
+    // ---- Cleanup: flush M-1 remaining positions for this chunk ----
     for (int32_t flush_pos = M - 2; flush_pos >= 0; --flush_pos) {
       for (int32_t row_in_chunk = 0; row_in_chunk < ROWS_PER_CHUNK; ++row_in_chunk) {
         const int32_t tile_row = chunk * ROWS_PER_CHUNK + row_in_chunk;
@@ -685,23 +633,7 @@ __global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE) void cvstencil(
       } // end row_in_chunk cleanup
     } // end flush_pos loop
 
-    // Load next inactive chunk (no save needed, cleanup is terminal)
-    if (cleanup_pass < NUM_CHUNKS - 1) {
-#pragma unroll
-      for (int32_t ws = 0; ws < M; ++ws)
-#pragma unroll
-        for (int32_t r = 0; r < ROWS_PER_CHUNK; ++r)
-#pragma unroll
-          for (int32_t elem = 0; elem < ELEMS_PER_THREAD; ++elem)
-            acc_reg[ws][r][elem] = saved_acc[cleanup_pass][ws][r][elem];
-
-#pragma unroll
-      for (int32_t r = 0; r < ROWS_PER_CHUNK; ++r)
-#pragma unroll
-        for (int32_t elem = 0; elem < ELEMS_PER_THREAD; ++elem)
-          carry_reg[r][elem] = saved_carry[cleanup_pass][r][elem];
-    }
-  } // end cleanup pass loop
+  } // end chunk loop
 
   // ====================================================================
   // BOUNDARY HANDLING: emulated_gain for non-interior elements.

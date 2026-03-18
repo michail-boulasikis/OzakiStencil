@@ -653,7 +653,7 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
       NVTX_PUSH("Warmup");
       for (int32_t t = 0; t < cfg.warmup; ++t) {
         ozigpu::cvstencil<Oz, M>
-            <<<grid_cv, block_cv>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.d_main[0], tma.d_extra[0]);
+            <<<grid_cv, block_cv>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.h_main[0], tma.h_extra[0]);
         if (t < cfg.warmup - 1)
           ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, 0);
         std::swap(d_slices_1, d_slices_2);
@@ -686,7 +686,7 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
     NVTX_PUSH("Integration");
     ev.record_start();
     for (int32_t t = 0; t < cfg.timesteps; ++t) {
-      ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.d_main[0], tma.d_extra[0]);
+      ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.h_main[0], tma.h_extra[0]);
       if (t < cfg.timesteps - 1) {
         int32_t min_shifts_now;
         if (t == cfg.timesteps - 2)

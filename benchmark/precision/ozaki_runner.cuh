@@ -369,7 +369,7 @@ public:
     NVTX_PUSH("Integration Loop");
     for (int32_t t = 0; t < n_iterations; ++t) {
       ozigpu::cvstencil<ozigpu::OzakiFP_Int8<Real>, M>
-          <<<grid, block>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary_, tma.d_main[0], tma.d_extra[0]);
+          <<<grid, block>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary_, tma.h_main[0], tma.h_extra[0]);
 
       if (t < n_iterations - 1) {
         int32_t min_shifts_now;

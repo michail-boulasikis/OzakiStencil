@@ -337,7 +337,7 @@ protected:
       throw std::runtime_error("cvstencil requires ldm >= 128 and ldm % 16 == 0; got ldm=" + std::to_string(ldm));
 
     for (int32_t t = 0; t < timesteps; ++t) {
-      ozigpu::cvstencil<OzPair, M><<<grid, block>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.d_main[0], tma.d_extra[0]);
+      ozigpu::cvstencil<OzPair, M><<<grid, block>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.h_main[0], tma.h_extra[0]);
 
       if (t < timesteps - 1) {
         int32_t min_shifts_now;
