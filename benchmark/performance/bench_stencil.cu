@@ -3,7 +3,7 @@
 #include <ozaki/gpu/gpu_checks.cuh>
 #include <ozaki/gpu/ozi.cuh>
 #include <ozaki/gpu/ozi_kernels.cuh>
-#include <ozaki/gpu/ozi_stencil_conv.cuh>
+#include <ozaki/gpu/ozi_stencil_conv_v2.cuh>
 #include <ozaki/gpu/ozi_stencil_plain.cuh>
 #include <ozaki/gpu/stencil_gpu.cuh>
 #include <ozaki/utils/stencil_registry.hpp>
@@ -624,7 +624,8 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
 
   ozigpu::convstencil::TmaDescriptors tma;
   size_t total_height = static_cast<size_t>(actual_slices) * height;
-  bool tma_ok = ozigpu::convstencil::create_tma_descriptors(tma, d_slices_1, d_slices_2, total_height, ldm);
+  bool tma_ok = ozigpu::convstencil::create_tma_descriptors(tma, d_slices_1, d_slices_2, total_height, ldm,
+                                                             ozigpu::convstencil::TMA_TAIL_TILE);
   if (!tma_ok) {
     std::cerr << "Skipping cvstencil: TMA requires ldm >= 128 and ldm % 16 == 0\n";
     return {};
