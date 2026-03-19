@@ -74,6 +74,16 @@ constexpr int32_t ROWS_PER_CHUNK = 2;
 constexpr int32_t NUM_CHUNKS = MMA_N / ROWS_PER_CHUNK; // = 4
 static_assert(MMA_N % ROWS_PER_CHUNK == 0, "MMA_N must be divisible by ROWS_PER_CHUNK");
 
+// ========== cvstencil_v2 constants (chunk-free, double-buffered TMA) ==========
+constexpr int32_t SLICES_PER_BATCH = 2;
+constexpr int32_t NUM_BUFFER_STAGES = 2;
+constexpr int32_t TESS_PER_STAGE = SLICES_PER_BATCH * 2; // 4
+
+// Dynamic shared memory for double-buffered data tiles
+constexpr int32_t DYN_SMEM_DATA = NUM_BUFFER_STAGES * TESS_PER_STAGE * SMEM_TESS_BYTES;   // 39,936 B
+constexpr int32_t DYN_SMEM_EXTRA = NUM_BUFFER_STAGES * TESS_PER_STAGE * SMEM_EXTRA_BYTES; // 5,120 B
+constexpr int32_t DYN_SMEM_BYTES = DYN_SMEM_DATA + DYN_SMEM_EXTRA;                        // 45,056 B
+
 // ========== Boundary gain data (passed by value to kernel) ==========
 struct BoundaryGainData {
   int8_t emulated_gain[MAX_DATA_SLICES];
@@ -337,6 +347,112 @@ __device__ __forceinline__ void extract_truncation_carry(int32_t (&acc)[M][ROWS_
     int32_t val = acc[M - 1][row_in_chunk][elem];
     Target trunc = static_cast<Target>(val);
     carry[row_in_chunk][elem] = (val - static_cast<Acc>(trunc)) >> (CHAR_BIT * sizeof(Target) - 1);
+  }
+}
+
+// ========== cvstencil_v2 helper: MMA accumulate for one tile_row ==========
+
+/** Run 2 tessellations x MMA_NUM k-tiles of mma.sync, accumulating into `target`.
+ *  A_frags must already be loaded for this tile_row. `ws` selects the weight slice. */
+__device__ __forceinline__ void mma_accumulate_row(int32_t (&target)[ELEMS_PER_THREAD],
+                                                   const uint32_t (&A_frags)[2][MMA_NUM][2], const uint32_t *sm_weight,
+                                                   int32_t ws, int32_t lane_id) {
+  uint32_t mma_accum[ELEMS_PER_THREAD];
+#pragma unroll
+  for (int32_t elem = 0; elem < ELEMS_PER_THREAD; ++elem)
+    mma_accum[elem] = static_cast<uint32_t>(target[elem]);
+
+#pragma unroll
+  for (int32_t tess = 0; tess < 2; ++tess) {
+#pragma unroll
+    for (int32_t k_tile = 0; k_tile < MMA_NUM; ++k_tile) {
+      uint32_t B = sm_weight[(ws * 2 + tess) * PACKED_WT_WORDS + k_tile * WARP_SIZE + lane_id];
+      asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
+                   "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                   : "+r"(mma_accum[0]), "+r"(mma_accum[1]), "+r"(mma_accum[2]), "+r"(mma_accum[3])
+                   : "r"(A_frags[tess][k_tile][0]), "r"(A_frags[tess][k_tile][1]), "r"(B));
+    }
+  }
+
+#pragma unroll
+  for (int32_t elem = 0; elem < ELEMS_PER_THREAD; ++elem)
+    target[elem] = static_cast<int32_t>(mma_accum[elem]);
+}
+
+/** Load A-fragments from a specific slot within a double-buffered dynamic smem layout.
+ *  stage: 0 or 1 (double-buffer stage)
+ *  slice_in_batch: 0 or 1 (which data slice within the batch)
+ *  tess: 0 (upper) or 1 (lower) tessellation */
+__device__ __forceinline__ void load_a_frags_for_slot(uint32_t (&A_frags)[2][MMA_NUM][2], const int8_t *dyn_smem,
+                                                      int32_t stage, int32_t slice_in_batch, int32_t k_base,
+                                                      int32_t lane_id) {
+#pragma unroll
+  for (int32_t tess = 0; tess < 2; ++tess) {
+    int32_t slot = slice_in_batch * 2 + tess; // 0..3
+    const int8_t *sm_data_ptr = dyn_smem + (stage * TESS_PER_STAGE + slot) * SMEM_TESS_BYTES;
+    const int8_t *sm_extra_ptr = dyn_smem + DYN_SMEM_DATA + (stage * TESS_PER_STAGE + slot) * SMEM_EXTRA_BYTES;
+
+#pragma unroll
+    for (int32_t k_tile = 0; k_tile < MMA_NUM; ++k_tile) {
+      if (tess == 0)
+        load_a_frag_tma_split<UPPER_HALO_OFF>(A_frags[0][k_tile], sm_data_ptr, sm_extra_ptr, k_base + k_tile * MMA_K,
+                                              lane_id);
+      else
+        load_a_frag_tma_split<LOWER_HALO_OFF>(A_frags[1][k_tile], sm_data_ptr, sm_extra_ptr, k_base + k_tile * MMA_K,
+                                              lane_id);
+    }
+  }
+}
+
+/** Truncation-store + carry for one tile_row of C.
+ *  Stores int8(C[e]) to output, then overwrites C with carry: C[e] = (C[e] - int32(digit)) >> 7.
+ *  When is_msb is true, skips carry and records max_abs_acc. */
+template <typename Target, typename Acc>
+__device__ __forceinline__ void trunc_store_row(int32_t (&C)[ELEMS_PER_THREAD], int32_t &max_abs_acc, Target *slice_out,
+                                                size_t ldm, int32_t global_row, int32_t tile_col_base,
+                                                bool tile_in_bounds, bool is_interior_row, bool is_msb, int32_t lane_id,
+                                                size_t height) {
+  if (tile_in_bounds) {
+#pragma unroll
+    for (int32_t store_pair = 0; store_pair < ELEMS_PER_THREAD / 2; ++store_pair) {
+      const int32_t elem_lo = store_pair * 2;
+      const int32_t out_col = acc_out_col(elem_lo, lane_id);
+      const int32_t global_col = tile_col_base + out_col;
+      const uint8_t v0 = static_cast<uint8_t>(static_cast<Target>(C[elem_lo]));
+      const uint8_t v1 = static_cast<uint8_t>(static_cast<Target>(C[elem_lo + 1]));
+      *reinterpret_cast<uint16_t *>(&slice_out[global_row * ldm + global_col]) =
+          static_cast<uint16_t>(v0) | (static_cast<uint16_t>(v1) << 8);
+    }
+    if (is_msb) {
+#pragma unroll
+      for (int32_t elem = 0; elem < ELEMS_PER_THREAD; ++elem)
+        max_abs_acc = max(max_abs_acc, abs(C[elem]));
+    }
+  } else {
+#pragma unroll
+    for (int32_t elem = 0; elem < ELEMS_PER_THREAD; ++elem) {
+      int32_t out_col = acc_out_col(elem, lane_id);
+      int32_t global_col = tile_col_base + out_col;
+
+      bool in_grid = (global_row < static_cast<int32_t>(height) && global_col < static_cast<int32_t>(ldm));
+      bool is_interior =
+          in_grid && is_interior_row && (global_col >= HALO && global_col < static_cast<int32_t>(ldm) - HALO);
+
+      if (is_interior)
+        slice_out[global_row * ldm + global_col] = static_cast<Target>(C[elem]);
+
+      if (is_msb && is_interior)
+        max_abs_acc = max(max_abs_acc, abs(C[elem]));
+    }
+  }
+
+  // Compute carry in-place (skip for MSB)
+  if (!is_msb) {
+#pragma unroll
+    for (int32_t elem = 0; elem < ELEMS_PER_THREAD; ++elem) {
+      Target trunc = static_cast<Target>(C[elem]);
+      C[elem] = (C[elem] - static_cast<Acc>(trunc)) >> (CHAR_BIT * sizeof(Target) - 1);
+    }
   }
 }
 
@@ -709,6 +825,446 @@ __global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE) void cvstencil(
     }
   }
 }
+
+namespace convstencil {
+/** Issue TMA loads for one batch of data slices into a double-buffer stage.
+ *  All parameters passed by value to avoid address-taking (stack spills). */
+__device__ __forceinline__ void issue_tma_for_batch(int32_t batch, int32_t stage, int8_t *dyn_smem, uint64_t *tma_mbar,
+                                                    const CUtensorMap *d_t_map, const CUtensorMap *d_t_map_extra,
+                                                    const int32_t *phys_lut, int32_t total_slices, int32_t num_batches,
+                                                    int32_t just_shifted, int32_t height, int32_t data_row_start,
+                                                    int32_t aligned_upper, int32_t aligned_lower) {
+  int32_t slices_in_batch = (batch == num_batches - 1 && (total_slices % SLICES_PER_BATCH) != 0)
+                                ? (total_slices % SLICES_PER_BATCH)
+                                : SLICES_PER_BATCH;
+
+  int32_t active_slices = 0;
+  for (int32_t s = 0; s < slices_in_batch; ++s) {
+    int32_t data_logical = total_slices - 1 - (batch * SLICES_PER_BATCH + s);
+    if (data_logical >= 0 && !(data_logical == 0 && just_shifted))
+      ++active_slices;
+  }
+
+  uint32_t tx = active_slices * (2 * TMA_TX_BYTES + 2 * TMA_EXTRA_TX_BYTES);
+  shmem_barrier_arrive_expect_tx(&tma_mbar[stage], tx);
+
+  for (int32_t s = 0; s < slices_in_batch; ++s) {
+    int32_t data_logical = total_slices - 1 - (batch * SLICES_PER_BATCH + s);
+    if (data_logical < 0 || (data_logical == 0 && just_shifted))
+      continue;
+
+    int32_t physical_slice = phys_lut[data_logical];
+    int32_t tma_row = physical_slice * height + data_row_start;
+
+    int32_t base_slot = s * 2;
+    int8_t *data_upper = dyn_smem + (stage * TESS_PER_STAGE + base_slot + 0) * SMEM_TESS_BYTES;
+    int8_t *data_lower = dyn_smem + (stage * TESS_PER_STAGE + base_slot + 1) * SMEM_TESS_BYTES;
+    int8_t *extra_upper = dyn_smem + DYN_SMEM_DATA + (stage * TESS_PER_STAGE + base_slot + 0) * SMEM_EXTRA_BYTES;
+    int8_t *extra_lower = dyn_smem + DYN_SMEM_DATA + (stage * TESS_PER_STAGE + base_slot + 1) * SMEM_EXTRA_BYTES;
+
+    tma_load_tile_2d(data_upper, d_t_map, aligned_upper, tma_row, &tma_mbar[stage]);
+    tma_load_tile_2d(data_lower, d_t_map, aligned_lower, tma_row, &tma_mbar[stage]);
+    tma_load_tile_2d(extra_upper, d_t_map_extra, aligned_upper + SMEM_ROW_BYTES, tma_row, &tma_mbar[stage]);
+    tma_load_tile_2d(extra_lower, d_t_map_extra, aligned_lower + SMEM_ROW_BYTES, tma_row, &tma_mbar[stage]);
+  }
+}
+} // namespace convstencil
+
+/**
+ * Chunk-free ConvStencil kernel with double-buffered TMA and 1x bandwidth.
+ *
+ * Eliminates the 4x TMA replay of the chunked cvstencil by processing all 8
+ * tile_rows per data slice without reloading. Data slices are loaded in pairs
+ * ("batches") with double-buffered TMA for latency hiding.
+ *
+ * Uses a single accumulator C (plus C_next for M>=3) instead of M sliding-
+ * window accumulators, reducing register pressure to enable 4 blocks/SM.
+ * Carry propagation happens in-place: trunc_store_row extracts carry into C.
+ */
+template <OzakiPair O, int32_t M = 1>
+  requires(std::is_same_v<typename O::target_type, int8_t>) && (M >= 1)
+// clang-format off
+__global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE, 4) void cvstencil_v2(
+    typename O::target_type *__restrict__ out,
+    const typename O::target_type *__restrict__ in,
+    const typename O::target_type *__restrict__ weight,
+    const size_t ldm, const size_t height,
+    OzakiDescriptor<O> *__restrict__ desc,
+    __grid_constant__ const convstencil::BoundaryGainData boundary,
+    __grid_constant__ const CUtensorMap d_t_map,
+    __grid_constant__ const CUtensorMap d_t_map_extra) {
+  // clang-format on
+  using namespace convstencil;
+  using Target = typename O::target_type;
+  using Acc = typename O::acc_type;
+
+  // ======================== Descriptor state ========================
+  const int32_t total_slices = desc->n_slices_input;
+  const int32_t carry_idx = desc->carry_slice_index;
+  const Target threshold = desc->overflow_danger_threshold;
+  const int32_t just_shifted = desc->just_shifted;
+  const int32_t *phys_lut = &phys_lut_cmem[carry_idx * PHYS_LUT_MAX_SLICES];
+
+  // ======================== Thread identity ========================
+  const int32_t warp_id = threadIdx.x / WARP_SIZE;
+  const int32_t lane_id = threadIdx.x % WARP_SIZE;
+  const int32_t tid = threadIdx.x;
+
+  const size_t slice_stride = ldm * height;
+
+  // ======================== Shared memory ========================
+  extern __shared__ __align__(128) int8_t dyn_smem[];
+
+  __shared__ __align__(16) uint32_t sm_weight[M * 2 * PACKED_WT_WORDS];
+  __shared__ __align__(8) uint64_t tma_mbar[NUM_BUFFER_STAGES];
+  __shared__ int32_t sm_overflow[NUM_WARPS];
+
+  if (tid < NUM_WARPS)
+    sm_overflow[tid] = 0;
+
+  int32_t max_abs_acc = 0;
+
+  // ======================== Tile coordinates ========================
+  const int32_t data_row_start = static_cast<int32_t>(blockIdx.x * TILE_SIZE_ROW) - HALO;
+  const int32_t data_col_start = static_cast<int32_t>(blockIdx.y * TILE_SIZE_COL) - HALO;
+
+  const bool tile_in_bounds =
+      (data_row_start >= 0) && (data_row_start + DATA_TILE_SIZE_ROW <= static_cast<int32_t>(height)) &&
+      (data_col_start >= 0) && (data_col_start + DATA_TILE_SIZE_COL <= static_cast<int32_t>(ldm));
+
+  const int32_t aligned_upper = data_col_start & ~15;
+  const int32_t aligned_lower = (data_col_start + STENCIL_SIDE) & ~15;
+  const int32_t tile_col_base = static_cast<int32_t>(blockIdx.y * TILE_SIZE_COL);
+
+  // Initialize mbarriers
+  if (tid == 0) {
+    shmem_barrier_init(&tma_mbar[0], 1);
+    shmem_barrier_init(&tma_mbar[1], 1);
+  }
+
+  // Load weight matrices global → shared
+  {
+    const uint32_t *wt_src = reinterpret_cast<const uint32_t *>(weight);
+    constexpr int32_t WT_WORDS = M * 2 * PACKED_WT_WORDS;
+    for (int32_t idx = tid; idx < WT_WORDS; idx += blockDim.x)
+      sm_weight[idx] = wt_src[idx];
+  }
+
+  __syncthreads();
+
+  // ====================================================================
+  // SINGLE-ACCUMULATOR BATCH PROCESSING (chunk-free, double-buffered TMA)
+  //
+  // Data slices are loaded in pairs (batches) with double-buffered TMA.
+  // A single accumulator C (plus C_next for M>=3) replaces M sliding-
+  // window accumulators, reducing register pressure. Each batch produces
+  // up to 2 outputs via phased MMA accumulation with in-place carry.
+  // All 8 tile_rows are processed per batch (no chunking).
+  //
+  // Phase ordering per batch (b >= 1):
+  //   M=1: [D0@W0 store] [D1@W0 store]
+  //   M=2: [D0@W1 store] [D0@W0+D1@W1 store] [D1@W0 defer]
+  //   M=3: [D0@W2 store] [C_next+D0@W1+D1@W2 store] [D0@W0+D1@W1 defer] [D1@W0->C_next]
+  // ====================================================================
+
+  const int32_t num_batches = (total_slices + SLICES_PER_BATCH - 1) / SLICES_PER_BATCH;
+
+  // Single accumulator C: holds partial sums + carry (in-place via trunc_store_row)
+  int32_t C[MMA_N][ELEMS_PER_THREAD] = {0};
+  // Secondary accumulator for M>=3 (deferred D@W0 contribution)
+  int32_t C_next[MMA_N][ELEMS_PER_THREAD] = {0};
+
+  uint32_t phase_0 = 0, phase_1 = 0;
+
+  // Pre-load batch 0 into stage 0
+  if (tid == 0)
+    issue_tma_for_batch(0, 0, dyn_smem, tma_mbar, &d_t_map, &d_t_map_extra, phys_lut, total_slices, num_batches,
+                        just_shifted, static_cast<int32_t>(height), data_row_start, aligned_upper, aligned_lower);
+  shmem_barrier_spin(&tma_mbar[0], phase_0);
+  phase_0 ^= 1;
+
+  // ---- Main batch loop ----
+  for (int32_t batch = 0; batch < num_batches; ++batch) {
+    const int32_t cur_stage = batch % NUM_BUFFER_STAGES;
+    const int32_t nxt_stage = 1 - cur_stage;
+
+    // Prefetch next batch into nxt_stage
+    if (batch + 1 < num_batches) {
+      if (tid == 0)
+        issue_tma_for_batch(batch + 1, nxt_stage, dyn_smem, tma_mbar, &d_t_map, &d_t_map_extra, phys_lut, total_slices,
+                            num_batches, just_shifted, static_cast<int32_t>(height), data_row_start, aligned_upper,
+                            aligned_lower);
+    }
+
+    // How many data slices in this batch
+    const int32_t slices_in_batch = (batch == num_batches - 1 && (total_slices % SLICES_PER_BATCH) != 0)
+                                        ? (total_slices % SLICES_PER_BATCH)
+                                        : SLICES_PER_BATCH;
+    const bool has_D1 = (slices_in_batch >= 2);
+
+    // Data slice indices (code convention: 0 = MSB, total_slices-1 = LSB)
+    const int32_t ds_D0 = total_slices - 1 - batch * SLICES_PER_BATCH;
+    const int32_t ds_D1 = total_slices - 2 - batch * SLICES_PER_BATCH;
+    const bool skip_D0 = (ds_D0 == 0 && just_shifted);
+    const bool skip_D1 = has_D1 && (ds_D1 == 0 && just_shifted);
+
+    // Process all 8 tile_rows with phased MMA accumulation
+#pragma unroll
+    for (int32_t tile_row = 0; tile_row < MMA_N; ++tile_row) {
+      const int32_t k_base = (warp_id * MMA_N + tile_row) * STRIDE;
+      const int32_t out_row_local = warp_id * MMA_N + tile_row;
+      const int32_t global_row = static_cast<int32_t>(blockIdx.x * TILE_SIZE_ROW) + out_row_local;
+      const bool is_interior_row = (global_row >= HALO && global_row < static_cast<int32_t>(height) - HALO);
+
+      // Load A-fragments for D0 and D1 (both held in registers for multi-phase use)
+      uint32_t A_D0[2][MMA_NUM][2];
+      if (!skip_D0)
+        load_a_frags_for_slot(A_D0, dyn_smem, cur_stage, 0, k_base, lane_id);
+
+      uint32_t A_D1[2][MMA_NUM][2];
+      if (has_D1 && !skip_D1)
+        load_a_frags_for_slot(A_D1, dyn_smem, cur_stage, 1, k_base, lane_id);
+
+      // ============ Phase 1: Complete a prior output ============
+      // M=1: D0@W0 -> store output[ts-1-2b]
+      // M=2: D0@W1 -> store output[ts-2b]     (batch > 0 only)
+      // M=3: D0@W2 -> store output[ts+1-2b]   (batch > 0 only)
+      if constexpr (M == 1) {
+        if (!skip_D0)
+          mma_accumulate_row(C[tile_row], A_D0, sm_weight, 0, lane_id);
+
+        const int32_t os = total_slices - 1 - 2 * batch;
+        if (os >= 0 && os < total_slices) {
+          const int32_t phys = phys_lut[os];
+          Target *slice_out = out + slice_stride * phys;
+          trunc_store_row<Target, Acc>(C[tile_row], max_abs_acc, slice_out, ldm, global_row, tile_col_base,
+                                       tile_in_bounds, is_interior_row, /*is_msb=*/(os == 0), lane_id, height);
+        }
+      } else if constexpr (M == 2) {
+        if (batch > 0) {
+          if (!skip_D0)
+            mma_accumulate_row(C[tile_row], A_D0, sm_weight, 1, lane_id);
+
+          const int32_t os = total_slices - 2 * batch;
+          if (os >= 0 && os < total_slices) {
+            const int32_t phys = phys_lut[os];
+            Target *slice_out = out + slice_stride * phys;
+            trunc_store_row<Target, Acc>(C[tile_row], max_abs_acc, slice_out, ldm, global_row, tile_col_base,
+                                         tile_in_bounds, is_interior_row, /*is_msb=*/(os == 0), lane_id, height);
+          }
+        }
+      } else { // M >= 3
+        if (batch > 0) {
+          if (!skip_D0)
+            mma_accumulate_row(C[tile_row], A_D0, sm_weight, 2, lane_id);
+
+          const int32_t os = total_slices + 1 - 2 * batch;
+          if (os >= 0 && os < total_slices) {
+            const int32_t phys = phys_lut[os];
+            Target *slice_out = out + slice_stride * phys;
+            trunc_store_row<Target, Acc>(C[tile_row], max_abs_acc, slice_out, ldm, global_row, tile_col_base,
+                                         tile_in_bounds, is_interior_row, /*is_msb=*/(os == 0), lane_id, height);
+          }
+        }
+      }
+
+      // ============ Phase 2: Complete current output ============
+      // M=1: D1@W0 -> store output[ts-2-2b]
+      // M=2: D0@W0 + D1@W1 -> store output[ts-1-2b]
+      // M=3: C_next + D0@W1 + D1@W2 -> store output[ts-2b]  (batch > 0 only)
+      if constexpr (M == 1) {
+        if (has_D1 && !skip_D1)
+          mma_accumulate_row(C[tile_row], A_D1, sm_weight, 0, lane_id);
+
+        const int32_t os = total_slices - 2 - 2 * batch;
+        if (has_D1 && os >= 0 && os < total_slices) {
+          const int32_t phys = phys_lut[os];
+          Target *slice_out = out + slice_stride * phys;
+          trunc_store_row<Target, Acc>(C[tile_row], max_abs_acc, slice_out, ldm, global_row, tile_col_base,
+                                       tile_in_bounds, is_interior_row, /*is_msb=*/(os == 0), lane_id, height);
+        }
+      } else if constexpr (M == 2) {
+        if (!skip_D0)
+          mma_accumulate_row(C[tile_row], A_D0, sm_weight, 0, lane_id);
+        if (has_D1 && !skip_D1)
+          mma_accumulate_row(C[tile_row], A_D1, sm_weight, 1, lane_id);
+
+        const int32_t os = total_slices - 1 - 2 * batch;
+        if (os >= 0 && os < total_slices) {
+          const int32_t phys = phys_lut[os];
+          Target *slice_out = out + slice_stride * phys;
+          trunc_store_row<Target, Acc>(C[tile_row], max_abs_acc, slice_out, ldm, global_row, tile_col_base,
+                                       tile_in_bounds, is_interior_row, /*is_msb=*/(os == 0), lane_id, height);
+        }
+      } else { // M >= 3
+        if (batch > 0) {
+          // Inject deferred C_next into C
+#pragma unroll
+          for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e) {
+            C[tile_row][e] += C_next[tile_row][e];
+            C_next[tile_row][e] = 0;
+          }
+          if (!skip_D0)
+            mma_accumulate_row(C[tile_row], A_D0, sm_weight, 1, lane_id);
+          if (has_D1 && !skip_D1)
+            mma_accumulate_row(C[tile_row], A_D1, sm_weight, 2, lane_id);
+
+          const int32_t os = total_slices - 2 * batch;
+          if (os >= 0 && os < total_slices) {
+            const int32_t phys = phys_lut[os];
+            Target *slice_out = out + slice_stride * phys;
+            trunc_store_row<Target, Acc>(C[tile_row], max_abs_acc, slice_out, ldm, global_row, tile_col_base,
+                                         tile_in_bounds, is_interior_row, /*is_msb=*/(os == 0), lane_id, height);
+          }
+        }
+      }
+
+      // ============ Phase 3: Defer into C ============
+      // M=2: C += D1@W0
+      // M=3: C += D0@W0 + D1@W1
+      if constexpr (M == 2) {
+        if (has_D1 && !skip_D1)
+          mma_accumulate_row(C[tile_row], A_D1, sm_weight, 0, lane_id);
+      } else if constexpr (M >= 3) {
+        if (!skip_D0)
+          mma_accumulate_row(C[tile_row], A_D0, sm_weight, 0, lane_id);
+        if (has_D1 && !skip_D1)
+          mma_accumulate_row(C[tile_row], A_D1, sm_weight, 1, lane_id);
+      }
+
+      // ============ Phase 4: Defer into C_next (M >= 3 only) ============
+      if constexpr (M >= 3) {
+#pragma unroll
+        for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
+          C_next[tile_row][e] = 0;
+        if (has_D1 && !skip_D1)
+          mma_accumulate_row(C_next[tile_row], A_D1, sm_weight, 0, lane_id);
+      }
+    } // end tile_row
+
+    __syncthreads(); // protect current stage for next batch's TMA
+
+    // Wait for prefetched next batch
+    if (batch + 1 < num_batches) {
+      if (nxt_stage == 0) {
+        shmem_barrier_spin(&tma_mbar[0], phase_0);
+        phase_0 ^= 1;
+      } else {
+        shmem_barrier_spin(&tma_mbar[1], phase_1);
+        phase_1 ^= 1;
+      }
+    }
+  } // end batch loop
+
+  // ---- Flush: M-1 remaining outputs ----
+  // The batch loop stores outputs down to a certain position; the flush
+  // covers the remaining M-1 most-significant positions (output[M-2]..output[0]).
+  // For odd total_slices with M=3, some flush positions were already stored
+  // by the last batch, so we guard with lowest_batch_os.
+  if constexpr (M >= 2) {
+    // Lowest output_slice stored by the batch loop's Phase 2
+    const int32_t lowest_batch_os =
+        (M == 2) ? (total_slices - 1 - 2 * (num_batches - 1)) : (total_slices - 2 * (num_batches - 1));
+
+    for (int32_t flush_pos = M - 2; flush_pos >= 0; --flush_pos) {
+      if (flush_pos >= lowest_batch_os || flush_pos >= total_slices)
+        continue;
+
+#pragma unroll
+      for (int32_t tile_row = 0; tile_row < MMA_N; ++tile_row) {
+        // For the MSB position (flush_pos == 0), inject C_next into C
+        if constexpr (M >= 3) {
+          if (flush_pos == 0) {
+#pragma unroll
+            for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
+              C[tile_row][e] += C_next[tile_row][e];
+          }
+        }
+
+        const int32_t out_row_local = warp_id * MMA_N + tile_row;
+        const int32_t global_row = static_cast<int32_t>(blockIdx.x * TILE_SIZE_ROW) + out_row_local;
+        const bool is_interior_row = (global_row >= HALO && global_row < static_cast<int32_t>(height) - HALO);
+
+        const int32_t phys = phys_lut[flush_pos];
+        Target *slice_out = out + slice_stride * phys;
+        trunc_store_row<Target, Acc>(C[tile_row], max_abs_acc, slice_out, ldm, global_row, tile_col_base,
+                                     tile_in_bounds, is_interior_row, /*is_msb=*/(flush_pos == 0), lane_id, height);
+      } // end tile_row flush
+    } // end flush_pos
+  }
+
+  // ====================================================================
+  // BOUNDARY HANDLING (verbatim from cvstencil)
+  // ====================================================================
+  if (boundary.n_slices > 0) {
+    for (int32_t tile_row = 0; tile_row < MMA_N; ++tile_row) {
+      int32_t out_row_local = warp_id * MMA_N + tile_row;
+      int32_t global_row = static_cast<int32_t>(blockIdx.x * TILE_SIZE_ROW) + out_row_local;
+
+      for (int32_t elem = 0; elem < ELEMS_PER_THREAD; ++elem) {
+        int32_t local_col = lane_id % MMA_N;
+        int32_t local_row = (lane_id / MMA_N) + elem * (WARP_SIZE / MMA_N);
+        int32_t out_col = local_row * MMA_N + local_col;
+        int32_t global_col = static_cast<int32_t>(blockIdx.y * TILE_SIZE_COL) + out_col;
+
+        bool in_grid = (global_row < static_cast<int32_t>(height) && global_col < static_cast<int32_t>(ldm));
+        bool is_interior = in_grid && (global_row >= HALO && global_row < static_cast<int32_t>(height) - HALO &&
+                                       global_col >= HALO && global_col < static_cast<int32_t>(ldm) - HALO);
+
+        if (in_grid && !is_interior) {
+          size_t global_offset = static_cast<size_t>(global_row) * ldm + global_col;
+
+          Acc boundary_carry = static_cast<Acc>(0);
+          Acc boundary_accum = static_cast<Acc>(0);
+
+          for (int32_t slice_pos = total_slices - 1; slice_pos >= 0; --slice_pos) {
+            boundary_accum = boundary_carry;
+            boundary_carry = static_cast<Acc>(0);
+
+            for (int32_t gain_idx = 0; gain_idx < boundary.n_slices; ++gain_idx) {
+              int32_t input_slice = slice_pos - gain_idx;
+              if (input_slice >= 0 && !(input_slice == 0 && just_shifted)) {
+                int32_t phys_in = phys_lut[input_slice];
+                boundary_accum += static_cast<Acc>(in[slice_stride * phys_in + global_offset]) *
+                                  static_cast<int32_t>(boundary.emulated_gain[gain_idx]);
+              }
+            }
+
+            int32_t phys_out = phys_lut[slice_pos];
+            Target *out_ptr = out + slice_stride * phys_out;
+            if (slice_pos > 0) {
+              Target digit = static_cast<Target>(boundary_accum);
+              out_ptr[global_offset] = digit;
+              boundary_carry = (boundary_accum - static_cast<Acc>(digit)) >> (CHAR_BIT * sizeof(Target) - 1);
+            } else {
+              out_ptr[global_offset] = static_cast<Target>(boundary_accum);
+            }
+          }
+
+          max_abs_acc = max(max_abs_acc, abs(boundary_accum));
+        }
+      }
+    }
+  }
+
+  // ====================================================================
+  // OVERFLOW DETECTION (matches stencil_v1 pattern)
+  // ====================================================================
+  __syncthreads();
+  int32_t has_overflow = __any_sync(__activemask(), max_abs_acc > static_cast<Acc>(threshold));
+  if (lane_id == 0)
+    sm_overflow[warp_id] = has_overflow;
+  __syncthreads();
+
+  if (tid < WARP_SIZE) {
+    int32_t any_overflow = (tid < NUM_WARPS) ? sm_overflow[tid] : 0;
+    any_overflow = __any_sync(__activemask(), any_overflow);
+    if (any_overflow && tid == 0) {
+      atomicExch(&desc->shift_required, 1);
+    }
+  }
+}
+
 } // namespace ozigpu
 
 #endif // HEADER_OZI_STENCIL_CONV

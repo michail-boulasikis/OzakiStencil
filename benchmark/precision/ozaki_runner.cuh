@@ -360,6 +360,10 @@ public:
 
     ozigpu::upload_slice_phys_lut(active_slices);
 
+    cudaFuncSetAttribute(ozigpu::cvstencil_v2<ozigpu::OzakiFP_Int8<Real>, M>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         ozigpu::convstencil::DYN_SMEM_BYTES);
+
     ozigpu::convstencil::TmaDescriptors tma;
     size_t total_height = static_cast<size_t>(num_slices_total) * height;
     bool tma_ok = ozigpu::convstencil::create_tma_descriptors(tma, d_slices_1, d_slices_2, total_height, ldm);
@@ -368,8 +372,8 @@ public:
 
     NVTX_PUSH("Integration Loop");
     for (int32_t t = 0; t < n_iterations; ++t) {
-      ozigpu::cvstencil<ozigpu::OzakiFP_Int8<Real>, M>
-          <<<grid, block>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary_, tma.h_main[0], tma.h_extra[0]);
+      ozigpu::cvstencil_v2<ozigpu::OzakiFP_Int8<Real>, M>
+          <<<grid, block, ozigpu::convstencil::DYN_SMEM_BYTES>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary_, tma.h_main[0], tma.h_extra[0]);
 
       if (t < n_iterations - 1) {
         int32_t min_shifts_now;
