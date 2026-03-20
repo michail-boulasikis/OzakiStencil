@@ -29,30 +29,34 @@ static_assert(MMA_NUM % 2 == 0, "MMA_NUM must be even for k32 pairing");
 
 // ========== cvstencil_v2 helpers ==========
 
-/** Load A-fragment from a unified 192B-per-row buffer.
- *  Single pointer, no main/extra split, no boundary checks (max eff_col = 147 < 192). */
+/** Load K=32 A-fragment from a unified 192B-per-row buffer.
+ *  Computes row base once and reuses for both k16 halves (row_hi = row_lo + 2*ROW_STRIDE).
+ *  Takes k_row (= k_start / STRIDE) directly, avoiding the multiply-then-shift roundtrip. */
 template <int32_t HALO_OFF, int32_t ROW_STRIDE>
-__device__ __forceinline__ void load_a_frag_unified(uint32_t (&A)[2], const int8_t *sm, int32_t k_start,
-                                                    int32_t lane_id) {
+__device__ __forceinline__ void load_a_frag_k32(uint32_t (&A)[4], const int8_t *sm, int32_t k_row, int32_t lane_id) {
   const int32_t groupID = lane_id >> 2;
   const int32_t tIG = lane_id & 3;
   const int32_t col_offset = (tIG & 1) * 4;
-  const int32_t row = ((k_start >> 3) + (tIG >> 1)) * ROW_STRIDE;
+  const int32_t row_lo = (k_row + (tIG >> 1)) * ROW_STRIDE;
 
 #pragma unroll
-  for (int32_t r = 0; r < 2; ++r) {
-    const int32_t m = groupID + r * 8;
-    const int32_t eff_col = HALO_OFF + m * 8 + col_offset;
+  for (int32_t half = 0; half < 2; ++half) {
+    const int32_t row = row_lo + half * (2 * ROW_STRIDE);
+#pragma unroll
+    for (int32_t r = 0; r < 2; ++r) {
+      const int32_t m = groupID + r * 8;
+      const int32_t eff_col = HALO_OFF + m * 8 + col_offset;
 
-    if constexpr ((HALO_OFF & 3) == 0) {
-      A[r] = *reinterpret_cast<const uint32_t *>(sm + row + eff_col);
-    } else {
-      constexpr int32_t MISALIGN = HALO_OFF & 3;
-      constexpr uint32_t PRMT_SEL = MISALIGN | ((MISALIGN + 1) << 4) | ((MISALIGN + 2) << 8) | ((MISALIGN + 3) << 12);
-      const int32_t aligned = eff_col - MISALIGN;
-      const uint32_t w0 = *reinterpret_cast<const uint32_t *>(sm + row + aligned);
-      const uint32_t w1 = *reinterpret_cast<const uint32_t *>(sm + row + aligned + 4);
-      A[r] = __byte_perm(w0, w1, PRMT_SEL);
+      if constexpr ((HALO_OFF & 3) == 0) {
+        A[half * 2 + r] = *reinterpret_cast<const uint32_t *>(sm + row + eff_col);
+      } else {
+        constexpr int32_t MISALIGN = HALO_OFF & 3;
+        constexpr uint32_t PRMT_SEL = MISALIGN | ((MISALIGN + 1) << 4) | ((MISALIGN + 2) << 8) | ((MISALIGN + 3) << 12);
+        const int32_t aligned = eff_col - MISALIGN;
+        const uint32_t w0 = *reinterpret_cast<const uint32_t *>(sm + row + aligned);
+        const uint32_t w1 = *reinterpret_cast<const uint32_t *>(sm + row + aligned + 4);
+        A[half * 2 + r] = __byte_perm(w0, w1, PRMT_SEL);
+      }
     }
   }
 }
@@ -60,66 +64,41 @@ __device__ __forceinline__ void load_a_frag_unified(uint32_t (&A)[2], const int8
 /** Weight-reuse MMA (K=32): load B-pair once, execute m16n8k32 across all 8 tile_rows.
  *  Half-batched: processes 4 tile_rows per phase to keep A-register pressure at 16 (same as K=16). */
 template <int32_t HALO_OFF>
-__device__ __forceinline__ void mma_weight_reuse(int32_t (&C_all)[MMA_N][ELEMS_PER_THREAD],
-                                                 const int8_t *sm_data, uint32_t B_lo, uint32_t B_hi,
-                                                 int32_t k32_tile, int32_t warp_id, int32_t lane_id) {
-  constexpr int32_t HALF = MMA_N / 2; // = 4
+__device__ __forceinline__ void mma_weight_reuse(int32_t (&C_all)[MMA_N][ELEMS_PER_THREAD], const int8_t *sm_data,
+                                                 uint32_t B_lo, uint32_t B_hi, int32_t k32_tile, int32_t warp_id,
+                                                 int32_t lane_id) {
+  constexpr int32_t HALF = MMA_N / 2;
+  constexpr int32_t K32_K_ROWS = 2 * MMA_K / STRIDE; // = 4
   uint32_t A_half[HALF][4];
 
   // ---- First half: tile_rows 0..3 ----
 #pragma unroll
   for (int32_t tr = 0; tr < HALF; ++tr) {
-    const int32_t k_start = (warp_id * MMA_N + tr) * STRIDE + k32_tile * 2 * MMA_K;
-    uint32_t A_tmp[2];
-    load_a_frag_unified<HALO_OFF, SMEM_ROW_BYTES_V2>(A_tmp, sm_data, k_start, lane_id);
-    A_half[tr][0] = A_tmp[0];
-    A_half[tr][1] = A_tmp[1];
-    load_a_frag_unified<HALO_OFF, SMEM_ROW_BYTES_V2>(A_tmp, sm_data, k_start + MMA_K, lane_id);
-    A_half[tr][2] = A_tmp[0];
-    A_half[tr][3] = A_tmp[1];
+    const int32_t k_row = warp_id * MMA_N + tr + k32_tile * K32_K_ROWS;
+    load_a_frag_k32<HALO_OFF, SMEM_ROW_BYTES_V2>(A_half[tr], sm_data, k_row, lane_id);
   }
 #pragma unroll
   for (int32_t tr = 0; tr < HALF; ++tr) {
-    uint32_t acc[ELEMS_PER_THREAD];
-#pragma unroll
-    for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
-      acc[e] = static_cast<uint32_t>(C_all[tr][e]);
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
-                 : "r"(A_half[tr][0]), "r"(A_half[tr][1]), "r"(A_half[tr][2]), "r"(A_half[tr][3]),
-                   "r"(B_lo), "r"(B_hi));
-#pragma unroll
-    for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
-      C_all[tr][e] = static_cast<int32_t>(acc[e]);
+                 : "+r"(C_all[tr][0]), "+r"(C_all[tr][1]), "+r"(C_all[tr][2]), "+r"(C_all[tr][3])
+                 : "r"(A_half[tr][0]), "r"(A_half[tr][1]), "r"(A_half[tr][2]), "r"(A_half[tr][3]), "r"(B_lo),
+                   "r"(B_hi));
   }
 
   // ---- Second half: tile_rows 4..7 ----
 #pragma unroll
   for (int32_t tr = 0; tr < HALF; ++tr) {
-    const int32_t k_start = (warp_id * MMA_N + (tr + HALF)) * STRIDE + k32_tile * 2 * MMA_K;
-    uint32_t A_tmp[2];
-    load_a_frag_unified<HALO_OFF, SMEM_ROW_BYTES_V2>(A_tmp, sm_data, k_start, lane_id);
-    A_half[tr][0] = A_tmp[0];
-    A_half[tr][1] = A_tmp[1];
-    load_a_frag_unified<HALO_OFF, SMEM_ROW_BYTES_V2>(A_tmp, sm_data, k_start + MMA_K, lane_id);
-    A_half[tr][2] = A_tmp[0];
-    A_half[tr][3] = A_tmp[1];
+    const int32_t k_row = warp_id * MMA_N + (tr + HALF) + k32_tile * K32_K_ROWS;
+    load_a_frag_k32<HALO_OFF, SMEM_ROW_BYTES_V2>(A_half[tr], sm_data, k_row, lane_id);
   }
 #pragma unroll
   for (int32_t tr = 0; tr < HALF; ++tr) {
-    uint32_t acc[ELEMS_PER_THREAD];
-#pragma unroll
-    for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
-      acc[e] = static_cast<uint32_t>(C_all[tr + HALF][e]);
-    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                 : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
-                 : "r"(A_half[tr][0]), "r"(A_half[tr][1]), "r"(A_half[tr][2]), "r"(A_half[tr][3]),
-                   "r"(B_lo), "r"(B_hi));
-#pragma unroll
-    for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
-      C_all[tr + HALF][e] = static_cast<int32_t>(acc[e]);
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+r"(C_all[tr + HALF][0]), "+r"(C_all[tr + HALF][1]), "+r"(C_all[tr + HALF][2]), "+r"(C_all[tr + HALF][3])
+        : "r"(A_half[tr][0]), "r"(A_half[tr][1]), "r"(A_half[tr][2]), "r"(A_half[tr][3]), "r"(B_lo), "r"(B_hi));
   }
 }
 
@@ -347,7 +326,7 @@ using namespace ozi;
 template <OzakiPair O, int32_t M = 1>
   requires(std::is_same_v<typename O::target_type, int8_t>) && (M >= 1)
 // clang-format off
-__global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE, 2) void cvstencil_v2(
+__global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE, 1) void cvstencil_v2(
     typename O::target_type *__restrict__ out,
     const typename O::target_type *__restrict__ in,
     const typename O::target_type *__restrict__ weight,
@@ -513,37 +492,39 @@ __global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE, 2) void cvstenci
       }
 
       // ---- MMA ops with weight reuse (inlined to keep constexpr visible to NVCC) ----
-#define CVSTENCIL_V2_WEIGHT_MAJOR_OP(OP_IDX)                                                     \
-      if constexpr (s.n_ops >= (OP_IDX) + 1) {                                                   \
-        constexpr auto mop = s.ops[(OP_IDX)];                                                    \
-        const int8_t *sm_data;                                                                    \
-        bool skip;                                                                                \
-        if constexpr (mop.data_slot == 0) { sm_data = sm_D0; skip = skip_D0; }                   \
-        else { sm_data = sm_D1; skip = !has_D1 || skip_D1; }                                     \
-        if (!skip) {                                                                              \
-          _Pragma("unroll")                                                                       \
-          for (int32_t tess = 0; tess < 2; ++tess) {                                             \
-            _Pragma("unroll")                                                                     \
-            for (int32_t k32 = 0; k32 < MMA_NUM / 2; ++k32) {                                   \
-              uint32_t B_lo = sm_weight[(mop.weight_slot * 2 + tess) * PACKED_WT_WORDS            \
-                                        + (k32 * 2) * WARP_SIZE + lane_id];                       \
-              uint32_t B_hi = sm_weight[(mop.weight_slot * 2 + tess) * PACKED_WT_WORDS            \
-                                        + (k32 * 2 + 1) * WARP_SIZE + lane_id];                   \
-              if (tess == 0) {                                                                    \
-                if constexpr (s.accumulate_to_cnext)                                              \
-                  mma_weight_reuse<UPPER_HALO_OFF>(C_next, sm_data, B_lo, B_hi, k32, warp_id, lane_id); \
-                else                                                                              \
-                  mma_weight_reuse<UPPER_HALO_OFF>(C, sm_data, B_lo, B_hi, k32, warp_id, lane_id);     \
-              } else {                                                                            \
-                if constexpr (s.accumulate_to_cnext)                                              \
-                  mma_weight_reuse<LOWER_HALO_OFF_UNIFIED>(C_next, sm_data, B_lo, B_hi, k32, warp_id, lane_id); \
-                else                                                                              \
-                  mma_weight_reuse<LOWER_HALO_OFF_UNIFIED>(C, sm_data, B_lo, B_hi, k32, warp_id, lane_id);     \
-              }                                                                                   \
-            }                                                                                     \
-          }                                                                                       \
-        }                                                                                         \
-      }
+#define CVSTENCIL_V2_WEIGHT_MAJOR_OP(OP_IDX)                                                                           \
+  if constexpr (s.n_ops >= (OP_IDX) + 1) {                                                                             \
+    constexpr auto mop = s.ops[(OP_IDX)];                                                                              \
+    const int8_t *sm_data;                                                                                             \
+    bool skip;                                                                                                         \
+    if constexpr (mop.data_slot == 0) {                                                                                \
+      sm_data = sm_D0;                                                                                                 \
+      skip = skip_D0;                                                                                                  \
+    } else {                                                                                                           \
+      sm_data = sm_D1;                                                                                                 \
+      skip = !has_D1 || skip_D1;                                                                                       \
+    }                                                                                                                  \
+    if (!skip) {                                                                                                       \
+      _Pragma("unroll") for (int32_t tess = 0; tess < 2; ++tess) {                                                     \
+        _Pragma("unroll") for (int32_t k32 = 0; k32 < MMA_NUM / 2; ++k32) {                                            \
+          uint32_t B_lo = sm_weight[(mop.weight_slot * 2 + tess) * PACKED_WT_WORDS + (k32 * 2) * WARP_SIZE + lane_id]; \
+          uint32_t B_hi =                                                                                              \
+              sm_weight[(mop.weight_slot * 2 + tess) * PACKED_WT_WORDS + (k32 * 2 + 1) * WARP_SIZE + lane_id];         \
+          if (tess == 0) {                                                                                             \
+            if constexpr (s.accumulate_to_cnext)                                                                       \
+              mma_weight_reuse<UPPER_HALO_OFF>(C_next, sm_data, B_lo, B_hi, k32, warp_id, lane_id);                    \
+            else                                                                                                       \
+              mma_weight_reuse<UPPER_HALO_OFF>(C, sm_data, B_lo, B_hi, k32, warp_id, lane_id);                         \
+          } else {                                                                                                     \
+            if constexpr (s.accumulate_to_cnext)                                                                       \
+              mma_weight_reuse<LOWER_HALO_OFF_UNIFIED>(C_next, sm_data, B_lo, B_hi, k32, warp_id, lane_id);            \
+            else                                                                                                       \
+              mma_weight_reuse<LOWER_HALO_OFF_UNIFIED>(C, sm_data, B_lo, B_hi, k32, warp_id, lane_id);                 \
+          }                                                                                                            \
+        }                                                                                                              \
+      }                                                                                                                \
+    }                                                                                                                  \
+  }
       CVSTENCIL_V2_WEIGHT_MAJOR_OP(0)
       CVSTENCIL_V2_WEIGHT_MAJOR_OP(1)
 #undef CVSTENCIL_V2_WEIGHT_MAJOR_OP
@@ -556,15 +537,13 @@ __global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE, 2) void cvstenci
           Target *slice_out = out + slice_stride * phys;
 #pragma unroll
           for (int32_t tr = 0; tr < MMA_N; ++tr) {
-            const int32_t global_row =
-                static_cast<int32_t>(blockIdx.x * TILE_SIZE_ROW) + warp_id * MMA_N + tr;
-            const bool is_interior_row =
-                (global_row >= HALO && global_row < static_cast<int32_t>(height) - HALO);
-            store_row(C[tr], slice_out, ldm, global_row, tile_col_base,
-                      tile_in_bounds, is_interior_row, lane_id, height);
+            const int32_t global_row = static_cast<int32_t>(blockIdx.x * TILE_SIZE_ROW) + warp_id * MMA_N + tr;
+            const bool is_interior_row = (global_row >= HALO && global_row < static_cast<int32_t>(height) - HALO);
+            store_row(C[tr], slice_out, ldm, global_row, tile_col_base, tile_in_bounds, is_interior_row, lane_id,
+                      height);
             if (os == 0)
-              check_overflow(C[tr], max_abs_acc, tile_in_bounds, global_row,
-                             tile_col_base, is_interior_row, lane_id, ldm, height);
+              check_overflow(C[tr], max_abs_acc, tile_in_bounds, global_row, tile_col_base, is_interior_row, lane_id,
+                             ldm, height);
             else
               extract_carry<Target, Acc>(C[tr]);
           }
@@ -689,7 +668,6 @@ __global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE, 2) void cvstenci
   // ====================================================================
   // OVERFLOW DETECTION (matches stencil_v1 pattern)
   // ====================================================================
-  __syncthreads();
   int32_t has_overflow = __any_sync(__activemask(), max_abs_acc > static_cast<Acc>(threshold));
   if (lane_id == 0)
     sm_overflow[warp_id] = has_overflow;
