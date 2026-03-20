@@ -25,6 +25,8 @@ constexpr int32_t TMA_TX_BYTES_V2 = SMEM_ROW_BYTES_V2 * DATA_TILE_SIZE_ROW; // 7
 constexpr int32_t SMEM_SLOT_STRIDE_V2 = ((SMEM_TESS_BYTES_V2 + 255) / 256) * 256;             // 7,680 B
 constexpr int32_t DYN_SMEM_BYTES = NUM_BUFFER_STAGES * SLOTS_PER_STAGE * SMEM_SLOT_STRIDE_V2; // 46,080 B
 
+static_assert(MMA_NUM % 2 == 0, "MMA_NUM must be even for k32 pairing");
+
 // ========== cvstencil_v2 helpers ==========
 
 /** Load A-fragment from a unified 192B-per-row buffer.
@@ -55,36 +57,69 @@ __device__ __forceinline__ void load_a_frag_unified(uint32_t (&A)[2], const int8
   }
 }
 
-/** Weight-reuse MMA: load B once, execute IMMA across all 8 tile_rows.
- *  A-fragments are loaded per tile_row from sm_data (data slice's smem buffer).
- *  Loads all A-frags first (phase 1), then executes all IMMAs (phase 2),
- *  giving ~16-32 instructions of distance to hide smem latency. */
+/** Weight-reuse MMA (K=32): load B-pair once, execute m16n8k32 across all 8 tile_rows.
+ *  Half-batched: processes 4 tile_rows per phase to keep A-register pressure at 16 (same as K=16). */
 template <int32_t HALO_OFF>
 __device__ __forceinline__ void mma_weight_reuse(int32_t (&C_all)[MMA_N][ELEMS_PER_THREAD],
-                                                 const int8_t *sm_data, uint32_t B,
-                                                 int32_t k_tile, int32_t warp_id, int32_t lane_id) {
-  // Phase 1: Load A-frags for all tile_rows (16 regs, dead after phase 2)
-  uint32_t A_all[MMA_N][2];
-#pragma unroll
-  for (int32_t tr = 0; tr < MMA_N; ++tr) {
-    const int32_t k_start = (warp_id * MMA_N + tr) * STRIDE + k_tile * MMA_K;
-    load_a_frag_unified<HALO_OFF, SMEM_ROW_BYTES_V2>(A_all[tr], sm_data, k_start, lane_id);
-  }
+                                                 const int8_t *sm_data, uint32_t B_lo, uint32_t B_hi,
+                                                 int32_t k32_tile, int32_t warp_id, int32_t lane_id) {
+  constexpr int32_t HALF = MMA_N / 2; // = 4
+  uint32_t A_half[HALF][4];
 
-  // Phase 2: Execute IMMAs for all tile_rows (B reused 8x)
+  // ---- First half: tile_rows 0..3 ----
 #pragma unroll
-  for (int32_t tr = 0; tr < MMA_N; ++tr) {
+  for (int32_t tr = 0; tr < HALF; ++tr) {
+    const int32_t k_start = (warp_id * MMA_N + tr) * STRIDE + k32_tile * 2 * MMA_K;
+    uint32_t A_tmp[2];
+    load_a_frag_unified<HALO_OFF, SMEM_ROW_BYTES_V2>(A_tmp, sm_data, k_start, lane_id);
+    A_half[tr][0] = A_tmp[0];
+    A_half[tr][1] = A_tmp[1];
+    load_a_frag_unified<HALO_OFF, SMEM_ROW_BYTES_V2>(A_tmp, sm_data, k_start + MMA_K, lane_id);
+    A_half[tr][2] = A_tmp[0];
+    A_half[tr][3] = A_tmp[1];
+  }
+#pragma unroll
+  for (int32_t tr = 0; tr < HALF; ++tr) {
     uint32_t acc[ELEMS_PER_THREAD];
 #pragma unroll
     for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
       acc[e] = static_cast<uint32_t>(C_all[tr][e]);
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
-                 "{%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
-                 : "r"(A_all[tr][0]), "r"(A_all[tr][1]), "r"(B));
+                 : "r"(A_half[tr][0]), "r"(A_half[tr][1]), "r"(A_half[tr][2]), "r"(A_half[tr][3]),
+                   "r"(B_lo), "r"(B_hi));
 #pragma unroll
     for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
       C_all[tr][e] = static_cast<int32_t>(acc[e]);
+  }
+
+  // ---- Second half: tile_rows 4..7 ----
+#pragma unroll
+  for (int32_t tr = 0; tr < HALF; ++tr) {
+    const int32_t k_start = (warp_id * MMA_N + (tr + HALF)) * STRIDE + k32_tile * 2 * MMA_K;
+    uint32_t A_tmp[2];
+    load_a_frag_unified<HALO_OFF, SMEM_ROW_BYTES_V2>(A_tmp, sm_data, k_start, lane_id);
+    A_half[tr][0] = A_tmp[0];
+    A_half[tr][1] = A_tmp[1];
+    load_a_frag_unified<HALO_OFF, SMEM_ROW_BYTES_V2>(A_tmp, sm_data, k_start + MMA_K, lane_id);
+    A_half[tr][2] = A_tmp[0];
+    A_half[tr][3] = A_tmp[1];
+  }
+#pragma unroll
+  for (int32_t tr = 0; tr < HALF; ++tr) {
+    uint32_t acc[ELEMS_PER_THREAD];
+#pragma unroll
+    for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
+      acc[e] = static_cast<uint32_t>(C_all[tr + HALF][e]);
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+r"(acc[0]), "+r"(acc[1]), "+r"(acc[2]), "+r"(acc[3])
+                 : "r"(A_half[tr][0]), "r"(A_half[tr][1]), "r"(A_half[tr][2]), "r"(A_half[tr][3]),
+                   "r"(B_lo), "r"(B_hi));
+#pragma unroll
+    for (int32_t e = 0; e < ELEMS_PER_THREAD; ++e)
+      C_all[tr + HALF][e] = static_cast<int32_t>(acc[e]);
   }
 }
 
@@ -489,19 +524,21 @@ __global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE, 2) void cvstenci
           _Pragma("unroll")                                                                       \
           for (int32_t tess = 0; tess < 2; ++tess) {                                             \
             _Pragma("unroll")                                                                     \
-            for (int32_t k_tile = 0; k_tile < MMA_NUM; ++k_tile) {                               \
-              uint32_t B = sm_weight[(mop.weight_slot * 2 + tess) * PACKED_WT_WORDS               \
-                                     + k_tile * WARP_SIZE + lane_id];                             \
+            for (int32_t k32 = 0; k32 < MMA_NUM / 2; ++k32) {                                   \
+              uint32_t B_lo = sm_weight[(mop.weight_slot * 2 + tess) * PACKED_WT_WORDS            \
+                                        + (k32 * 2) * WARP_SIZE + lane_id];                       \
+              uint32_t B_hi = sm_weight[(mop.weight_slot * 2 + tess) * PACKED_WT_WORDS            \
+                                        + (k32 * 2 + 1) * WARP_SIZE + lane_id];                   \
               if (tess == 0) {                                                                    \
                 if constexpr (s.accumulate_to_cnext)                                              \
-                  mma_weight_reuse<UPPER_HALO_OFF>(C_next, sm_data, B, k_tile, warp_id, lane_id);\
+                  mma_weight_reuse<UPPER_HALO_OFF>(C_next, sm_data, B_lo, B_hi, k32, warp_id, lane_id); \
                 else                                                                              \
-                  mma_weight_reuse<UPPER_HALO_OFF>(C, sm_data, B, k_tile, warp_id, lane_id);     \
+                  mma_weight_reuse<UPPER_HALO_OFF>(C, sm_data, B_lo, B_hi, k32, warp_id, lane_id);     \
               } else {                                                                            \
                 if constexpr (s.accumulate_to_cnext)                                              \
-                  mma_weight_reuse<LOWER_HALO_OFF_UNIFIED>(C_next, sm_data, B, k_tile, warp_id, lane_id); \
+                  mma_weight_reuse<LOWER_HALO_OFF_UNIFIED>(C_next, sm_data, B_lo, B_hi, k32, warp_id, lane_id); \
                 else                                                                              \
-                  mma_weight_reuse<LOWER_HALO_OFF_UNIFIED>(C, sm_data, B, k_tile, warp_id, lane_id);     \
+                  mma_weight_reuse<LOWER_HALO_OFF_UNIFIED>(C, sm_data, B_lo, B_hi, k32, warp_id, lane_id);     \
               }                                                                                   \
             }                                                                                     \
           }                                                                                       \
