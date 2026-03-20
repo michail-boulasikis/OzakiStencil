@@ -11,19 +11,19 @@ constexpr int32_t SLICES_PER_BATCH = 2;
 constexpr int32_t NUM_BUFFER_STAGES = 2;
 constexpr int32_t SLOTS_PER_STAGE = SLICES_PER_BATCH; // 2 (one unified buffer per slice, not per tessellation)
 
-// Unified TMA tail: 32B wide replaces per-tessellation 16B extras.
-// Both tessellations share one main+tail buffer per data slice.
-constexpr int32_t TMA_TAIL_TILE = 32;
-constexpr int32_t SMEM_TAIL_BYTES = ((TMA_TAIL_TILE * SMEM_ROWS_TMA + 127) / 128) * 128; // 1,280 B
-constexpr int32_t TMA_TAIL_TX_BYTES = TMA_TAIL_TILE * DATA_TILE_SIZE_ROW;                 // 1,216 B
-
 // Lower tessellation HALO_OFF in unified buffer: original offset + inter-tessellation gap
 constexpr int32_t LOWER_HALO_OFF_UNIFIED = STENCIL_SIDE + UPPER_HALO_OFF; // 20
 
-// Dynamic shared memory for double-buffered unified data tiles
-constexpr int32_t DYN_SMEM_MAIN = NUM_BUFFER_STAGES * SLOTS_PER_STAGE * SMEM_TESS_BYTES; // 19,968 B
-constexpr int32_t DYN_SMEM_TAIL = NUM_BUFFER_STAGES * SLOTS_PER_STAGE * SMEM_TAIL_BYTES; // 5,120 B
-constexpr int32_t DYN_SMEM_BYTES = DYN_SMEM_MAIN + DYN_SMEM_TAIL;                        // 25,088 B
+// 192B unified TMA tile: eliminates bank conflicts.
+// With 128B rows, (128/4)%32 = 0 -> systematic 2-way bank conflicts.
+// With 192B rows, (192/4)%32 = 16 -> consecutive rows offset by 16 banks, perfectly complementary.
+constexpr int32_t SMEM_ROW_BYTES_V2 = 192;
+constexpr int32_t SMEM_TESS_BYTES_V2 = SMEM_ROW_BYTES_V2 * SMEM_ROWS_TMA;                       // 7,488 B
+constexpr int32_t TMA_TX_BYTES_V2 = SMEM_ROW_BYTES_V2 * DATA_TILE_SIZE_ROW;                      // 7,296 B
+// TMA SWIZZLE_NONE requires destination aligned to next_power_of_2(boxDim[0]) = 256 bytes.
+// Pad each slot to 256-byte boundary so all TMA destinations are correctly aligned.
+constexpr int32_t SMEM_SLOT_STRIDE_V2 = ((SMEM_TESS_BYTES_V2 + 255) / 256) * 256;                // 7,680 B
+constexpr int32_t DYN_SMEM_BYTES = NUM_BUFFER_STAGES * SLOTS_PER_STAGE * SMEM_SLOT_STRIDE_V2;    // 30,720 B
 
 // ========== cvstencil_v2 helper: MMA accumulate for one tile_row ==========
 
@@ -54,23 +54,50 @@ __device__ __forceinline__ void mma_accumulate_row(int32_t (&target)[ELEMS_PER_T
     target[elem] = static_cast<int32_t>(mma_accum[elem]);
 }
 
-/** Load A-fragments from a unified buffer within a double-buffered dynamic smem layout.
+/** Load A-fragment from a unified 192B-per-row buffer.
+ *  Single pointer, no main/extra split, no boundary checks (max eff_col = 147 < 192). */
+template <int32_t HALO_OFF, int32_t ROW_STRIDE>
+__device__ __forceinline__ void load_a_frag_unified(uint32_t (&A)[2], const int8_t *sm,
+                                                     int32_t k_start, int32_t lane_id) {
+  const int32_t groupID = lane_id >> 2;
+  const int32_t tIG = lane_id & 3;
+  const int32_t col_offset = (tIG & 1) * 4;
+  const int32_t row = ((k_start >> 3) + (tIG >> 1)) * ROW_STRIDE;
+
+#pragma unroll
+  for (int32_t r = 0; r < 2; ++r) {
+    const int32_t m = groupID + r * 8;
+    const int32_t eff_col = HALO_OFF + m * 8 + col_offset;
+
+    if constexpr ((HALO_OFF & 3) == 0) {
+      A[r] = *reinterpret_cast<const uint32_t *>(sm + row + eff_col);
+    } else {
+      constexpr int32_t MISALIGN = HALO_OFF & 3;
+      constexpr uint32_t PRMT_SEL = MISALIGN | ((MISALIGN + 1) << 4) |
+                                    ((MISALIGN + 2) << 8) | ((MISALIGN + 3) << 12);
+      const int32_t aligned = eff_col - MISALIGN;
+      const uint32_t w0 = *reinterpret_cast<const uint32_t *>(sm + row + aligned);
+      const uint32_t w1 = *reinterpret_cast<const uint32_t *>(sm + row + aligned + 4);
+      A[r] = __byte_perm(w0, w1, PRMT_SEL);
+    }
+  }
+}
+
+/** Load A-fragments from a unified 192B buffer within a double-buffered dynamic smem layout.
  *  stage: 0 or 1 (double-buffer stage)
  *  slice_in_batch: 0 or 1 (which data slice within the batch)
- *  Both tessellations read from the same main+tail buffers with different HALO_OFF. */
+ *  Both tessellations read from the same buffer with different HALO_OFF. */
 __device__ __forceinline__ void load_a_frags_for_slot(uint32_t (&A_frags)[2][MMA_NUM][2], const int8_t *dyn_smem,
                                                       int32_t stage, int32_t slice_in_batch, int32_t k_base,
                                                       int32_t lane_id) {
-  int32_t slot = slice_in_batch; // 0 or 1 (unified: one buffer per slice)
-  const int8_t *sm_main = dyn_smem + (stage * SLOTS_PER_STAGE + slot) * SMEM_TESS_BYTES;
-  const int8_t *sm_tail = dyn_smem + DYN_SMEM_MAIN + (stage * SLOTS_PER_STAGE + slot) * SMEM_TAIL_BYTES;
+  const int8_t *sm = dyn_smem + (stage * SLOTS_PER_STAGE + slice_in_batch) * SMEM_SLOT_STRIDE_V2;
 
 #pragma unroll
   for (int32_t k_tile = 0; k_tile < MMA_NUM; ++k_tile) {
-    load_a_frag_tma_split<UPPER_HALO_OFF, TMA_TAIL_TILE>(A_frags[0][k_tile], sm_main, sm_tail,
-                                                          k_base + k_tile * MMA_K, lane_id);
-    load_a_frag_tma_split<LOWER_HALO_OFF_UNIFIED, TMA_TAIL_TILE>(A_frags[1][k_tile], sm_main, sm_tail,
-                                                                   k_base + k_tile * MMA_K, lane_id);
+    load_a_frag_unified<UPPER_HALO_OFF, SMEM_ROW_BYTES_V2>(A_frags[0][k_tile], sm,
+                                                             k_base + k_tile * MMA_K, lane_id);
+    load_a_frag_unified<LOWER_HALO_OFF_UNIFIED, SMEM_ROW_BYTES_V2>(A_frags[1][k_tile], sm,
+                                                                      k_base + k_tile * MMA_K, lane_id);
   }
 }
 
@@ -154,10 +181,10 @@ __device__ __forceinline__ void dispatch_mma(int32_t (&acc)[ELEMS_PER_THREAD], i
 }
 
 /** Issue TMA loads for one batch of data slices into a double-buffer stage.
- *  Unified buffer: 1 main (128B) + 1 tail (32B) per data slice (was 2+2 per-tessellation).
+ *  Unified 192B buffer: 1 TMA per data slice (no split main+tail).
  *  All parameters passed by value to avoid address-taking (stack spills). */
 __device__ __forceinline__ void issue_tma_for_batch(int32_t batch, int32_t stage, int8_t *dyn_smem, uint64_t *tma_mbar,
-                                                    const CUtensorMap *d_t_map, const CUtensorMap *d_t_map_tail,
+                                                    const CUtensorMap *d_t_map,
                                                     const int32_t *phys_lut, int32_t total_slices, int32_t num_batches,
                                                     int32_t just_shifted, int32_t height, int32_t data_row_start,
                                                     int32_t aligned_upper) {
@@ -172,8 +199,7 @@ __device__ __forceinline__ void issue_tma_for_batch(int32_t batch, int32_t stage
       ++active_slices;
   }
 
-  // 1 main + 1 tail per active slice (was 2 main + 2 extra)
-  uint32_t tx = active_slices * (TMA_TX_BYTES + TMA_TAIL_TX_BYTES);
+  uint32_t tx = active_slices * TMA_TX_BYTES_V2;
   shmem_barrier_arrive_expect_tx(&tma_mbar[stage], tx);
 
   for (int32_t s = 0; s < slices_in_batch; ++s) {
@@ -184,12 +210,8 @@ __device__ __forceinline__ void issue_tma_for_batch(int32_t batch, int32_t stage
     int32_t physical_slice = phys_lut[data_logical];
     int32_t tma_row = physical_slice * height + data_row_start;
 
-    // Unified: 1 main + 1 tail per slice (was 2+2 per-tessellation)
-    int8_t *data_main = dyn_smem + (stage * SLOTS_PER_STAGE + s) * SMEM_TESS_BYTES;
-    int8_t *data_tail = dyn_smem + DYN_SMEM_MAIN + (stage * SLOTS_PER_STAGE + s) * SMEM_TAIL_BYTES;
-
-    tma_load_tile_2d(data_main, d_t_map, aligned_upper, tma_row, &tma_mbar[stage]);
-    tma_load_tile_2d(data_tail, d_t_map_tail, aligned_upper + SMEM_ROW_BYTES, tma_row, &tma_mbar[stage]);
+    int8_t *data_dst = dyn_smem + (stage * SLOTS_PER_STAGE + s) * SMEM_SLOT_STRIDE_V2;
+    tma_load_tile_2d(data_dst, d_t_map, aligned_upper, tma_row, &tma_mbar[stage]);
   }
 }
 
@@ -280,6 +302,26 @@ template <int32_t M> static constexpr OutputSchedule make_schedule() {
   return s;
 }
 
+// Ping-pong pair of unified 192B TMA descriptors (host-side, passed by value via __grid_constant__).
+struct TmaDescriptorsV2 {
+  CUtensorMap h_main[2] = {};
+  void swap() { std::swap(h_main[0], h_main[1]); }
+  void free() {} // No-op: host-side objects, no device allocation.
+};
+
+// Create unified 192B TMA descriptors for two ping-pong slice buffers.
+// ldm minimum stays at SMEM_ROW_BYTES (128), NOT raised to 192.
+// TMA zero-fills OOB columns for integer types, so tile_width > ldm is safe.
+inline bool create_tma_descriptors_v2(TmaDescriptorsV2 &out, const int8_t *buf_a, const int8_t *buf_b,
+                                       size_t total_height, size_t ldm) {
+  if (ldm % 16 != 0 || ldm < SMEM_ROW_BYTES)
+    return false;
+  if (create_tma_descriptor_impl(&out.h_main[0], buf_a, total_height, ldm, SMEM_ROW_BYTES_V2) != CUDA_SUCCESS ||
+      create_tma_descriptor_impl(&out.h_main[1], buf_b, total_height, ldm, SMEM_ROW_BYTES_V2) != CUDA_SUCCESS)
+    return false;
+  return true;
+}
+
 } // namespace convstencil
 
 using namespace ozi;
@@ -305,8 +347,7 @@ __global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE, 2) void cvstenci
     const size_t ldm, const size_t height,
     OzakiDescriptor<O> *__restrict__ desc,
     __grid_constant__ const convstencil::BoundaryGainData boundary,
-    __grid_constant__ const CUtensorMap d_t_map,
-    __grid_constant__ const CUtensorMap d_t_map_extra) {
+    __grid_constant__ const CUtensorMap d_t_map) {
   // clang-format on
   using namespace convstencil;
   using Target = typename O::target_type;
@@ -327,7 +368,7 @@ __global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE, 2) void cvstenci
   const size_t slice_stride = ldm * height;
 
   // ======================== Shared memory ========================
-  extern __shared__ __align__(128) int8_t dyn_smem[];
+  extern __shared__ __align__(256) int8_t dyn_smem[];
 
   __shared__ __align__(16) uint32_t sm_weight[M * 2 * PACKED_WT_WORDS];
   __shared__ __align__(8) uint64_t tma_mbar[NUM_BUFFER_STAGES];
@@ -391,7 +432,7 @@ __global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE, 2) void cvstenci
 
   // Pre-load batch 0 into stage 0
   if (tid == 0)
-    issue_tma_for_batch(0, 0, dyn_smem, tma_mbar, &d_t_map, &d_t_map_extra, phys_lut, total_slices, num_batches,
+    issue_tma_for_batch(0, 0, dyn_smem, tma_mbar, &d_t_map, phys_lut, total_slices, num_batches,
                         just_shifted, static_cast<int32_t>(height), data_row_start, aligned_upper);
   shmem_barrier_spin(&tma_mbar[0], phase_0);
   phase_0 ^= 1;
@@ -404,7 +445,7 @@ __global__ __launch_bounds__(convstencil::NUM_WARPS *WARP_SIZE, 2) void cvstenci
     // Prefetch next batch into nxt_stage
     if (batch + 1 < num_batches) {
       if (tid == 0)
-        issue_tma_for_batch(batch + 1, nxt_stage, dyn_smem, tma_mbar, &d_t_map, &d_t_map_extra, phys_lut, total_slices,
+        issue_tma_for_batch(batch + 1, nxt_stage, dyn_smem, tma_mbar, &d_t_map, phys_lut, total_slices,
                             num_batches, just_shifted, static_cast<int32_t>(height), data_row_start, aligned_upper);
     }
 

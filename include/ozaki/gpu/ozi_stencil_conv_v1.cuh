@@ -87,7 +87,7 @@ inline CUresult create_tma_descriptor_impl(CUtensorMap *out, const int8_t *base_
                                            uint32_t tile_width) {
   assert(ldm % 16 == 0 && "TMA requires ldm to be a multiple of 16");
   assert(reinterpret_cast<uintptr_t>(base_ptr) % 16 == 0 && "TMA requires 16-byte-aligned base pointer");
-  assert(tile_width % 16 == 0 && tile_width <= 128 && "TMA tile width must be a multiple of 16 and <= 128");
+  assert(tile_width % 16 == 0 && tile_width <= 256 && "TMA tile width must be a multiple of 16 and <= 256");
 
   uint64_t gDim[2] = {ldm, total_height};
   uint64_t gStrides[1] = {ldm};
