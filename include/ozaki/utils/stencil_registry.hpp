@@ -18,6 +18,23 @@ namespace ozi {
 
 static constexpr int32_t MAX_STENCIL_SLICE_INT = (1 << 21);
 
+// Number of mantissa bits available in CoeffStorageType.
+// Determines how many bits of the integer stencil coefficients carry
+// independent information in the power-of-2 fallback path.
+#ifdef OZAKI_HAVE_FLOAT128
+static constexpr int32_t COEFF_MANTISSA_BITS = 113;
+#else
+static constexpr int32_t COEFF_MANTISSA_BITS = 63; // long double: 64-bit mantissa, int64 has 63 usable
+#endif
+
+// countl_zero for unsigned __int128 (std::countl_zero only handles up to uint64_t).
+inline int32_t countl_zero_u128(unsigned __int128 x) {
+  uint64_t hi = static_cast<uint64_t>(x >> 64);
+  if (hi != 0)
+    return std::countl_zero(hi);
+  return 64 + std::countl_zero(static_cast<uint64_t>(x));
+}
+
 // Variant over all supported stencil shapes.
 // Adding a new shape requires one line here and a recompile.
 using StencilVariant = std::variant<
@@ -120,7 +137,7 @@ inline CoeffStorageType find_integer_basis(const StencilSpec &spec) {
           : CoeffStorageType(static_cast<int64_t>(ratio - CoeffStorageType(0.5)));
       CoeffStorageType diff = ratio - rounded;
       if (diff < CoeffStorageType(0)) diff = -diff;
-      if (diff > CoeffStorageType(1e-9)) {
+      if (diff > CoeffStorageType(1e-12)) {
         all_integer = false;
         break;
       }
@@ -136,17 +153,17 @@ inline CoeffStorageType find_integer_basis(const StencilSpec &spec) {
 inline int compute_m_needed(const StencilSpec &spec, CoeffStorageType a) {
   constexpr int32_t target_bits = static_cast<int32_t>(CHAR_BIT * sizeof(int8_t)) - 1;
 
-  int32_t range_msb = 64;
+  int32_t range_msb = 128;
   for (const auto &c : spec.coeffs) {
     CoeffStorageType raw = c / a;
     CoeffStorageType shifted = raw + (raw >= CoeffStorageType(0) ? CoeffStorageType(0.5) : CoeffStorageType(-0.5));
-    int64_t int_val = static_cast<int64_t>(shifted);
-    uint64_t abs_val = (int_val < 0) ? static_cast<uint64_t>(-int_val) : static_cast<uint64_t>(int_val);
-    if (int32_t msb = std::countl_zero(abs_val); msb < range_msb)
+    __int128 int_val = static_cast<__int128>(shifted);
+    unsigned __int128 abs_val = (int_val < 0) ? static_cast<unsigned __int128>(-int_val) : static_cast<unsigned __int128>(int_val);
+    if (int32_t msb = countl_zero_u128(abs_val); msb < range_msb)
       range_msb = msb;
   }
 
-  int32_t p_max = 63 - range_msb;
+  int32_t p_max = 127 - range_msb;
   if (p_max < 0)
     return 1; // All coefficients rounded to zero
   return p_max / target_bits + 1;
@@ -181,10 +198,10 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
       int exp;
 #ifdef OZAKI_HAVE_FLOAT128
       frexpq(abs_max, &exp);
-      p.a_coeff = scalbnq(static_cast<__float128>(1.0), exp - 63);
+      p.a_coeff = scalbnq(static_cast<__float128>(1.0), exp - COEFF_MANTISSA_BITS);
 #else
       std::frexp(static_cast<long double>(abs_max), &exp);
-      p.a_coeff = std::scalbn(static_cast<long double>(1.0), exp - 63);
+      p.a_coeff = std::scalbn(static_cast<long double>(1.0), exp - COEFF_MANTISSA_BITS);
 #endif
     } else {
       p.a_coeff = CoeffStorageType(1);
@@ -201,17 +218,17 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
   int32_t p_max = -1;
   {
     // Compute integer coefficients (same logic as slice_stencil)
-    int32_t range_msb = 64;
-    std::vector<int64_t> int_coeffs(spec.coeffs.size());
+    int32_t range_msb = 128;
+    std::vector<__int128> int_coeffs(spec.coeffs.size());
     for (size_t i = 0; i < spec.coeffs.size(); ++i) {
       CoeffStorageType raw = spec.coeffs[i] / p.a_coeff;
       CoeffStorageType shifted = raw + (raw >= CoeffStorageType(0) ? CoeffStorageType(0.5) : CoeffStorageType(-0.5));
-      int_coeffs[i] = static_cast<int64_t>(shifted);
-      uint64_t abs_val = (int_coeffs[i] < 0) ? static_cast<uint64_t>(-int_coeffs[i]) : static_cast<uint64_t>(int_coeffs[i]);
-      if (int32_t msb = std::countl_zero(abs_val); msb < range_msb)
+      int_coeffs[i] = static_cast<__int128>(shifted);
+      unsigned __int128 abs_val = (int_coeffs[i] < 0) ? static_cast<unsigned __int128>(-int_coeffs[i]) : static_cast<unsigned __int128>(int_coeffs[i]);
+      if (int32_t msb = countl_zero_u128(abs_val); msb < range_msb)
         range_msb = msb;
     }
-    p_max = 63 - range_msb;
+    p_max = 127 - range_msb;
 
     // Compute L1 norm of the would-be MSB slice
     p.extra_msb_shift = 0;
@@ -220,9 +237,9 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
         int32_t shift = std::max(0, p_max + extra_shift - (target_bits - 1));
         int64_t l1 = 0;
         for (size_t i = 0; i < int_coeffs.size(); ++i) {
-          uint64_t abs_val = (int_coeffs[i] < 0)
-            ? static_cast<uint64_t>(-int_coeffs[i])
-            : static_cast<uint64_t>(int_coeffs[i]);
+          unsigned __int128 abs_val = (int_coeffs[i] < 0)
+            ? static_cast<unsigned __int128>(-int_coeffs[i])
+            : static_cast<unsigned __int128>(int_coeffs[i]);
           l1 += static_cast<int64_t>(abs_val >> shift);
         }
         return l1;

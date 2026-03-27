@@ -201,30 +201,37 @@ slice_stencil(StencilType s, HighPrec a, int32_t extra_msb_shift = 0, int32_t n_
 
   // Number of usable bits per int8_t slice (excludes the disallowed INT8_MIN value).
   constexpr int32_t target_bits = static_cast<int32_t>(CHAR_BIT * sizeof(Target)) - 1;
-  constexpr int64_t LO = static_cast<int64_t>(std::numeric_limits<Target>::min()) + 1;
-  constexpr int64_t HI = static_cast<int64_t>(std::numeric_limits<Target>::max());
+  constexpr __int128 LO = static_cast<__int128>(std::numeric_limits<Target>::min()) + 1;
+  constexpr __int128 HI = static_cast<__int128>(std::numeric_limits<Target>::max());
 
-  std::array<int64_t, StencilType::size> high_prec_int_coeffs{};
-  // range_msb = min(countl_zero(|coeff_i|)) -- equals 64 when all coefficients are zero.
-  int32_t range_msb = 64;
+  // countl_zero for unsigned __int128 (std::countl_zero only handles up to uint64_t).
+  auto countl_zero_u128 = [](unsigned __int128 x) -> int32_t {
+    uint64_t hi = static_cast<uint64_t>(x >> 64);
+    if (hi != 0)
+      return std::countl_zero(hi);
+    return 64 + std::countl_zero(static_cast<uint64_t>(x));
+  };
+
+  std::array<__int128, StencilType::size> high_prec_int_coeffs{};
+  // range_msb = min(countl_zero(|coeff_i|)) -- equals 128 when all coefficients are zero.
+  int32_t range_msb = 128;
 
   for (size_t i = 0; i < StencilType::size; ++i) {
     HighPrec raw = static_cast<HighPrec>(s.coeffs[i]) / a;
-    high_prec_int_coeffs[i] = static_cast<int64_t>(raw + (raw >= HighPrec(0) ? HighPrec(0.5) : HighPrec(-0.5)));
-    int64_t v = high_prec_int_coeffs[i];
-    // Safe conversion to uint64_t: avoids UB from std::abs(INT64_MIN) and the
-    // fact that std::countl_zero only accepts unsigned types in C++20.
-    uint64_t abs_val = (v < 0) ? static_cast<uint64_t>(-v) : static_cast<uint64_t>(v);
-    if (int32_t msb = std::countl_zero(abs_val); msb < range_msb)
+    high_prec_int_coeffs[i] = static_cast<__int128>(raw + (raw >= HighPrec(0) ? HighPrec(0.5) : HighPrec(-0.5)));
+    __int128 v = high_prec_int_coeffs[i];
+    // Safe conversion to unsigned __int128: avoids UB from negating the minimum value.
+    unsigned __int128 abs_val = (v < 0) ? static_cast<unsigned __int128>(-v) : static_cast<unsigned __int128>(v);
+    if (int32_t msb = countl_zero_u128(abs_val); msb < range_msb)
       range_msb = msb;
   }
 
   // Position (0-indexed from LSB) of the most significant bit across all
   // absolute coefficients.  -1 when every coefficient rounds to zero.
-  int32_t p_max = 63 - range_msb;
+  int32_t p_max = 127 - range_msb;
 
   StencilSlices<IntStencilType, N> result;
-  std::array<int64_t, StencilType::size> residual = high_prec_int_coeffs;
+  std::array<__int128, StencilType::size> residual = high_prec_int_coeffs;
 
   for (int32_t k = 0; k < N; ++k) {
     // Arithmetic shift that aligns the k-th window of target_bits bits
@@ -241,16 +248,17 @@ slice_stencil(StencilType s, HighPrec a, int32_t extra_msb_shift = 0, int32_t n_
     result.slices[k].offsets = s.offsets;
 
     for (size_t i = 0; i < StencilType::size; ++i) {
-      int64_t val = (shift >= 0) ? (residual[i] >> shift) : (residual[i] << (-shift));
+      __int128 val = (shift >= 0) ? (residual[i] >> shift) : (residual[i] << (-shift));
       // Clamp to the symmetric int8 range [-127, 127] to keep multiplication
       // well-behaved and to avoid the prohibited INT8_MIN value.
-      val = std::max(LO, std::min(HI, val));
+      if (val > HI) val = HI;
+      if (val < LO) val = LO;
       result.slices[k].coeffs[i] = static_cast<Target>(val);
       // Subtract this slice's exact contribution so the residual carries only
       // the bits not yet captured.
       residual[i] -= (shift >= 0)
-          ? (static_cast<int64_t>(result.slices[k].coeffs[i]) << shift)
-          : (static_cast<int64_t>(result.slices[k].coeffs[i]) >> (-shift));
+          ? (static_cast<__int128>(result.slices[k].coeffs[i]) << shift)
+          : (static_cast<__int128>(result.slices[k].coeffs[i]) >> (-shift));
     }
   }
 

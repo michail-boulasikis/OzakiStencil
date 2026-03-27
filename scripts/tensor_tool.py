@@ -104,7 +104,7 @@ def plot_tensor_simple(tensor, title):
     plt.show()
 
 
-def generate_data(n, n_peaks, dtype_name, halo_avg, output_path):
+def generate_data(n, n_peaks, dtype_name, halo_avg, output_path, ndim=2):
     dtype_map = get_dtype_map()
     if dtype_name not in dtype_map:
         print(f"Error: {dtype_name} not supported.")
@@ -112,28 +112,55 @@ def generate_data(n, n_peaks, dtype_name, halo_avg, output_path):
 
     target_dtype = dtype_map[dtype_name]
     type_id = get_type_id_from_dtype(target_dtype)
-    print(f"Generating data strictly in: {target_dtype}")
+    print(f"Generating {ndim}D data strictly in: {target_dtype}")
 
     dim = np.linspace(0, 1, n).astype(target_dtype)
-    X, Y = np.meshgrid(dim, dim)
 
-    peak_means_x = np.random.uniform(0.3, 0.7, n_peaks).astype(target_dtype)
-    peak_means_y = np.random.uniform(0.3, 0.7, n_peaks).astype(target_dtype)
-    peak_std = np.random.uniform(0.01, 0.001, n_peaks).astype(target_dtype)
+    if ndim == 2:
+        X, Y = np.meshgrid(dim, dim)
 
-    output = np.zeros_like(X, dtype=target_dtype)
+        peak_means_x = np.random.uniform(0.3, 0.7, n_peaks).astype(target_dtype)
+        peak_means_y = np.random.uniform(0.3, 0.7, n_peaks).astype(target_dtype)
+        peak_std = np.random.uniform(0.01, 0.001, n_peaks).astype(target_dtype)
 
-    for px, py, std in zip(peak_means_x, peak_means_y, peak_std):
-        term = np.exp(-((X - px) ** 2 + (Y - py) ** 2) / std)
-        output += term
-    if halo_avg:
-        avg = np.mean(output)
-        output[0, :] = avg
-        output[-1, :] = avg
-        output[:, 0] = avg
-        output[:, -1] = avg
+        output = np.zeros_like(X, dtype=target_dtype)
 
-    header = struct.pack(f"<{'Q' * (2 + len(output.shape))}", 2, type_id, n, n)
+        for px, py, std in zip(peak_means_x, peak_means_y, peak_std):
+            term = np.exp(-((X - px) ** 2 + (Y - py) ** 2) / std)
+            output += term
+        if halo_avg:
+            avg = np.mean(output)
+            output[0, :] = avg
+            output[-1, :] = avg
+            output[:, 0] = avg
+            output[:, -1] = avg
+    elif ndim == 3:
+        X, Y, Z = np.meshgrid(dim, dim, dim, indexing="ij")
+
+        peak_means_x = np.random.uniform(0.3, 0.7, n_peaks).astype(target_dtype)
+        peak_means_y = np.random.uniform(0.3, 0.7, n_peaks).astype(target_dtype)
+        peak_means_z = np.random.uniform(0.3, 0.7, n_peaks).astype(target_dtype)
+        peak_std = np.random.uniform(0.01, 0.001, n_peaks).astype(target_dtype)
+
+        output = np.zeros_like(X, dtype=target_dtype)
+
+        for px, py, pz, std in zip(peak_means_x, peak_means_y, peak_means_z, peak_std):
+            term = np.exp(-((X - px) ** 2 + (Y - py) ** 2 + (Z - pz) ** 2) / std)
+            output += term
+        if halo_avg:
+            avg = np.mean(output)
+            output[0, :, :] = avg
+            output[-1, :, :] = avg
+            output[:, 0, :] = avg
+            output[:, -1, :] = avg
+            output[:, :, 0] = avg
+            output[:, :, -1] = avg
+    else:
+        print(f"Error: unsupported dimensionality {ndim}")
+        sys.exit(1)
+
+    shape = output.shape
+    header = struct.pack(f"<{'Q' * (2 + ndim)}", ndim, type_id, *shape)
     with open(output_path, "wb") as outf:
         outf.write(header)
         output.tofile(outf)
@@ -156,6 +183,7 @@ if __name__ == "__main__":
         choices=["float16", "float32", "float64", "float128"],
     )
     parser.add_argument("--N", type=int, default=64)
+    parser.add_argument("--dims", type=int, default=2, choices=[2, 3], help="Dimensionality (default: 2)")
     parser.add_argument("--halo-avg", action="store_true")
     args = parser.parse_args()
 
@@ -166,4 +194,4 @@ if __name__ == "__main__":
         if tensor is not None:
             plot_tensor_simple(tensor, os.path.basename(args.file))
     else:
-        generate_data(args.N, 10, args.type, args.halo_avg, args.file)
+        generate_data(args.N, 10, args.type, args.halo_avg, args.file, ndim=args.dims)

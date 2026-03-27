@@ -14,7 +14,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/lib")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # options
-set(CUDA_COMPUTE_CAPABILITY "90a;100;120" CACHE STRING "Target CUDA compute capabilities (semicolon-separated list, e.g. '90a;100;120').")
+set(CUDA_COMPUTE_CAPABILITY "90a" CACHE STRING "Target CUDA compute capability (single value, e.g. '90a', '100', '120').")
 option(BUILD_TESTING "Build the project's tests" ON)
 option(OZAKI_NVTX_EVENTS "Whether to record NVTX events" ON)
 option(OZAKI_USE_BOOST_MULTIPRECISION "Use Boost.Multiprecision for high-precision scale factor computation" OFF)
@@ -55,17 +55,23 @@ target_compile_options(ozaki_cuda_common INTERFACE
   $<$<COMPILE_LANGUAGE:CUDA>:--generate-line-info --expt-relaxed-constexpr --extended-lambda>
 )
 
-# OZAKI_CUDA_ARCH = minimum target arch. Host-side guards (e.g. __float128
-# AccumulatorType) use this so that features are only enabled when ALL targets
-# support them.  Fat binaries require every arch to compile every kernel
-# instantiation, so the minimum is the correct conservative choice.
-set(CUDA_ARCH_LIST ${CUDA_COMPUTE_CAPABILITY})
-list(SORT CUDA_ARCH_LIST COMPARE NATURAL ORDER ASCENDING)
-list(GET CUDA_ARCH_LIST 0 OZAKI_MIN_CUDA_ARCH)
-# Strip architecture suffixes (e.g. "90a" -> "90") so the define is a plain integer
-# usable in #if preprocessor expressions.
-string(REGEX REPLACE "[a-zA-Z]" "" OZAKI_MIN_CUDA_ARCH_NUM "${OZAKI_MIN_CUDA_ARCH}")
-target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_CUDA_ARCH=${OZAKI_MIN_CUDA_ARCH_NUM})
+# Validate that CUDA_COMPUTE_CAPABILITY is a single architecture, not a list.
+list(LENGTH CUDA_COMPUTE_CAPABILITY _arch_count)
+if(_arch_count GREATER 1)
+  message(FATAL_ERROR "CUDA_COMPUTE_CAPABILITY must be a single architecture (e.g. '90a'), not a list. Got: '${CUDA_COMPUTE_CAPABILITY}'")
+endif()
+
+# OZAKI_CUDA_ARCH: strip suffixes (e.g. "90a" -> "90") so the define is a
+# plain integer usable in #if preprocessor expressions.
+string(REGEX REPLACE "[a-zA-Z]" "" OZAKI_CUDA_ARCH_NUM "${CUDA_COMPUTE_CAPABILITY}")
+target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_CUDA_ARCH=${OZAKI_CUDA_ARCH_NUM})
+
+# OZAKI_HAVE_WGMMA: WGMMA integer (wgmma.mma_async s8.s8) is only available
+# on SM_90a (Hopper with architecture acceleration). Blackwell (SM_100/SM_100a)
+# uses tcgen05.mma instead; SM_120 has no warp-group MMA at all.
+if(CUDA_COMPUTE_CAPABILITY STREQUAL "90a")
+  target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_HAVE_WGMMA=1)
+endif()
 
 if(OZAKI_NVTX_EVENTS)
   target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_NVTX_EVENTS)

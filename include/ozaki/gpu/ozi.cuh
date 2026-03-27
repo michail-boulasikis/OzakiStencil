@@ -183,7 +183,17 @@ __host__
 #ifdef OZAKI_USE_BOOST_MULTIPRECISION
   using high_precision_float = boost::multiprecision::number<boost::multiprecision::backends::cpp_bin_float<512>>;
 
+  // Convert to boost with maximum available precision.
+#ifdef OZAKI_HAVE_FLOAT128
+  // __float128 → boost via string to preserve full 113-bit mantissa.
+  // static_cast<double>(a) would truncate to 53 bits, introducing ~2^-53
+  // relative error that compounds through pow(a, -N).
+  char a_buf[64];
+  quadmath_snprintf(a_buf, sizeof(a_buf), "%.40Qe", static_cast<__float128>(a));
+  high_precision_float a_hp(a_buf);
+#else
   high_precision_float a_hp = static_cast<double>(a);
+#endif
   high_precision_float result = boost::multiprecision::pow(a_hp, -time_steps);
 
   // Multiply by 2^(slice_bits * shifts)

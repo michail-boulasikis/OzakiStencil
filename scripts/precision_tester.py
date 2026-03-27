@@ -7,7 +7,11 @@ import os
 import re
 import sys
 import argparse
+from decimal import Decimal, getcontext as _getcontext
+from fractions import Fraction
 from itertools import product
+
+_getcontext().prec = 50
 
 STENCIL_NAME = ["0"]
 REQUESTED_SLICES = [1, 2, 3, None]
@@ -26,13 +30,13 @@ EXTRA_MSBS = 0
 
 # Entry: (stencil_shape, input_shape, label)
 SHAPE_INPUT_PAIRS = [
-    # ([5], [128], "1D_128"),
+    ([5], [128], "1D_128"),
     # ([7], [128], "1D_128"),
-    # ([3, 3], [128, 128], "2D_128x128"),
+    ([3, 3], [128, 128], "2D_128x128"),
     # ([5, 5], [128, 128], "2D_128x128"),
     ([7, 7], [128, 128], "2D_128x128"),
-    # ([3, 3, 3], [32, 32, 32], "3D_32x32x32"),
-    # ([5, 5, 5], [32, 32, 32], "3D_32x32x32"),
+    ([3, 3, 3], [32, 32, 32], "3D_32x32x32"),
+    ([5, 5, 5], [32, 32, 32], "3D_32x32x32"),
 ]
 
 ERROR_THRESHOLD = 1e-8
@@ -114,45 +118,84 @@ def generate_stencil_spec(
         rng = np.random.default_rng(0)
 
     coeffs = None
+    int_coeffs = None
     if requested_slices:
         abs_limit = 2 ** (7 * requested_slices) // np.prod(shape)
-        coeffs = rng.integers(
+        int_coeffs = rng.integers(
             -abs_limit if negative_coeffs else 0, abs_limit, size=shape
-        ).astype(PRECISION_TYPE_MAP[original_precision])
-        # log-uniform basis so pre-normalization magnitudes span several decades evenly instead of clustering near the upper end.
+        )
+
+        if sparse:
+            zero_mask = rng.random(size=int_coeffs.shape) < 0.7
+            int_coeffs[zero_mask] = 0
+
+        l1_int = int(np.sum(np.abs(int_coeffs)))
+        if l1_int == 0:
+            int_coeffs.flat[len(int_coeffs.flat) // 2] = 1
+            l1_int = 1
+
+        if l1_norm == "ONE":
+            target_l1 = 1.0 / (1.0 + 0.05 * (1.0 - 2 * rng.random()))
+        elif l1_norm == "GT1":
+            target_l1 = rng.uniform(1.05, 1.5)
+        elif l1_norm == "LT1":
+            target_l1 = rng.uniform(0.3, 0.95)
+        else:
+            raise ValueError(f"Unknown l1_norm mode: {l1_norm}")
+
+        # Compute the common factor as an exact Fraction to avoid float64
+        # rounding errors that would break the integer relationship.
+        # log-uniform basis so pre-normalization magnitudes span several
+        # decades evenly instead of clustering near the upper end.
         basis = np.float64(10) ** rng.uniform(-6, 0)
-        coeffs *= basis
+        factor = Fraction(basis) * Fraction(target_l1) / Fraction(l1_int)
+
+        # Multiply each integer coefficient by the exact rational factor,
+        # producing a high-precision string for the .stc file.
+        flat_ints = int_coeffs.flatten()
+        coeffs_str = []
+        for iv in flat_ints:
+            exact = Fraction(int(iv)) * factor
+            # Convert via Decimal for 40-digit string without float64 rounding
+            d = Decimal(exact.numerator) / Decimal(exact.denominator)
+            coeffs_str.append(format(d, "f"))
+
+        # Also produce a numpy array for the return value (informational only)
+        coeffs = np.array(
+            [float(Fraction(int(iv)) * factor) for iv in flat_ints],
+            dtype=PRECISION_TYPE_MAP[original_precision],
+        ).reshape(shape)
     else:
         coeffs = rng.standard_normal(size=shape).astype(
             PRECISION_TYPE_MAP[original_precision]
         )
         coeffs = np.abs(coeffs) if not negative_coeffs else coeffs
 
-    if sparse:
-        zero_mask = rng.random(size=coeffs.shape) < 0.7
-        coeffs[zero_mask] = 0.0
+        if sparse:
+            zero_mask = rng.random(size=coeffs.shape) < 0.7
+            coeffs[zero_mask] = 0.0
 
-    l1_sum = np.sum(np.abs(coeffs))
-    if l1_sum == 0:
-        coeffs.flat[len(coeffs.flat) // 2] = 1.0
-        l1_sum = 1.0
+        l1_sum = np.sum(np.abs(coeffs))
+        if l1_sum == 0:
+            coeffs.flat[len(coeffs.flat) // 2] = 1.0
+            l1_sum = 1.0
 
-    if l1_norm == "ONE":
-        target_l1 = 1.0 / (1.0 + 0.05 * (1.0 - 2 * rng.random()))
-    elif l1_norm == "GT1":
-        target_l1 = rng.uniform(1.05, 1.5)
-    elif l1_norm == "LT1":
-        target_l1 = rng.uniform(0.3, 0.95)
-    else:
-        raise ValueError(f"Unknown l1_norm mode: {l1_norm}")
+        if l1_norm == "ONE":
+            target_l1 = 1.0 / (1.0 + 0.05 * (1.0 - 2 * rng.random()))
+        elif l1_norm == "GT1":
+            target_l1 = rng.uniform(1.05, 1.5)
+        elif l1_norm == "LT1":
+            target_l1 = rng.uniform(0.3, 0.95)
+        else:
+            raise ValueError(f"Unknown l1_norm mode: {l1_norm}")
 
-    coeffs *= target_l1 / l1_sum
+        coeffs *= target_l1 / l1_sum
+        coeffs_str = [str(x) for x in coeffs.flatten()]
 
     if not offsets:
         offsets = np.array(shape) // 2
     shape = [str(x) for x in shape]
     offsets = [str(x) for x in offsets]
-    coeffs_str = [str(x) for x in coeffs.flatten()]
 
     l1_tag = {"ONE": "N", "GT1": "G", "LT1": "L"}[l1_norm]
     name = (

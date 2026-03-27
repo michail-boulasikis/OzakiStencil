@@ -9,7 +9,7 @@ index 8b109d6..7031688 100644
  project(spmm_coo VERSION 0.01 LANGUAGES CXX CUDA)
  set(CMAKE_VERBOSE_MAKEFILE ON)
  
-+set(GPU_ARCH "86" CACHE STRING "Which GPU Compute Architecture to compile for")
++set(GPU_ARCH "128" CACHE STRING "Which GPU Compute Architecture to compile for")
 +
 +find_package(CUDAToolkit REQUIRED)
 +

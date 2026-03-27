@@ -1,0 +1,568 @@
+diff --git a/2dstencil/2d25pt/CMakeLists.txt b/2dstencil/2d25pt/CMakeLists.txt
+index aa9b8fd..e1134b7 100644
+--- a/2dstencil/2d25pt/CMakeLists.txt
++++ b/2dstencil/2d25pt/CMakeLists.txt
+@@ -56,14 +56,14 @@ function(subcompile prefix default_compiler_flag aim)
+     add_library(${libraryname} ${LOCAL_SOURCE})
+     set_target_properties(${libraryname} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+     set_target_properties(${libraryname} PROPERTIES COMPILE_FLAGS "${local_compiler_flag} ")
+-    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     target_link_libraries(${libraryname} PUBLIC ${LOCAL_LIB} ${prefix}_jacobi_gold ${prefix}_jacobi_gold_gen ${CUDA_LIBRARIES})
+ 
+ 
+     add_executable(${local_goal} ${LOCAL_DRIVER})
+     set_target_properties(${local_goal}
+                       PROPERTIES LANGUAGES CUDA LINKER_LANGUAGE CUDA)
+-    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     set_target_properties(${local_goal} PROPERTIES COMPILE_FLAGS "${local_compiler_flag}")
+     set_target_properties(${local_goal} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+ 
+@@ -79,7 +79,7 @@ endfunction()
+ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+ 
+ mylib("${type}_ebisu" "${CMAKE_SOURCE_DIR}/jacobi-temporal-traditional-box.cu" "${DEFAULT_COMPILER_FLAG} ${COMPILECG}  -DTRATEMPORAL")
+-set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "80")
++set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+ 
+ 
+ subcompile(${type} "${DEFAULT_COMPILER_FLAG} -D__PRINT__" "EBISU" SOURCE "${CMAKE_SOURCE_DIR}/jacobi-2d.cu"  DRIVER "${CMAKE_SOURCE_DIR}/jacobi.driver.cpp" LIB "${type}_ebisu" )
+diff --git a/2dstencil/2d49pt/CMakeLists.txt b/2dstencil/2d49pt/CMakeLists.txt
+index aa9b8fd..e1134b7 100644
+--- a/2dstencil/2d49pt/CMakeLists.txt
++++ b/2dstencil/2d49pt/CMakeLists.txt
+@@ -56,14 +56,14 @@ function(subcompile prefix default_compiler_flag aim)
+     add_library(${libraryname} ${LOCAL_SOURCE})
+     set_target_properties(${libraryname} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+     set_target_properties(${libraryname} PROPERTIES COMPILE_FLAGS "${local_compiler_flag} ")
+-    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     target_link_libraries(${libraryname} PUBLIC ${LOCAL_LIB} ${prefix}_jacobi_gold ${prefix}_jacobi_gold_gen ${CUDA_LIBRARIES})
+ 
+ 
+     add_executable(${local_goal} ${LOCAL_DRIVER})
+     set_target_properties(${local_goal}
+                       PROPERTIES LANGUAGES CUDA LINKER_LANGUAGE CUDA)
+-    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     set_target_properties(${local_goal} PROPERTIES COMPILE_FLAGS "${local_compiler_flag}")
+     set_target_properties(${local_goal} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+ 
+@@ -79,7 +79,7 @@ endfunction()
+ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+ 
+ mylib("${type}_ebisu" "${CMAKE_SOURCE_DIR}/jacobi-temporal-traditional-box.cu" "${DEFAULT_COMPILER_FLAG} ${COMPILECG}  -DTRATEMPORAL")
+-set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "80")
++set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+ 
+ 
+ subcompile(${type} "${DEFAULT_COMPILER_FLAG} -D__PRINT__" "EBISU" SOURCE "${CMAKE_SOURCE_DIR}/jacobi-2d.cu"  DRIVER "${CMAKE_SOURCE_DIR}/jacobi.driver.cpp" LIB "${type}_ebisu" )
+diff --git a/2dstencil/2d5pt/CMakeLists.txt b/2dstencil/2d5pt/CMakeLists.txt
+index 417f65b..7073437 100644
+--- a/2dstencil/2d5pt/CMakeLists.txt
++++ b/2dstencil/2d5pt/CMakeLists.txt
+@@ -56,14 +56,14 @@ function(subcompile prefix default_compiler_flag aim)
+     add_library(${libraryname} ${LOCAL_SOURCE})
+     set_target_properties(${libraryname} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+     set_target_properties(${libraryname} PROPERTIES COMPILE_FLAGS "${local_compiler_flag} ")
+-    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     target_link_libraries(${libraryname} PUBLIC ${LOCAL_LIB} ${prefix}_jacobi_gold ${prefix}_jacobi_gold_gen ${CUDA_LIBRARIES})
+ 
+ 
+     add_executable(${local_goal} ${LOCAL_DRIVER})
+     set_target_properties(${local_goal}
+                       PROPERTIES LANGUAGES CUDA LINKER_LANGUAGE CUDA)
+-    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     set_target_properties(${local_goal} PROPERTIES COMPILE_FLAGS "${local_compiler_flag}")
+     set_target_properties(${local_goal} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+ 
+@@ -79,7 +79,7 @@ endfunction()
+ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+ 
+ mylib("${type}_ebisu" "${CMAKE_SOURCE_DIR}/jacobi-temporal-traditional.cu" "${DEFAULT_COMPILER_FLAG} ${COMPILECG}  -DTRATEMPORAL")
+-set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "80")
++set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+ 
+ 
+ subcompile(${type} "${DEFAULT_COMPILER_FLAG} " "EBISU" SOURCE "${CMAKE_SOURCE_DIR}/jacobi-2d.cu"  DRIVER "${CMAKE_SOURCE_DIR}/jacobi.driver.cpp" LIB "${type}_ebisu" )
+diff --git a/2dstencil/2d9pt/CMakeLists.txt b/2dstencil/2d9pt/CMakeLists.txt
+index 873326c..a09e719 100644
+--- a/2dstencil/2d9pt/CMakeLists.txt
++++ b/2dstencil/2d9pt/CMakeLists.txt
+@@ -56,14 +56,14 @@ function(subcompile prefix default_compiler_flag aim)
+     add_library(${libraryname} ${LOCAL_SOURCE})
+     set_target_properties(${libraryname} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+     set_target_properties(${libraryname} PROPERTIES COMPILE_FLAGS "${local_compiler_flag} ")
+-    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     target_link_libraries(${libraryname} PUBLIC ${LOCAL_LIB} ${prefix}_jacobi_gold ${prefix}_jacobi_gold_gen ${CUDA_LIBRARIES})
+ 
+ 
+     add_executable(${local_goal} ${LOCAL_DRIVER})
+     set_target_properties(${local_goal}
+                       PROPERTIES LANGUAGES CUDA LINKER_LANGUAGE CUDA)
+-    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     set_target_properties(${local_goal} PROPERTIES COMPILE_FLAGS "${local_compiler_flag}")
+     set_target_properties(${local_goal} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+ 
+@@ -79,7 +79,7 @@ endfunction()
+ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+ 
+ mylib("${type}_ebisu" "${CMAKE_SOURCE_DIR}/jacobi-temporal-traditional-box.cu" "${DEFAULT_COMPILER_FLAG} ${COMPILECG}  -DTRATEMPORAL")
+-set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "80")
++set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+ 
+ 
+ subcompile(${type} "${DEFAULT_COMPILER_FLAG} " "EBISU" SOURCE "${CMAKE_SOURCE_DIR}/jacobi-2d.cu"  DRIVER "${CMAKE_SOURCE_DIR}/jacobi.driver.cpp" LIB "${type}_ebisu" )
+diff --git a/2dstencil/2ds9pt/CMakeLists.txt b/2dstencil/2ds9pt/CMakeLists.txt
+index 417f65b..7073437 100644
+--- a/2dstencil/2ds9pt/CMakeLists.txt
++++ b/2dstencil/2ds9pt/CMakeLists.txt
+@@ -56,14 +56,14 @@ function(subcompile prefix default_compiler_flag aim)
+     add_library(${libraryname} ${LOCAL_SOURCE})
+     set_target_properties(${libraryname} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+     set_target_properties(${libraryname} PROPERTIES COMPILE_FLAGS "${local_compiler_flag} ")
+-    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     target_link_libraries(${libraryname} PUBLIC ${LOCAL_LIB} ${prefix}_jacobi_gold ${prefix}_jacobi_gold_gen ${CUDA_LIBRARIES})
+ 
+ 
+     add_executable(${local_goal} ${LOCAL_DRIVER})
+     set_target_properties(${local_goal}
+                       PROPERTIES LANGUAGES CUDA LINKER_LANGUAGE CUDA)
+-    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     set_target_properties(${local_goal} PROPERTIES COMPILE_FLAGS "${local_compiler_flag}")
+     set_target_properties(${local_goal} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+ 
+@@ -79,7 +79,7 @@ endfunction()
+ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+ 
+ mylib("${type}_ebisu" "${CMAKE_SOURCE_DIR}/jacobi-temporal-traditional.cu" "${DEFAULT_COMPILER_FLAG} ${COMPILECG}  -DTRATEMPORAL")
+-set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "80")
++set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+ 
+ 
+ subcompile(${type} "${DEFAULT_COMPILER_FLAG} " "EBISU" SOURCE "${CMAKE_SOURCE_DIR}/jacobi-2d.cu"  DRIVER "${CMAKE_SOURCE_DIR}/jacobi.driver.cpp" LIB "${type}_ebisu" )
+diff --git a/2dstencil/CMakeLists.txt b/2dstencil/CMakeLists.txt
+index a4735cb..bac9ff7 100644
+--- a/2dstencil/CMakeLists.txt
++++ b/2dstencil/CMakeLists.txt
+@@ -1,11 +1,13 @@
+ cmake_minimum_required(VERSION 3.10)
+ 
+-project(EBISU_2DSTENCIL VERSION 1.0)
++project(EBISU_2DSTENCIL VERSION 1.0 LANGUAGES CXX CUDA)
+ 
+ cmake_policy(SET CMP0077 NEW)
+ 
+ 
+-set(CMAKE_CXX_STANDARD 14)
++set(CMAKE_CXX_STANDARD 17)
++set(CMAKE_CUDA_STANDARD 17)
+ set(CMAKE_CXX_STANDARD_REQUIRED True)
++set(CMAKE_CUDA_STANDARD_REQUIRED True)
+ 
+ #star
+diff --git a/2dstencil/common/cuda_common.cuh b/2dstencil/common/cuda_common.cuh
+index bf25b11..b72fdaf 100644
+--- a/2dstencil/common/cuda_common.cuh
++++ b/2dstencil/common/cuda_common.cuh
+@@ -2,21 +2,20 @@
+ #include "stdio.h"
+ 
+ #ifndef CUDACOMMON
+ 
+ #ifndef __CUDA_ARCH__
+-    #define PERKS_ARCH 000
++#define PERKS_ARCH 000
+ #else
+-    #if __CUDA_ARCH__==800
+-        #define PERKS_ARCH 800
+-    #elif __CUDA_ARCH__==700
+-        #define PERKS_ARCH 700
+-    #elif __CUDA_ARCH__==600
+-        #define PERKS_ARCH 600
+-    #else
+-        #error "unsupport"
+-    #endif
++#if __CUDA_ARCH__ == 800
++#define PERKS_ARCH 800
++#elif __CUDA_ARCH__ == 700
++#define PERKS_ARCH 700
++#elif __CUDA_ARCH__ == 600
++#define PERKS_ARCH 600
++#else
++#define PERKS_ARCH 900
++#endif
+ #endif
+-
+ 
+ #include <cooperative_groups/memcpy_async.h>
+ #include <cuda_pipeline.h>
+@@ -24,26 +26,21 @@
+ #define CUDACOMMON
+ extern __host__ __device__ __forceinline__ int MAX(int a, int b) { return a > b ? a : b; }
+ extern __host__ __device__ __forceinline__ int MIN(int a, int b) { return a < b ? a : b; }
+-extern __host__ __device__ __forceinline__ int CEIL(int a, int b) { return ( (a) % (b) == 0 ? (a) / (b) :  ( (a) / (b) + 1 ) ); }
+-
+-
+-#define Check_CUDA_Error(message) \
+-  do{\
+-    cudaError_t error = cudaGetLastError();\
+-    if( error != cudaSuccess ){\
+-      printf("CUDA-ERROR:%s, %s\n",message,cudaGetErrorString(error) ); \
+-      exit(-1);\
+-    }\
+-  }while(0)
++extern __host__ __device__ __forceinline__ int CEIL(int a, int b) {
++  return ((a) % (b) == 0 ? (a) / (b) : ((a) / (b) + 1));
++}
+ 
+-template<class REAL, int SIZE>
+-__device__ void __forceinline__ init_reg_array(REAL reg_array[SIZE], int val)
+-{
+-  _Pragma("unroll")
+-  for(int l_y=0; l_y<SIZE; l_y++)
+-  {
+-    reg_array[l_y]=val;
+-  }
++#define Check_CUDA_Error(message)                                                                                      \
++  do {                                                                                                                 \
++    cudaError_t error = cudaGetLastError();                                                                            \
++    if (error != cudaSuccess) {                                                                                        \
++      printf("CUDA-ERROR:%s, %s\n", message, cudaGetErrorString(error));                                               \
++      exit(-1);                                                                                                        \
++    }                                                                                                                  \
++  } while (0)
++
++template <class REAL, int SIZE> __device__ void __forceinline__ init_reg_array(REAL reg_array[SIZE], int val) {
++  _Pragma("unroll") for (int l_y = 0; l_y < SIZE; l_y++) { reg_array[l_y] = val; }
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/2dstencil/config.sh b/2dstencil/config.sh
+index e13fab1..5b4611f 100755
+--- a/2dstencil/config.sh
++++ b/2dstencil/config.sh
+@@ -1,3 +1,3 @@
+ rm ./build/init/CMakeCache.txt 
+ 
+-cmake -S . -B ./build/init/
++cmake -S . -B ./build/init/ -DGPU_ARCH=$1
+diff --git a/3dstencil/3d13pt/CMakeLists.txt b/3dstencil/3d13pt/CMakeLists.txt
+index 31df521..156e96e 100644
+--- a/3dstencil/3d13pt/CMakeLists.txt
++++ b/3dstencil/3d13pt/CMakeLists.txt
+@@ -24,7 +24,7 @@ target_link_libraries(${reference_goal} PUBLIC
+ set_target_properties(${reference_goal} PROPERTIES
+                             COMPILE_FLAGS " -DREFCHECK ")     
+                             
+-set_target_properties("${reference_goal}" PROPERTIES CUDA_ARCHITECTURES "80")
++set_target_properties("${reference_goal}" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+ 
+ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+ 
+@@ -60,13 +60,13 @@ function(subcompile prefix default_compiler_flag aim)
+     add_library(${libraryname} ${LOCAL_SOURCE})
+     set_target_properties(${libraryname} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+     set_target_properties(${libraryname} PROPERTIES COMPILE_FLAGS "${local_compiler_flag} ")
+-    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     target_link_libraries(${libraryname} PUBLIC ${LOCAL_LIB}  ${CUDA_LIBRARIES})
+ 
+     add_executable(${local_goal} ${LOCAL_DRIVER})
+     set_target_properties(${local_goal}
+                       PROPERTIES LANGUAGES CUDA LINKER_LANGUAGE CUDA)
+-    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     set_target_properties(${local_goal} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+ 
+ 
+@@ -80,7 +80,7 @@ endfunction()
+ 
+ 
+ mylib("${type}_ebisu" "${CMAKE_SOURCE_DIR}/j3d-temporal.cu" "${DEFAULT_COMPILER_FLAG}  ")
+-set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "80")
++set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+ 
+ subcompile(${type} "${DEFAULT_COMPILER_FLAG}  -D__PRINT__" "EBISU" SOURCE "${CMAKE_SOURCE_DIR}/j3d.cu" DRIVER "${CMAKE_SOURCE_DIR}/j3d.driver.cpp" LIB "${type}_ebisu" )
+ 
+diff --git a/3dstencil/3d17pt/CMakeLists.txt b/3dstencil/3d17pt/CMakeLists.txt
+index 4ef7212..39f5943 100644
+--- a/3dstencil/3d17pt/CMakeLists.txt
++++ b/3dstencil/3d17pt/CMakeLists.txt
+@@ -24,7 +24,7 @@ target_link_libraries(${reference_goal} PUBLIC
+ set_target_properties(${reference_goal} PROPERTIES
+                             COMPILE_FLAGS " -DREFCHECK ")     
+                             
+-set_target_properties("${reference_goal}" PROPERTIES CUDA_ARCHITECTURES "80")
++set_target_properties("${reference_goal}" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+ 
+ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+ 
+@@ -60,13 +60,13 @@ function(subcompile prefix default_compiler_flag aim)
+     add_library(${libraryname} ${LOCAL_SOURCE})
+     set_target_properties(${libraryname} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+     set_target_properties(${libraryname} PROPERTIES COMPILE_FLAGS "${local_compiler_flag} ")
+-    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     target_link_libraries(${libraryname} PUBLIC ${LOCAL_LIB}  ${CUDA_LIBRARIES})
+ 
+     add_executable(${local_goal} ${LOCAL_DRIVER})
+     set_target_properties(${local_goal}
+                       PROPERTIES LANGUAGES CUDA LINKER_LANGUAGE CUDA)
+-    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     set_target_properties(${local_goal} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+ 
+ 
+@@ -80,7 +80,7 @@ endfunction()
+ 
+ 
+ mylib("${type}_ebisu" "${CMAKE_SOURCE_DIR}/j3d-temporal-box.cu" "${DEFAULT_COMPILER_FLAG}  ")
+-set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "80")
++set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+ 
+ subcompile(${type} "${DEFAULT_COMPILER_FLAG}  -D__PRINT__" "EBISU" SOURCE "${CMAKE_SOURCE_DIR}/j3d.cu" DRIVER "${CMAKE_SOURCE_DIR}/j3d.driver.cpp" LIB "${type}_ebisu" )
+ 
+diff --git a/3dstencil/3d27pt/CMakeLists.txt b/3dstencil/3d27pt/CMakeLists.txt
+index 4ef7212..39f5943 100644
+--- a/3dstencil/3d27pt/CMakeLists.txt
++++ b/3dstencil/3d27pt/CMakeLists.txt
+@@ -24,7 +24,7 @@ target_link_libraries(${reference_goal} PUBLIC
+ set_target_properties(${reference_goal} PROPERTIES
+                             COMPILE_FLAGS " -DREFCHECK ")     
+                             
+-set_target_properties("${reference_goal}" PROPERTIES CUDA_ARCHITECTURES "80")
++set_target_properties("${reference_goal}" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+ 
+ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+ 
+@@ -60,13 +60,13 @@ function(subcompile prefix default_compiler_flag aim)
+     add_library(${libraryname} ${LOCAL_SOURCE})
+     set_target_properties(${libraryname} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+     set_target_properties(${libraryname} PROPERTIES COMPILE_FLAGS "${local_compiler_flag} ")
+-    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     target_link_libraries(${libraryname} PUBLIC ${LOCAL_LIB}  ${CUDA_LIBRARIES})
+ 
+     add_executable(${local_goal} ${LOCAL_DRIVER})
+     set_target_properties(${local_goal}
+                       PROPERTIES LANGUAGES CUDA LINKER_LANGUAGE CUDA)
+-    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     set_target_properties(${local_goal} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+ 
+ 
+@@ -80,7 +80,7 @@ endfunction()
+ 
+ 
+ mylib("${type}_ebisu" "${CMAKE_SOURCE_DIR}/j3d-temporal-box.cu" "${DEFAULT_COMPILER_FLAG}  ")
+-set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "80")
++set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+ 
+ subcompile(${type} "${DEFAULT_COMPILER_FLAG}  -D__PRINT__" "EBISU" SOURCE "${CMAKE_SOURCE_DIR}/j3d.cu" DRIVER "${CMAKE_SOURCE_DIR}/j3d.driver.cpp" LIB "${type}_ebisu" )
+ 
+diff --git a/3dstencil/3d7pt/CMakeLists.txt b/3dstencil/3d7pt/CMakeLists.txt
+index 31df521..156e96e 100644
+--- a/3dstencil/3d7pt/CMakeLists.txt
++++ b/3dstencil/3d7pt/CMakeLists.txt
+@@ -24,7 +24,7 @@ target_link_libraries(${reference_goal} PUBLIC
+ set_target_properties(${reference_goal} PROPERTIES
+                             COMPILE_FLAGS " -DREFCHECK ")     
+                             
+-set_target_properties("${reference_goal}" PROPERTIES CUDA_ARCHITECTURES "80")
++set_target_properties("${reference_goal}" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+ 
+ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+ 
+@@ -60,13 +60,13 @@ function(subcompile prefix default_compiler_flag aim)
+     add_library(${libraryname} ${LOCAL_SOURCE})
+     set_target_properties(${libraryname} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+     set_target_properties(${libraryname} PROPERTIES COMPILE_FLAGS "${local_compiler_flag} ")
+-    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     target_link_libraries(${libraryname} PUBLIC ${LOCAL_LIB}  ${CUDA_LIBRARIES})
+ 
+     add_executable(${local_goal} ${LOCAL_DRIVER})
+     set_target_properties(${local_goal}
+                       PROPERTIES LANGUAGES CUDA LINKER_LANGUAGE CUDA)
+-    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     set_target_properties(${local_goal} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+ 
+ 
+@@ -80,7 +80,7 @@ endfunction()
+ 
+ 
+ mylib("${type}_ebisu" "${CMAKE_SOURCE_DIR}/j3d-temporal.cu" "${DEFAULT_COMPILER_FLAG}  ")
+-set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "80")
++set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+ 
+ subcompile(${type} "${DEFAULT_COMPILER_FLAG}  -D__PRINT__" "EBISU" SOURCE "${CMAKE_SOURCE_DIR}/j3d.cu" DRIVER "${CMAKE_SOURCE_DIR}/j3d.driver.cpp" LIB "${type}_ebisu" )
+ 
+diff --git a/3dstencil/CMakeLists.txt b/3dstencil/CMakeLists.txt
+index 51285da..3928e07 100644
+--- a/3dstencil/CMakeLists.txt
++++ b/3dstencil/CMakeLists.txt
+@@ -2,7 +2,9 @@ cmake_minimum_required(VERSION 3.10)
+-project(EBISU_3DSTENCIL VERSION 1.0)
++project(EBISU_3DSTENCIL VERSION 1.0 LANGUAGES CXX CUDA)
+ cmake_policy(SET CMP0077 NEW)
+
+-set(CMAKE_CXX_STANDARD 14)
++set(CMAKE_CXX_STANDARD 17)
++set(CMAKE_CUDA_STANDARD 17)
+ set(CMAKE_CXX_STANDARD_REQUIRED True)
++set(CMAKE_CUDA_STANDARD_REQUIRED True)
+
+
+diff --git a/3dstencil/common/cuda_common.cuh b/3dstencil/common/cuda_common.cuh
+index ede8b2c..97cec0f 100644
+--- a/3dstencil/common/cuda_common.cuh
++++ b/3dstencil/common/cuda_common.cuh
+@@ -6,56 +6,47 @@
+ #define CUDACOMMON
+ 
+ #ifndef __CUDA_ARCH__
+-    #define PERKS_ARCH 000
++#define PERKS_ARCH 000
+ #else
+-    #if __CUDA_ARCH__==800
+-        #define PERKS_ARCH 800
+-    #elif __CUDA_ARCH__==700
+-        #define PERKS_ARCH 700
+-    #elif __CUDA_ARCH__==600
+-        #define PERKS_ARCH 600
+-    #else
+-        #error "unsupport"
+-    #endif
++#if __CUDA_ARCH__ == 800
++#define PERKS_ARCH 800
++#elif __CUDA_ARCH__ == 700
++#define PERKS_ARCH 700
++#elif __CUDA_ARCH__ == 600
++#define PERKS_ARCH 600
++#else
++#define PERKS_ARCH 900
++#endif
+ #endif
+-
+ 
+ #include <cooperative_groups/memcpy_async.h>
+ #include <cuda_pipeline.h>
+ 
+-
+-
+ extern __host__ __device__ __forceinline__ int MAX(int a, int b) { return a > b ? a : b; }
+ extern __host__ __device__ __forceinline__ int MIN(int a, int b) { return a < b ? a : b; }
+-extern __host__ __device__ __forceinline__ int CEIL(int a, int b) { return ( (a) % (b) == 0 ? (a) / (b) :  ( (a) / (b) + 1 ) ); }
+-
+-#define cudaCheckError()                                                               \
+-  {                                                                                    \
+-    cudaError_t e = cudaGetLastError();                                                \
+-    if (e != cudaSuccess)                                                              \
+-    {                                                                                  \
+-      printf("Cuda failure %s:%d: '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e)); \
+-    }                                                                                  \
+-  }
+-  
+-#define Check_CUDA_Error(message) \
+-  do{\
+-    cudaError_t error = cudaGetLastError();\
+-    if( error != cudaSuccess ){\
+-      printf("CUDA-ERROR:%s, %s\n",message,cudaGetErrorString(error) ); \
+-      exit(-1);\
+-    }\
+-  }while(0)
+-
+-template<class REAL, int SIZE>
+-__device__ void __forceinline__ init_reg_array(REAL reg_array[SIZE], int val)
+-{
+-  _Pragma("unroll")
+-  for(int l_y=0; l_y<SIZE; l_y++)
+-  {
+-    reg_array[l_y]=val;
+-  }
++extern __host__ __device__ __forceinline__ int CEIL(int a, int b) {
++  return ((a) % (b) == 0 ? (a) / (b) : ((a) / (b) + 1));
+ }
+ 
++#define cudaCheckError()                                                                                               \
++  {                                                                                                                    \
++    cudaError_t e = cudaGetLastError();                                                                                \
++    if (e != cudaSuccess) {                                                                                            \
++      printf("Cuda failure %s:%d: '%s'\n", __FILE__, __LINE__, cudaGetErrorString(e));                                 \
++    }                                                                                                                  \
++  }
+ 
+-#endif
+\ No newline at end of file
++#define Check_CUDA_Error(message)                                                                                      \
++  do {                                                                                                                 \
++    cudaError_t error = cudaGetLastError();                                                                            \
++    if (error != cudaSuccess) {                                                                                        \
++      printf("CUDA-ERROR:%s, %s\n", message, cudaGetErrorString(error));                                               \
++      exit(-1);                                                                                                        \
++    }                                                                                                                  \
++  } while (0)
++
++template <class REAL, int SIZE> __device__ void __forceinline__ init_reg_array(REAL reg_array[SIZE], int val) {
++  _Pragma("unroll") for (int l_y = 0; l_y < SIZE; l_y++) { reg_array[l_y] = val; }
++}
++
++#endif
+diff --git a/3dstencil/config.sh b/3dstencil/config.sh
+index e13fab1..5b4611f 100755
+--- a/3dstencil/config.sh
++++ b/3dstencil/config.sh
+@@ -1,3 +1,3 @@
+ rm ./build/init/CMakeCache.txt 
+ 
+-cmake -S . -B ./build/init/
++cmake -S . -B ./build/init/ -DGPU_ARCH=$1
+diff --git a/3dstencil/poisson/CMakeLists.txt b/3dstencil/poisson/CMakeLists.txt
+index 4ef7212..39f5943 100644
+--- a/3dstencil/poisson/CMakeLists.txt
++++ b/3dstencil/poisson/CMakeLists.txt
+@@ -24,7 +24,7 @@ target_link_libraries(${reference_goal} PUBLIC
+ set_target_properties(${reference_goal} PROPERTIES
+                             COMPILE_FLAGS " -DREFCHECK ")     
+                             
+-set_target_properties("${reference_goal}" PROPERTIES CUDA_ARCHITECTURES "80")
++set_target_properties("${reference_goal}" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+ 
+ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+ 
+@@ -60,13 +60,13 @@ function(subcompile prefix default_compiler_flag aim)
+     add_library(${libraryname} ${LOCAL_SOURCE})
+     set_target_properties(${libraryname} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+     set_target_properties(${libraryname} PROPERTIES COMPILE_FLAGS "${local_compiler_flag} ")
+-    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     target_link_libraries(${libraryname} PUBLIC ${LOCAL_LIB}  ${CUDA_LIBRARIES})
+ 
+     add_executable(${local_goal} ${LOCAL_DRIVER})
+     set_target_properties(${local_goal}
+                       PROPERTIES LANGUAGES CUDA LINKER_LANGUAGE CUDA)
+-    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "80")
++    set_target_properties("${local_goal}" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+     set_target_properties(${local_goal} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+ 
+ 
+@@ -80,7 +80,7 @@ endfunction()
+ 
+ 
+ mylib("${type}_ebisu" "${CMAKE_SOURCE_DIR}/j3d-temporal-box.cu" "${DEFAULT_COMPILER_FLAG}  ")
+-set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "80")
++set_target_properties("${type}_ebisu" PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")
+ 
+ subcompile(${type} "${DEFAULT_COMPILER_FLAG}  -D__PRINT__" "EBISU" SOURCE "${CMAKE_SOURCE_DIR}/j3d.cu" DRIVER "${CMAKE_SOURCE_DIR}/j3d.driver.cpp" LIB "${type}_ebisu" )
+ 

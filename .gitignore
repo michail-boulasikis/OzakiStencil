@@ -3,7 +3,9 @@ target*/
 Testing/
 benchmark/ConvStencil/
 benchmark/DRStencil/
+benchmark/EBISU/
 benchmark/LoRAStencil/
+benchmark/SPIDER/
 benchmark/TCStencil/
 data/
 temp/
