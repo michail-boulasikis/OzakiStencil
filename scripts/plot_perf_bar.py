@@ -21,6 +21,7 @@ import seaborn as sns
 
 sns.set_theme(style="ticks", font_scale=1.2)
 sns.set_context("paper")
+plt.rcParams["ps.fonttype"] = 42
 
 OZAKI_VARIANTS = {
     "7x7Lm1_0": "Ozaki + DSO1",
@@ -126,7 +127,7 @@ def plot_groups(ax, groups):
                 va="bottom",
                 fontsize=6,
                 fontweight="bold",
-                rotation=30,
+                rotation=45,
             )
             if name not in seen:
                 seen[name] = rect[0]
@@ -201,6 +202,11 @@ def main():
         ax.set_title(f"{gpu}", pad=16)
         sns.despine(ax=ax)
 
+    # Unify y-axis limits across all subplots
+    # global_ymax = max(ax.get_ylim()[1] for ax in axes)
+    # for ax in axes:
+    #    ax.set_ylim(0, global_ymax)
+
     # Single shared legend from the last subplot
     order = list(OZAKI_VARIANTS.values()) + [
         "Direct FP32",
@@ -220,7 +226,7 @@ def main():
         fontsize=9,
         frameon=False,
         handlelength=1.2,
-        handletextpad=0.4,
+        handletextpad=0.2,
     )
 
     # fig.suptitle("OzakiStencil Performance Comparisons", fontweight="bold", y=0.90)

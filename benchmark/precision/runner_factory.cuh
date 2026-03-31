@@ -57,8 +57,7 @@ dispatch_m(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Rea
     return make_runner_impl<10>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
                                 extra_msb_shift);
   default:
-    throw std::invalid_argument("  Stencil requires M=" + std::to_string(m) +
-                                " slices, but M=" + std::to_string(m) +
+    throw std::invalid_argument("  Stencil requires M=" + std::to_string(m) + " slices, but M=" + std::to_string(m) +
                                 " is not a supported instantiation.");
   }
 }
@@ -111,8 +110,7 @@ dispatch_m_convstencil(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, cons
     return make_convstencil_runner_impl<10>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
                                             a_coeff, extra_msb_shift);
   default:
-    throw std::invalid_argument("  Stencil requires M=" + std::to_string(m) +
-                                " slices, but M=" + std::to_string(m) +
+    throw std::invalid_argument("  Stencil requires M=" + std::to_string(m) + " slices, but M=" + std::to_string(m) +
                                 " is not a supported instantiation.");
   }
 }
@@ -142,7 +140,8 @@ inline std::unique_ptr<OzakiRunnerBase> make_ozaki_runner(const StencilSpec &spe
   {
     std::ostringstream oss;
     oss << "  Using stencil " << spec.name << ": #Slices = " << params.m
-        << ", a = " << static_cast<long double>(params.a_coeff) << ", extra_msb_shift = " << params.extra_msb_shift << "\n";
+        << ", a = " << static_cast<long double>(params.a_coeff) << ", extra_msb_shift = " << params.extra_msb_shift
+        << "\n";
     std::cout << oss.str();
   }
 

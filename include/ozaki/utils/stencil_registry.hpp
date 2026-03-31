@@ -4,7 +4,6 @@
 #include "stencil_spec.hpp"
 #include "../core/stencil.hpp"
 
-#include <bit>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -18,22 +17,47 @@ namespace ozi {
 
 static constexpr int32_t MAX_STENCIL_SLICE_INT = (1 << 21);
 
-// Number of mantissa bits available in CoeffStorageType.
-// Determines how many bits of the integer stencil coefficients carry
-// independent information in the power-of-2 fallback path.
-#ifdef OZAKI_HAVE_FLOAT128
-static constexpr int32_t COEFF_MANTISSA_BITS = 113;
-#else
-static constexpr int32_t COEFF_MANTISSA_BITS = 63; // long double: 64-bit mantissa, int64 has 63 usable
-#endif
-
-// countl_zero for unsigned __int128 (std::countl_zero only handles up to uint64_t).
-inline int32_t countl_zero_u128(unsigned __int128 x) {
-  uint64_t hi = static_cast<uint64_t>(x >> 64);
-  if (hi != 0)
-    return std::countl_zero(hi);
-  return 64 + std::countl_zero(static_cast<uint64_t>(x));
+// Number of significand bits (including implicit leading 1) for each
+// OriginalPrecision level.  Used by the power-of-2 fallback in
+// compute_stencil_params to match the slicing depth to the *actual*
+// coefficient precision rather than the storage type.
+inline int32_t precision_mantissa_bits(OriginalPrecision p) {
+  switch (p) {
+  case OriginalPrecision::Int8:        return 7;
+  case OriginalPrecision::Float:       return 24;
+  case OriginalPrecision::Double:      return 53;
+  case OriginalPrecision::LongDouble:  return 64;
+  case OriginalPrecision::Float128:    return 113;
+  }
+  return 53; // fallback
 }
+
+namespace detail {
+inline CoeffStorageType coeff_abs(CoeffStorageType x) {
+  return (x >= CoeffStorageType(0)) ? x : -x;
+}
+inline CoeffStorageType coeff_round(CoeffStorageType x) {
+#ifdef OZAKI_HAVE_FLOAT128
+  return roundq(x);
+#else
+  return std::round(x);
+#endif
+}
+inline int32_t coeff_ilogb(CoeffStorageType x) {
+#ifdef OZAKI_HAVE_FLOAT128
+  return static_cast<int32_t>(ilogbq(x));
+#else
+  return std::ilogb(x);
+#endif
+}
+inline CoeffStorageType coeff_scalbn(CoeffStorageType x, int32_t n) {
+#ifdef OZAKI_HAVE_FLOAT128
+  return scalbnq(x, n);
+#else
+  return std::scalbn(x, n);
+#endif
+}
+} // namespace detail
 
 // Variant over all supported stencil shapes.
 // Adding a new shape requires one line here and a recompile.
@@ -137,7 +161,7 @@ inline CoeffStorageType find_integer_basis(const StencilSpec &spec) {
           : CoeffStorageType(static_cast<int64_t>(ratio - CoeffStorageType(0.5)));
       CoeffStorageType diff = ratio - rounded;
       if (diff < CoeffStorageType(0)) diff = -diff;
-      if (diff > CoeffStorageType(1e-12)) {
+      if (diff > CoeffStorageType(1e-9)) {
         all_integer = false;
         break;
       }
@@ -150,22 +174,39 @@ inline CoeffStorageType find_integer_basis(const StencilSpec &spec) {
   return CoeffStorageType(0); // sentinel: no exact integer basis found
 }
 
+// Returns the 0-indexed MSB position of the largest |round(c/a)| across all coefficients.
+// Returns -1 if all coefficients round to zero.
+inline int32_t compute_integer_p_max(const StencilSpec &spec, CoeffStorageType a) {
+  int32_t p_max = -1;
+  for (const auto &c : spec.coeffs) {
+    CoeffStorageType abs_ratio = detail::coeff_abs(detail::coeff_round(c / a));
+    if (abs_ratio > CoeffStorageType(0)) {
+      int32_t bit_pos = detail::coeff_ilogb(abs_ratio);
+      if (bit_pos > p_max)
+        p_max = bit_pos;
+    }
+  }
+  return p_max;
+}
+
+// Returns the L1 norm of the would-be MSB stencil slice for a given extra_msb_shift.
+inline int64_t compute_msb_l1(const StencilSpec &spec, CoeffStorageType a,
+                              int32_t p_max, int32_t extra_msb_shift) {
+  constexpr int32_t target_bits = static_cast<int32_t>(CHAR_BIT * sizeof(int8_t)) - 1;
+  int32_t shift = std::max(0, p_max + extra_msb_shift - (target_bits - 1));
+  int64_t l1 = 0;
+  for (const auto &c : spec.coeffs) {
+    CoeffStorageType abs_ratio = detail::coeff_abs(detail::coeff_round(c / a));
+    l1 += static_cast<int64_t>(detail::coeff_scalbn(abs_ratio, -shift));
+  }
+  return l1;
+}
+
 inline int compute_m_needed(const StencilSpec &spec, CoeffStorageType a) {
   constexpr int32_t target_bits = static_cast<int32_t>(CHAR_BIT * sizeof(int8_t)) - 1;
-
-  int32_t range_msb = 128;
-  for (const auto &c : spec.coeffs) {
-    CoeffStorageType raw = c / a;
-    CoeffStorageType shifted = raw + (raw >= CoeffStorageType(0) ? CoeffStorageType(0.5) : CoeffStorageType(-0.5));
-    __int128 int_val = static_cast<__int128>(shifted);
-    unsigned __int128 abs_val = (int_val < 0) ? static_cast<unsigned __int128>(-int_val) : static_cast<unsigned __int128>(int_val);
-    if (int32_t msb = countl_zero_u128(abs_val); msb < range_msb)
-      range_msb = msb;
-  }
-
-  int32_t p_max = 127 - range_msb;
+  int32_t p_max = compute_integer_p_max(spec, a);
   if (p_max < 0)
-    return 1; // All coefficients rounded to zero
+    return 1;
   return p_max / target_bits + 1;
 }
 
@@ -175,13 +216,13 @@ struct StencilParams {
   int32_t          m;              // Number of int8 slices required to represent the integer stencil
   CoeffStorageType scaling_factor; // 1 / effective_a; used to undo integer scaling after convolution
   bool             exact_basis;    // true if a_coeff is exact; false if the fallback approximation was used
-  int32_t          extra_msb_shift = 0; // Right-shift for MSB slice to keep L1 < 127
+  int32_t          extra_msb_shift = 0; // Right-shift for MSB slice to keep L1 < 128
 };
 
 // Computes all derived parameters needed to run an Ozaki stencil computation from a StencilSpec.
-// Wraps find_integer_basis (with fallback) + compute_m_needed + L1-norm / scaling_factor in one call.
 inline StencilParams compute_stencil_params(const StencilSpec &spec) {
   StencilParams p;
+  constexpr int32_t target_bits = static_cast<int32_t>(CHAR_BIT * sizeof(int8_t)) - 1;
 
   // Step 1: find a_coeff such that all coefficients / a_coeff are integers.
   p.a_coeff = find_integer_basis(spec);
@@ -191,101 +232,53 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
     // Fallback: power-of-2 normalization (Ozaki-style slicing of the stencil).
     CoeffStorageType abs_max = CoeffStorageType(0);
     for (const auto &c : spec.coeffs) {
-      CoeffStorageType ac = (c >= CoeffStorageType(0)) ? c : -c;
+      CoeffStorageType ac = detail::coeff_abs(c);
       if (ac > abs_max) abs_max = ac;
     }
     if (abs_max > CoeffStorageType(0)) {
       int exp;
+      int32_t mbits = precision_mantissa_bits(spec.specified_precision);
 #ifdef OZAKI_HAVE_FLOAT128
       frexpq(abs_max, &exp);
-      p.a_coeff = scalbnq(static_cast<__float128>(1.0), exp - COEFF_MANTISSA_BITS);
+      p.a_coeff = scalbnq(static_cast<__float128>(1.0), exp - mbits);
 #else
       std::frexp(static_cast<long double>(abs_max), &exp);
-      p.a_coeff = std::scalbn(static_cast<long double>(1.0), exp - COEFF_MANTISSA_BITS);
+      p.a_coeff = std::scalbn(static_cast<long double>(1.0), exp - mbits);
 #endif
     } else {
       p.a_coeff = CoeffStorageType(1);
     }
   }
 
-  // Step 2: determine the number of int8 slices needed.
-  p.m = compute_m_needed(spec, p.a_coeff);
+  // Step 2: compute p_max (MSB position of the largest integer coefficient).
+  int32_t p_max = compute_integer_p_max(spec, p.a_coeff);
 
-  // Step 2b: check whether the MSB stencil slice L1 norm >= 127.
-  // If so, right-shift the MSB slice by extra_msb_shift bits and add
-  // compensating LSB slices so that the overflow threshold stays valid.
-  constexpr int32_t target_bits = static_cast<int32_t>(CHAR_BIT * sizeof(int8_t)) - 1;
-  int32_t p_max = -1;
-  {
-    // Compute integer coefficients (same logic as slice_stencil)
-    int32_t range_msb = 128;
-    std::vector<__int128> int_coeffs(spec.coeffs.size());
-    for (size_t i = 0; i < spec.coeffs.size(); ++i) {
-      CoeffStorageType raw = spec.coeffs[i] / p.a_coeff;
-      CoeffStorageType shifted = raw + (raw >= CoeffStorageType(0) ? CoeffStorageType(0.5) : CoeffStorageType(-0.5));
-      int_coeffs[i] = static_cast<__int128>(shifted);
-      unsigned __int128 abs_val = (int_coeffs[i] < 0) ? static_cast<unsigned __int128>(-int_coeffs[i]) : static_cast<unsigned __int128>(int_coeffs[i]);
-      if (int32_t msb = countl_zero_u128(abs_val); msb < range_msb)
-        range_msb = msb;
-    }
-    p_max = 127 - range_msb;
+  // Step 3: determine extra_msb_shift.
+  // Two constraints must hold simultaneously:
+  //   (a) L1 norm of the MSB stencil slice < 128 (so overflow_danger_threshold >= 0)
+  //   (b) scaling_factor < 128 (so boundary_gain's MSB digit fits in int8_t)
+  p.extra_msb_shift = 0;
+  if (p_max >= 0) {
+    auto scaling_factor_for = [&](int32_t extra_shift) -> CoeffStorageType {
+      int32_t shift0 = std::max(0, p_max - (target_bits - 1) + extra_shift);
+      CoeffStorageType eff_a = detail::coeff_scalbn(p.a_coeff, shift0);
+      return (eff_a > CoeffStorageType(0)) ? (CoeffStorageType(1) / eff_a) : CoeffStorageType(1);
+    };
 
-    // Compute L1 norm of the would-be MSB slice
-    p.extra_msb_shift = 0;
-    if (p_max >= 0) {
-      auto compute_msb_l1 = [&](int32_t extra_shift) -> int64_t {
-        int32_t shift = std::max(0, p_max + extra_shift - (target_bits - 1));
-        int64_t l1 = 0;
-        for (size_t i = 0; i < int_coeffs.size(); ++i) {
-          unsigned __int128 abs_val = (int_coeffs[i] < 0)
-            ? static_cast<unsigned __int128>(-int_coeffs[i])
-            : static_cast<unsigned __int128>(int_coeffs[i]);
-          l1 += static_cast<int64_t>(abs_val >> shift);
-        }
-        return l1;
-      };
-
-      while (compute_msb_l1(p.extra_msb_shift) >= 91) {
-        p.extra_msb_shift++;
-      }
-
-      if (p.extra_msb_shift > 0) {
-        // Recompute M: the extra shift adds more bits to represent, requiring more slices
-        p.m = (p_max + p.extra_msb_shift) / target_bits + 1;
-      }
+    while (compute_msb_l1(spec, p.a_coeff, p_max, p.extra_msb_shift) >= 128 ||
+           scaling_factor_for(p.extra_msb_shift) >= CoeffStorageType(128)) {
+      p.extra_msb_shift++;
     }
   }
 
-  // Step 3: compute the scaling factor.
+  // Step 4: compute m (number of INT8 stencil slices).
+  p.m = (p_max < 0) ? 1 : (p_max + p.extra_msb_shift) / target_bits + 1;
+
+  // Step 5: compute scaling_factor = 1 / effective_a.
   // effective_a = a_coeff * 2^shift0, where shift0 accounts for the MSB right-shift.
-  // scaling_factor = 1 / effective_a; used by the runner to rescale reconstructed output.
-  CoeffStorageType effective_a = p.a_coeff;
   {
     int32_t shift0 = std::max(0, p_max - (target_bits - 1) + p.extra_msb_shift);
-#ifdef OZAKI_HAVE_FLOAT128
-    effective_a = scalbnq(p.a_coeff, shift0);
-#else
-    effective_a = std::scalbn(p.a_coeff, shift0);
-#endif
-  }
-  p.scaling_factor = (effective_a > CoeffStorageType(0))
-      ? (CoeffStorageType(1) / effective_a)
-      : CoeffStorageType(1);
-
-  // Ensure boundary_gain's most-significant digit fits in int8_t (values in [-127, 127]).
-  // boundary_gain encodes round(1/effective_a) in base-128; the MSB digit equals
-  // floor(scaling_factor). When scaling_factor >= 128 that digit overflows int8_t
-  // and gets silently truncated (mod 128).
-  // Each extra_msb_shift increment doubles effective_a and halves scaling_factor until < 128.
-  while (p.scaling_factor >= CoeffStorageType(128)) {
-    p.extra_msb_shift++;
-    int32_t new_shift0 = std::max(0, p_max - (target_bits - 1) + p.extra_msb_shift);
-#ifdef OZAKI_HAVE_FLOAT128
-    effective_a = scalbnq(p.a_coeff, new_shift0);
-#else
-    effective_a = std::scalbn(p.a_coeff, new_shift0);
-#endif
-    p.m = (p_max + p.extra_msb_shift) / target_bits + 1;
+    CoeffStorageType effective_a = detail::coeff_scalbn(p.a_coeff, shift0);
     p.scaling_factor = (effective_a > CoeffStorageType(0))
         ? (CoeffStorageType(1) / effective_a)
         : CoeffStorageType(1);

@@ -7,11 +7,7 @@ import os
 import re
 import sys
 import argparse
-from decimal import Decimal, getcontext as _getcontext
-from fractions import Fraction
 from itertools import product
-
-_getcontext().prec = 50
 
 STENCIL_NAME = ["0"]
 REQUESTED_SLICES = [1, 2, 3, None]
@@ -30,13 +26,13 @@ EXTRA_MSBS = 0
 
 # Entry: (stencil_shape, input_shape, label)
 SHAPE_INPUT_PAIRS = [
-    ([5], [128], "1D_128"),
+    # ([5], [128], "1D_128"),
     # ([7], [128], "1D_128"),
-    ([3, 3], [128, 128], "2D_128x128"),
+    # ([3, 3], [128, 128], "2D_128x128"),
     # ([5, 5], [128, 128], "2D_128x128"),
     ([7, 7], [128, 128], "2D_128x128"),
-    ([3, 3, 3], [32, 32, 32], "3D_32x32x32"),
-    ([5, 5, 5], [32, 32, 32], "3D_32x32x32"),
+    # ([3, 3, 3], [32, 32, 32], "3D_32x32x32"),
+    # ([5, 5, 5], [32, 32, 32], "3D_32x32x32"),
 ]
 
 ERROR_THRESHOLD = 1e-8
@@ -143,28 +139,13 @@ def generate_stencil_spec(
         else:
             raise ValueError(f"Unknown l1_norm mode: {l1_norm}")
 
-        # Compute the common factor as an exact Fraction to avoid float64
-        # rounding errors that would break the integer relationship.
-        # log-uniform basis so pre-normalization magnitudes span several
-        # decades evenly instead of clustering near the upper end.
-        basis = np.float64(10) ** rng.uniform(-6, 0)
-        factor = Fraction(basis) * Fraction(target_l1) / Fraction(l1_int)
-
-        # Multiply each integer coefficient by the exact rational factor,
-        # producing a high-precision string for the .stc file.
-        flat_ints = int_coeffs.flatten()
-        coeffs_str = []
-        for iv in flat_ints:
-            exact = Fraction(int(iv)) * factor
-            # Convert via Decimal for 40-digit string without float64 rounding
-            d = Decimal(exact.numerator) / Decimal(exact.denominator)
-            coeffs_str.append(format(d, "f"))
-
-        # Also produce a numpy array for the return value (informational only)
-        coeffs = np.array(
-            [float(Fraction(int(iv)) * factor) for iv in flat_ints],
-            dtype=PRECISION_TYPE_MAP[original_precision],
-        ).reshape(shape)
+        factor = target_l1 / l1_int
+        coeffs = (
+            (int_coeffs.astype(np.float64) * factor)
+            .astype(PRECISION_TYPE_MAP[original_precision])
+            .reshape(shape)
+        )
+        coeffs_str = [str(x) for x in coeffs.flatten()]
     else:
         coeffs = rng.standard_normal(size=shape).astype(
             PRECISION_TYPE_MAP[original_precision]

@@ -4,7 +4,7 @@ Run the full precision benchmark pipeline for a set of stencils.
 
 For each stencil x timestep combination:
   1. compute-reference  -> FP128 reference tensor
-  2. run-ozaki          -> Ozaki tensors for s=2..18
+  2. run-ozaki          -> Ozaki tensors for s=5..18
   3. compute-errors     -> RMSE between reference and each Ozaki result
 
 Usage:
@@ -27,7 +27,7 @@ BUILD_BIN = "./build/bin"
 TENSOR_DIR = "./data/tensors"
 
 DEFAULT_TIMESTEPS = [1, 10, 100, 1000]
-DEFAULT_SLICE_MIN = 2
+DEFAULT_SLICE_MIN = 5
 DEFAULT_SLICE_MAX = 18
 
 DEFAULT_INPUT_SHAPES = {

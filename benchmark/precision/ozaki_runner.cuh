@@ -7,7 +7,7 @@
 #include <ozaki/gpu/ozi.cuh>
 #include <ozaki/gpu/ozi_kernels.cuh>
 #include <ozaki/gpu/ozi_stencil_plain.cuh>
-#include <ozaki/gpu/ozi_stencil_conv_v2.cuh>
+#include <ozaki/gpu/ozi_stencil_conv.cuh>
 #include <ozaki/utils/tensor.hpp>
 
 #include <algorithm>
@@ -360,40 +360,66 @@ public:
 
     ozigpu::upload_slice_phys_lut(active_slices);
 
-    cudaFuncSetAttribute(ozigpu::cvstencil_v2<ozigpu::OzakiFP_Int8<Real>, M>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         ozigpu::convstencil::DYN_SMEM_BYTES);
-
-    ozigpu::convstencil::TmaDescriptorsV2 tma;
     size_t total_height = static_cast<size_t>(num_slices_total) * height;
-    bool tma_ok = ozigpu::convstencil::create_tma_descriptors_v2(tma, d_slices_1, d_slices_2, total_height, ldm);
-    if (!tma_ok)
-      throw std::runtime_error("cvstencil requires ldm >= 128 and ldm % 16 == 0");
 
     NVTX_PUSH("Integration Loop");
-    for (int32_t t = 0; t < n_iterations; ++t) {
-      ozigpu::cvstencil_v2<ozigpu::OzakiFP_Int8<Real>, M>
-          <<<grid, block, ozigpu::convstencil::DYN_SMEM_BYTES>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary_, tma.h_main[0]);
+    if constexpr (M <= 3) {
+      cudaFuncSetAttribute(ozigpu::cvstencil_v2<ozigpu::OzakiFP_Int8<Real>, M>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           ozigpu::convstencil::DYN_SMEM_BYTES);
 
-      if (t < n_iterations - 1) {
-        int32_t min_shifts_now;
-        if (t == n_iterations - 2) {
-          min_shifts_now = total_shifts_needed;
-        } else {
-          min_shifts_now = static_cast<int32_t>(
-              std::ceil((t + 1) * log2_sf / 7.0));
+      ozigpu::convstencil::TmaDescriptorsV2 tma;
+      bool tma_ok = ozigpu::convstencil::create_tma_descriptors_v2(tma, d_slices_1, d_slices_2, total_height, ldm);
+      if (!tma_ok)
+        throw std::runtime_error("cvstencil requires ldm >= 128 and ldm % 16 == 0");
+
+      for (int32_t t = 0; t < n_iterations; ++t) {
+        ozigpu::cvstencil_v2<ozigpu::OzakiFP_Int8<Real>, M>
+            <<<grid, block, ozigpu::convstencil::DYN_SMEM_BYTES>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary_, tma.h_main[0]);
+
+        if (t < n_iterations - 1) {
+          int32_t min_shifts_now;
+          if (t == n_iterations - 2) {
+            min_shifts_now = total_shifts_needed;
+          } else {
+            min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
+          }
+          if (min_shifts_now < 0) min_shifts_now = 0;
+          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
         }
-        if (min_shifts_now < 0) min_shifts_now = 0;
-        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
-      }
 
-      std::swap(d_slices_1, d_slices_2);
-      tma.swap();
+        std::swap(d_slices_1, d_slices_2);
+        tma.swap();
+      }
+      tma.free();
+    } else {
+      ozigpu::convstencil::TmaDescriptors tma;
+      bool tma_ok = ozigpu::convstencil::create_tma_descriptors(tma, d_slices_1, d_slices_2, total_height, ldm);
+      if (!tma_ok)
+        throw std::runtime_error("cvstencil requires ldm >= 128 and ldm % 16 == 0");
+
+      for (int32_t t = 0; t < n_iterations; ++t) {
+        ozigpu::cvstencil<ozigpu::OzakiFP_Int8<Real>, M>
+            <<<grid, block>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary_, tma.h_main[0], tma.h_extra[0]);
+
+        if (t < n_iterations - 1) {
+          int32_t min_shifts_now;
+          if (t == n_iterations - 2) {
+            min_shifts_now = total_shifts_needed;
+          } else {
+            min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
+          }
+          if (min_shifts_now < 0) min_shifts_now = 0;
+          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
+        }
+
+        std::swap(d_slices_1, d_slices_2);
+        tma.swap();
+      }
+      tma.free();
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     NVTX_POP();
-
-    tma.free();
 
     // Mend slices back to floating point and apply scale factor
     const int32_t nThreadsMend = std::min(static_cast<size_t>(RDC_THREADS), n_elems / 4);
