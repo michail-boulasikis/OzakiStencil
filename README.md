@@ -18,7 +18,7 @@ If you run into network issues try using the flag `--network=host`. If the packa
 The image may then be launched as follows:
 
 ```bash
-docker run -it --gpus all -e CUDA_COMPUTE_CAPABILITY="90a" -v $(pwd)/data/results:/artifact/data/results ozaki_stencil
+docker run -it --gpus all -e CUDA_COMPUTE_CAPABILITY="120" -v $(pwd)/data/results:/artifact/data/results ozaki_stencil
 ```
 
 Make sure to replace the `CUDA_COMPUTE_CAPABILITY` environment variable with the one that corresponds to the test environment's GPU. OzakiStencil supports `90`, `90a`, `100`, `100a` and `120`.
