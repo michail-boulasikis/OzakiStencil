@@ -22,6 +22,7 @@ docker run -it --gpus all -e CUDA_COMPUTE_CAPABILITY="90a" -v $(pwd)/data/result
 ```
 
 Make sure to replace the `CUDA_COMPUTE_CAPABILITY` environment variable with the one that corresponds to the test environment's GPU. OzakiStencil supports `90`, `90a`, `100`, `100a` and `120`.
+Note that if you want to see correctness results past `double` precision, you will need to use a GPU that supports the `__float128` type (`sm100` and above). This is a limitation of the implementation, not OzakiStencil.
 The volume `-v` argument allows accessing the resulting files from outside the container. 
 
 The container is going to run `entrypoint.sh`, which will provide a shell and additional instructions on how to run the experiments.
