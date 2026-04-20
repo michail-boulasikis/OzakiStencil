@@ -32,6 +32,27 @@ inline int32_t precision_mantissa_bits(OriginalPrecision p) {
   return 53; // fallback
 }
 
+// Detects the narrowest floating-point type that exactly represents every
+// coefficient, regardless of the declared precision.  A __float128 value
+// parsed from a double string has its low 60 mantissa bits all zero; the
+// round-trip CoeffStorageType((float)c) == c / CoeffStorageType((double)c) == c
+// tests exploit this.  Falls back to spec.specified_precision when the
+// coefficients genuinely use more than double precision.
+inline OriginalPrecision detect_coefficient_precision(const StencilSpec &spec) {
+#ifdef OZAKI_HAVE_FLOAT128
+  bool fits_float  = true;
+  bool fits_double = true;
+  for (const auto &c : spec.coeffs) {
+    if (c == CoeffStorageType(0)) continue;
+    if (CoeffStorageType(static_cast<double>(c)) != c) { fits_double = false; fits_float = false; break; }
+    if (CoeffStorageType(static_cast<float> (c)) != c)   fits_float  = false;
+  }
+  if (fits_float)  return OriginalPrecision::Float;
+  if (fits_double) return OriginalPrecision::Double;
+#endif
+  return spec.specified_precision;
+}
+
 namespace detail {
 inline CoeffStorageType coeff_abs(CoeffStorageType x) {
   return (x >= CoeffStorageType(0)) ? x : -x;
@@ -228,16 +249,28 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
   p.a_coeff = find_integer_basis(spec);
   p.exact_basis = (p.a_coeff != CoeffStorageType(0));
 
+  int32_t coeff_spread = 0;
+
   if (!p.exact_basis) {
     // Fallback: power-of-2 normalization (Ozaki-style slicing of the stencil).
     CoeffStorageType abs_max = CoeffStorageType(0);
+    int32_t exp_max_coeff = INT32_MIN;
+    int32_t exp_min_coeff = INT32_MAX;
     for (const auto &c : spec.coeffs) {
       CoeffStorageType ac = detail::coeff_abs(c);
       if (ac > abs_max) abs_max = ac;
+      if (ac > CoeffStorageType(0)) {
+        int32_t e = detail::coeff_ilogb(ac);
+        if (e > exp_max_coeff) exp_max_coeff = e;
+        if (e < exp_min_coeff) exp_min_coeff = e;
+      }
     }
+    if (exp_max_coeff >= exp_min_coeff)
+      coeff_spread = exp_max_coeff - exp_min_coeff;
+
     if (abs_max > CoeffStorageType(0)) {
       int exp;
-      int32_t mbits = precision_mantissa_bits(spec.specified_precision);
+      int32_t mbits = precision_mantissa_bits(detect_coefficient_precision(spec));
 #ifdef OZAKI_HAVE_FLOAT128
       frexpq(abs_max, &exp);
       p.a_coeff = scalbnq(static_cast<__float128>(1.0), exp - mbits);
@@ -272,7 +305,10 @@ inline StencilParams compute_stencil_params(const StencilSpec &spec) {
   }
 
   // Step 4: compute m (number of INT8 stencil slices).
-  p.m = (p_max < 0) ? 1 : (p_max + p.extra_msb_shift) / target_bits + 1;
+  // For the fallback (Ozaki splitting) path, coeff_spread accounts for the
+  // dynamic range of the coefficients: smaller coefficients have significant
+  // bits below the MSB slice that need additional slices to capture.
+  p.m = (p_max < 0) ? 1 : (p_max + p.extra_msb_shift + coeff_spread) / target_bits + 1;
 
   // Step 5: compute scaling_factor = 1 / effective_a.
   // effective_a = a_coeff * 2^shift0, where shift0 accounts for the MSB right-shift.

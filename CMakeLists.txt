@@ -64,7 +64,7 @@ endif()
 # OZAKI_CUDA_ARCH: strip suffixes (e.g. "90a" -> "90") so the define is a
 # plain integer usable in #if preprocessor expressions.
 string(REGEX REPLACE "[a-zA-Z]" "" OZAKI_CUDA_ARCH_NUM "${CUDA_COMPUTE_CAPABILITY}")
-target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_CUDA_ARCH=${OZAKI_CUDA_ARCH_NUM})
+target_compile_definitions(ozaki_common INTERFACE OZAKI_CUDA_ARCH=${OZAKI_CUDA_ARCH_NUM})
 
 # OZAKI_HAVE_WGMMA: WGMMA integer (wgmma.mma_async s8.s8) is only available
 # on SM_90a (Hopper with architecture acceleration). Blackwell (SM_100/SM_100a)

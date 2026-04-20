@@ -19,10 +19,10 @@ namespace po = boost::program_options;
 #endif
 
 HIGH_PREC absmax(const Tensor<HIGH_PREC> &a) {
-  HIGH_PREC amax = static_cast<HIGH_PREC>(-1.0);
+  HIGH_PREC amax = static_cast<HIGH_PREC>(0);
   for (const auto &d : a.data)
     if (HIGH_PREC_ABS(d) > amax) {
-      amax = d;
+      amax = HIGH_PREC_ABS(d);
     }
   return amax;
 }
@@ -69,9 +69,9 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    // Load tensors at highest available precision, widening if stored type differs
-    auto ref = read_tensor_as<HIGH_PREC>(reference_file);
-    auto result = read_tensor_as<HIGH_PREC>(result_file);
+    // Load tensors strictly as __float128; both reference and Ozaki outputs are written in __float128.
+    auto ref = read_tensor<HIGH_PREC>(reference_file);
+    auto result = read_tensor<HIGH_PREC>(result_file);
     if (scaled) {
       auto scale = absmax(ref);
       div_tensors(ref, scale);

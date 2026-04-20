@@ -17,7 +17,7 @@ STENCIL_TITLES = {
     "heat": "Heat Equation",
     "ad": "Advection-Diffusion",
     "7x7Lm1_0": r"7×7 Box (DSO1)",
-    "3x3x3Lm2_0": r"3×3×3 Box",
+    "3x3x3LmNone_0": r"3×3×3 Box",
 }
 
 # Desired subplot order (keys absent in the CSV are skipped)

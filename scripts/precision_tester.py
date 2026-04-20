@@ -1,108 +1,72 @@
 import numpy as np
 import subprocess
-import struct
 import glob
 import csv
 import os
 import re
 import sys
 import argparse
+from contextlib import nullcontext
+from decimal import Decimal, getcontext
 from itertools import product
 
+getcontext().prec = 60
+
 STENCIL_NAME = ["0"]
-REQUESTED_SLICES = [1, 2, 3, None]
+REQUESTED_SLICES = [1, 2, None]
 NEGATIVE_COEFFS = [True, False]
 SPARSE = [True, False]
 L1_NORM = ["ONE", "GT1", "LT1"]
 
-TIMESTEPS = [1, 10, 40]
-
-# If True, input tensors will have zeros on the boundary (Dirichlet boundary condition)
-DIRICHLET_ZERO = False
-
+TIMESTEPS = [1, 10, 25]
 
 EXTRA_LSBS = 0
 EXTRA_MSBS = 0
 
-# Entry: (stencil_shape, input_shape, label)
+# Entry: (stencil_shape, label). Dimensionality is len(stencil_shape); the
+# input tensor for that dim is supplied via a positional CLI arg.
 SHAPE_INPUT_PAIRS = [
-    # ([5], [128], "1D_128"),
-    # ([7], [128], "1D_128"),
-    # ([3, 3], [128, 128], "2D_128x128"),
-    # ([5, 5], [128, 128], "2D_128x128"),
-    ([7, 7], [128, 128], "2D_128x128"),
-    # ([3, 3, 3], [32, 32, 32], "3D_32x32x32"),
-    # ([5, 5, 5], [32, 32, 32], "3D_32x32x32"),
+    ([5], "1D"),
+    # ([7], "1D"),
+    # ([3, 3], "2D"),
+    # ([5, 5], "2D"),
+    ([7, 7], "2D"),
+    ([3, 3, 3], "3D"),
+    # ([5, 5, 5], "3D"),
 ]
 
 ERROR_THRESHOLD = 1e-8
 
 BUILD_BIN = "./build/bin"
-DATA_DIR = "./data"
 TENSOR_DIR = "./data/tensors"
 STENCIL_DIR = "./data/stencils"
-CSV_OUTPUT = "precision_results.csv"
-BREACHES_OUTPUT = "breaches.txt"
-
-PRECISION_TYPE_MAP = {
-    "double": np.float64,
-    "float": np.float32,
-    "longdouble": np.longdouble,
-    "fp128": np.float128 if hasattr(np, "float128") else np.longdouble,
-}
+CSV_OUTPUT = "./data/precision_results.csv"
+BREACHES_OUTPUT = "./data/breaches.txt"
 
 
-def apply_dirichlet_boundary(data, stencil_shape):
-    data = np.asarray(data, dtype=np.float64)
-    ndim = len(data.shape)
-    stencil_shape = list(stencil_shape)
-
-    if ndim != len(stencil_shape):
-        raise ValueError(
-            f"Data dimensionality {ndim} != stencil dimensionality {len(stencil_shape)}"
-        )
-
-    # Calculate boundary width for each dimension
-    boundary_widths = [s // 2 for s in stencil_shape]
-
-    if ndim == 1:
-        bw = boundary_widths[0]
-        data[:bw] = 0.0
-        data[-bw:] = 0.0
-    elif ndim == 2:
-        bw0, bw1 = boundary_widths
-        data[:bw0, :] = 0.0
-        data[-bw0:, :] = 0.0
-        data[:, :bw1] = 0.0
-        data[:, -bw1:] = 0.0
-    elif ndim == 3:
-        bw0, bw1, bw2 = boundary_widths
-        data[:bw0, :, :] = 0.0
-        data[-bw0:, :, :] = 0.0
-        data[:, :bw1, :] = 0.0
-        data[:, -bw1:, :] = 0.0
-        data[:, :, :bw2] = 0.0
-        data[:, :, -bw2:] = 0.0
+def _pick_target_l1(l1_norm, rng):
+    if l1_norm == "ONE":
+        return 1.0 / (1.0 + 0.05 * (1.0 - 2 * rng.random()))
+    elif l1_norm == "GT1":
+        return rng.uniform(1.05, 1.5)
+    elif l1_norm == "LT1":
+        return rng.uniform(0.3, 0.95)
     else:
-        raise ValueError(f"Only 1D, 2D, and 3D tensors supported, got {ndim}D")
-
-    return data
+        raise ValueError(f"Unknown l1_norm mode: {l1_norm}")
 
 
-def write_tensor_file(path, data):
-    data = np.asarray(data, dtype=np.float64)
-    shape = data.shape
-    ndim = len(shape)
-    header = struct.pack(f"<{'Q' * (2 + ndim)}", ndim, 1, *shape)
-    with open(path, "wb") as f:
-        f.write(header)
-        data.tofile(f)
+def _format_decimal(d):
+    """Plain decimal string (no exponent), trimming trailing zeros after the point."""
+    s = format(d, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s if s else "0"
+
 
 
 def generate_stencil_spec(
     shape,
     negative_coeffs=True,
-    original_precision="double",
     requested_slices=None,
     stencil_num=0,
     offsets=None,
@@ -110,11 +74,20 @@ def generate_stencil_spec(
     l1_norm="ONE",
     rng=None,
 ):
+    """Generate a stencil spec written in fp128.
+
+    With a basis (requested_slices set): coefficients are computed as exact
+    rationals (int_coeff * target_l1 / l1_int) using Decimal, then emitted with
+    full 50+ digit precision so that fp128 parsing keeps every bit we care about.
+
+    Without a basis: coefficients are generated as FP64 standard
+    normal then rescaled to target L1, and we append the decimal digits of a
+    uniformly random 64-bit integer to the string form of each nonzero
+    coefficient. Zero stays zero.
+    """
     if rng is None:
         rng = np.random.default_rng(0)
 
-    coeffs = None
-    int_coeffs = None
     if requested_slices:
         abs_limit = 2 ** (7 * requested_slices) // np.prod(shape)
         int_coeffs = rng.integers(
@@ -130,48 +103,42 @@ def generate_stencil_spec(
             int_coeffs.flat[len(int_coeffs.flat) // 2] = 1
             l1_int = 1
 
-        if l1_norm == "ONE":
-            target_l1 = 1.0 / (1.0 + 0.05 * (1.0 - 2 * rng.random()))
-        elif l1_norm == "GT1":
-            target_l1 = rng.uniform(1.05, 1.5)
-        elif l1_norm == "LT1":
-            target_l1 = rng.uniform(0.3, 0.95)
-        else:
-            raise ValueError(f"Unknown l1_norm mode: {l1_norm}")
+        target_l1 = _pick_target_l1(l1_norm, rng)
 
-        factor = target_l1 / l1_int
-        coeffs = (
-            (int_coeffs.astype(np.float64) * factor)
-            .astype(PRECISION_TYPE_MAP[original_precision])
-            .reshape(shape)
-        )
-        coeffs_str = [str(x) for x in coeffs.flatten()]
+        target_l1_d = Decimal(repr(target_l1))
+        l1_int_d = Decimal(int(l1_int))
+        coeffs_str = []
+        for ic in int_coeffs.flatten():
+            ic = int(ic)
+            if ic == 0:
+                coeffs_str.append("0")
+            else:
+                val = (Decimal(ic) * target_l1_d) / l1_int_d
+                coeffs_str.append(_format_decimal(val))
     else:
-        coeffs = rng.standard_normal(size=shape).astype(
-            PRECISION_TYPE_MAP[original_precision]
-        )
-        coeffs = np.abs(coeffs) if not negative_coeffs else coeffs
+        coeffs = rng.standard_normal(size=shape).astype(np.float64)
+        if not negative_coeffs:
+            coeffs = np.abs(coeffs)
 
         if sparse:
             zero_mask = rng.random(size=coeffs.shape) < 0.7
             coeffs[zero_mask] = 0.0
 
-        l1_sum = np.sum(np.abs(coeffs))
+        l1_sum = float(np.sum(np.abs(coeffs)))
         if l1_sum == 0:
             coeffs.flat[len(coeffs.flat) // 2] = 1.0
             l1_sum = 1.0
 
-        if l1_norm == "ONE":
-            target_l1 = 1.0 / (1.0 + 0.05 * (1.0 - 2 * rng.random()))
-        elif l1_norm == "GT1":
-            target_l1 = rng.uniform(1.05, 1.5)
-        elif l1_norm == "LT1":
-            target_l1 = rng.uniform(0.3, 0.95)
-        else:
-            raise ValueError(f"Unknown l1_norm mode: {l1_norm}")
-
+        target_l1 = _pick_target_l1(l1_norm, rng)
         coeffs *= target_l1 / l1_sum
-        coeffs_str = [str(x) for x in coeffs.flatten()]
+
+        coeffs_str = []
+        for c in coeffs.flatten():
+            c = float(c)
+            if c == 0.0:
+                coeffs_str.append("0")
+                continue
+            coeffs_str.append(_format_decimal(Decimal(c)))
 
     if not offsets:
         offsets = np.array(shape) // 2
@@ -192,13 +159,13 @@ def generate_stencil_spec(
     name {name}
     shape {" ".join(shape)}
     offsets {" ".join(offsets)}
-    precision {original_precision}
+    precision fp128
     coeffs
     {" ".join(coeffs_str)}
     """
     with open(f"{STENCIL_DIR}/{name}.stc", "w") as outfile:
         outfile.write(spec)
-    return name, coeffs
+    return name
 
 
 def run_pipeline(name, input_file, input_label, T, algorithm="direct"):
@@ -242,8 +209,6 @@ def run_pipeline(name, input_file, input_label, T, algorithm="direct"):
             oz_prefix,
             "-T",
             str(T),
-            "--slice-limit",
-            "12",
             "--extra-lsb",
             str(EXTRA_LSBS),
             "--extra-msb",
@@ -376,7 +341,7 @@ def plot_results(mode):
 
     # Column order: unique shapes in the order they appear in SHAPE_INPUT_PAIRS.
     shape_order = []
-    for stencil_shape, _, _ in SHAPE_INPUT_PAIRS:
+    for stencil_shape, _ in SHAPE_INPUT_PAIRS:
         s = "x".join(str(x) for x in stencil_shape)
         if s not in shape_order:
             shape_order.append(s)
@@ -521,6 +486,11 @@ _parser.add_argument(
     ),
 )
 _parser.add_argument(
+    "--no-experiments",
+    action="store_true",
+    help="Generate stencil files only; skip running the precision experiments.",
+)
+_parser.add_argument(
     "--plot",
     choices=["pos-neg", "slices", "sparse", "L1"],
     metavar="{pos-neg,slices,sparse,L1}",
@@ -533,6 +503,24 @@ _parser.add_argument(
         "'L1' groups rows by L1 norm magnitude (stable / expansive / contractive)."
     ),
 )
+_parser.add_argument(
+    "tensor_1d",
+    help="Path to 1D input tensor, or NONE to skip 1D tests.",
+    nargs="?",
+    default=None,
+)
+_parser.add_argument(
+    "tensor_2d",
+    help="Path to 2D input tensor, or NONE to skip 2D tests.",
+    nargs="?",
+    default=None,
+)
+_parser.add_argument(
+    "tensor_3d",
+    help="Path to 3D input tensor, or NONE to skip 3D tests.",
+    nargs="?",
+    default=None,
+)
 _args = _parser.parse_args()
 
 if _args.plot:
@@ -544,76 +532,61 @@ if _args.plot:
 os.makedirs(STENCIL_DIR, exist_ok=True)
 os.makedirs(TENSOR_DIR, exist_ok=True)
 
-# Generate one input tensor per unique (label, shape) in SHAPE_INPUT_PAIRS
-input_tensors = {}  # label -> path
-np.random.seed(0)
 rng = np.random.default_rng(0)
-seen_labels = {}  # label -> maximum stencil_shape for that label
 
-# First pass: identify the maximum stencil shape for each label
-for stencil_shape, input_shape, label in SHAPE_INPUT_PAIRS:
-    if label not in seen_labels:
-        seen_labels[label] = stencil_shape
+
+def _resolve_tensor_arg(arg):
+    if arg is None or arg.upper() == "NONE":
+        return None
+    if not os.path.isfile(arg):
+        raise FileNotFoundError(f"Input tensor not found: {arg}")
+    return arg
+
+
+input_tensors = {
+    1: _resolve_tensor_arg(_args.tensor_1d),
+    2: _resolve_tensor_arg(_args.tensor_2d),
+    3: _resolve_tensor_arg(_args.tensor_3d),
+}
+for dim, path in input_tensors.items():
+    if path is None:
+        if not _args.no_experiments:
+            print(f"Skipping {dim}D tests (no input tensor supplied).")
     else:
-        # Use the stencil shape with maximum extent (sum of sizes)
-        if sum(stencil_shape) > sum(seen_labels[label]):
-            seen_labels[label] = stencil_shape
-
-# Second pass: generate tensors
-for label, max_stencil_shape in seen_labels.items():
-    # Find the input_shape for this label
-    input_shape = None
-    for stencil_shape, ishape, lbl in SHAPE_INPUT_PAIRS:
-        if lbl == label:
-            input_shape = ishape
-            break
-
-    if input_shape is None:
-        continue
-
-    path = os.path.join(DATA_DIR, f"{label}.dat")
-    data = rng.standard_normal(input_shape)
-
-    # Apply Dirichlet zero boundary condition if enabled
-    if DIRICHLET_ZERO:
-        data = apply_dirichlet_boundary(data, max_stencil_shape)
-        print(
-            f"Generated {label} tensor {input_shape} with Dirichlet boundary (stencil {max_stencil_shape}) -> {path}"
-        )
-    else:
-        print(f"Generated {label} tensor {input_shape} -> {path}")
-
-    write_tensor_file(path, data)
-    input_tensors[label] = path
+        print(f"Using {dim}D input tensor: {path}")
 
 # --- Precision test loop ---
-with (
-    open(CSV_OUTPUT, "w", newline="") as csvfile,
-    open(BREACHES_OUTPUT, "w", newline="") as breachfile,
-):
-    writer = csv.writer(csvfile)
-    # One row per (stencil, input_shape, T, n_slices) so the plotter can draw
-    # RMSE as a function of slice count.
-    writer.writerow(
-        [
-            "stencil",
-            "input_shape",
-            "T",
-            "extra_in_msbs",
-            "extra_in_lsbs",
-            "msb_shift_stencil",
-            "status",
-            "result",
-            "n_slices",
-            "rmse",
-        ]
-    )
+_csv_ctx = nullcontext(None) if _args.no_experiments else open(CSV_OUTPUT, "w", newline="")
+_breach_ctx = nullcontext(None) if _args.no_experiments else open(BREACHES_OUTPUT, "w", newline="")
+with _csv_ctx as csvfile, _breach_ctx as breachfile:
+    if not _args.no_experiments:
+        writer = csv.writer(csvfile)
+        # One row per (stencil, input_shape, T, n_slices) so the plotter can draw
+        # RMSE as a function of slice count.
+        writer.writerow(
+            [
+                "stencil",
+                "input_shape",
+                "T",
+                "extra_in_msbs",
+                "extra_in_lsbs",
+                "msb_shift_stencil",
+                "status",
+                "result",
+                "n_slices",
+                "rmse",
+            ]
+        )
 
-    for stencil_shape, input_shape, input_label in SHAPE_INPUT_PAIRS:
+    for stencil_shape, input_label in SHAPE_INPUT_PAIRS:
+        dim = len(stencil_shape)
+        input_file = input_tensors.get(dim)
+        if input_file is None and not _args.no_experiments:
+            continue
         for neg_coeffs, req_slices, sparse, l1_norm, stencil_num in product(
             NEGATIVE_COEFFS, REQUESTED_SLICES, SPARSE, L1_NORM, STENCIL_NAME
         ):
-            name, coeffs = generate_stencil_spec(
+            name = generate_stencil_spec(
                 shape=stencil_shape,
                 negative_coeffs=neg_coeffs,
                 requested_slices=req_slices,
@@ -622,7 +595,9 @@ with (
                 l1_norm=l1_norm,
                 rng=rng,
             )
-            input_file = input_tensors[input_label]
+            if _args.no_experiments:
+                print(f"Generated stencil: {name}")
+                continue
             for T in TIMESTEPS:
                 print(f"Testing {name} | {input_label} | T={T} ...")
                 success, errs, oz_output = run_pipeline(

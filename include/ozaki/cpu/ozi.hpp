@@ -201,46 +201,31 @@ slice_stencil(StencilType s, HighPrec a, int32_t extra_msb_shift = 0, int32_t n_
 
   // Number of usable bits per int8_t slice (excludes the disallowed INT8_MIN value).
   constexpr int32_t target_bits = static_cast<int32_t>(CHAR_BIT * sizeof(Target)) - 1;
-  constexpr __int128 LO = static_cast<__int128>(std::numeric_limits<Target>::min()) + 1;
-  constexpr __int128 HI = static_cast<__int128>(std::numeric_limits<Target>::max());
+  constexpr int64_t LO = static_cast<int64_t>(std::numeric_limits<Target>::min()) + 1;
+  constexpr int64_t HI = static_cast<int64_t>(std::numeric_limits<Target>::max());
 
-  // countl_zero for unsigned __int128 (std::countl_zero only handles up to uint64_t).
-  auto countl_zero_u128 = [](unsigned __int128 x) -> int32_t {
-    uint64_t hi = static_cast<uint64_t>(x >> 64);
-    if (hi != 0)
-      return std::countl_zero(hi);
-    return 64 + std::countl_zero(static_cast<uint64_t>(x));
-  };
-
-  std::array<__int128, StencilType::size> high_prec_int_coeffs{};
-  // range_msb = min(countl_zero(|coeff_i|)) -- equals 128 when all coefficients are zero.
-  int32_t range_msb = 128;
+  // Ozaki splitting of stencil coefficients: decompose each c/a into int8
+  // digits using __float128 residual tracking (same algorithm as the GPU
+  // slice kernel).  Unlike the previous __int128 rounding approach, this
+  // captures ALL significant bits of every coefficient — small coefficients
+  // that previously lost fractional bits now contribute their full precision
+  // through the lower slices.
+  std::array<HighPrec, StencilType::size> fp_residual{};
+  int32_t p_max = -1;
 
   for (size_t i = 0; i < StencilType::size; ++i) {
-    HighPrec raw = static_cast<HighPrec>(s.coeffs[i]) / a;
-    high_prec_int_coeffs[i] = static_cast<__int128>(raw + (raw >= HighPrec(0) ? HighPrec(0.5) : HighPrec(-0.5)));
-    __int128 v = high_prec_int_coeffs[i];
-    // Safe conversion to unsigned __int128: avoids UB from negating the minimum value.
-    unsigned __int128 abs_val = (v < 0) ? static_cast<unsigned __int128>(-v) : static_cast<unsigned __int128>(v);
-    if (int32_t msb = countl_zero_u128(abs_val); msb < range_msb)
-      range_msb = msb;
+    fp_residual[i] = static_cast<HighPrec>(s.coeffs[i]) / a;
+    HighPrec abs_val = (fp_residual[i] >= HighPrec(0)) ? fp_residual[i] : -fp_residual[i];
+    if (abs_val > HighPrec(0)) {
+      int32_t e = OzakiTraits<HighPrec>::ilogb(abs_val);
+      if (e > p_max)
+        p_max = e;
+    }
   }
 
-  // Position (0-indexed from LSB) of the most significant bit across all
-  // absolute coefficients.  -1 when every coefficient rounds to zero.
-  int32_t p_max = 127 - range_msb;
-
   StencilSlices<IntStencilType, N> result;
-  std::array<__int128, StencilType::size> residual = high_prec_int_coeffs;
 
   for (int32_t k = 0; k < N; ++k) {
-    // Arithmetic shift that aligns the k-th window of target_bits bits
-    // to positions [target_bits-1 : 0].  Consecutive slices are target_bits
-    // apart, matching the carry step (>> target_bits) in the GPU kernel.
-    // For k=0 the shift is always non-negative when M>=2 (p_max >= 7);
-    // max(0,...) protects the M=1 case where p_max < target_bits.
-    // For k>0 the shift can be negative, meaning the residual has fewer
-    // bits than target_bits and must be left-shifted into the window.
     int32_t shift = p_max - (target_bits - 1) + extra_msb_shift - target_bits * k;
     if (k == 0)
       shift = std::max(0, shift);
@@ -248,17 +233,13 @@ slice_stencil(StencilType s, HighPrec a, int32_t extra_msb_shift = 0, int32_t n_
     result.slices[k].offsets = s.offsets;
 
     for (size_t i = 0; i < StencilType::size; ++i) {
-      __int128 val = (shift >= 0) ? (residual[i] >> shift) : (residual[i] << (-shift));
-      // Clamp to the symmetric int8 range [-127, 127] to keep multiplication
-      // well-behaved and to avoid the prohibited INT8_MIN value.
-      if (val > HI) val = HI;
-      if (val < LO) val = LO;
-      result.slices[k].coeffs[i] = static_cast<Target>(val);
-      // Subtract this slice's exact contribution so the residual carries only
-      // the bits not yet captured.
-      residual[i] -= (shift >= 0)
-          ? (static_cast<__int128>(result.slices[k].coeffs[i]) << shift)
-          : (static_cast<__int128>(result.slices[k].coeffs[i]) >> (-shift));
+      HighPrec scaled = OzakiTraits<HighPrec>::scalbn(fp_residual[i], -shift);
+      HighPrec rounded = OzakiTraits<HighPrec>::round(scaled);
+      int64_t digit = static_cast<int64_t>(rounded);
+      if (digit > HI) digit = HI;
+      if (digit < LO) digit = LO;
+      result.slices[k].coeffs[i] = static_cast<Target>(digit);
+      fp_residual[i] -= OzakiTraits<HighPrec>::scalbn(static_cast<HighPrec>(result.slices[k].coeffs[i]), shift);
     }
   }
 

@@ -284,7 +284,7 @@ __global__ void stencil_v1(typename O::target_type *__restrict__ out, const type
         // S_si @ D_{logic_s} contributes to result position (logic_s + si).
 #pragma unroll
         for (int32_t si = M - 1; si >= 0; --si) {
-          if (logic_s + si - 1 >= total_slices)
+          if (logic_s + si >= total_slices)
             continue;
 
           Acc partial = static_cast<Acc>(0);
