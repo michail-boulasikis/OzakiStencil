@@ -196,6 +196,14 @@ template <std::floating_point T> struct OzakiTraits<T> {
     using std::isfinite;
     return isfinite(a);
   }
+  static HDF int32_t ilogb(T a) {
+    using std::ilogb;
+    return static_cast<int32_t>(ilogb(a));
+  }
+  static HDF T round(T a) {
+    using std::round;
+    return round(a);
+  }
 };
 
 template <std::integral T> struct OzakiTraits<T> {
@@ -233,6 +241,22 @@ template <> struct OzakiTraits<__float128> {
     return true; // unused in CUDA
 #else
     return (!isnanq(a) && !isinfq(a));
+#endif
+  }
+  static HDF int32_t ilogb(__float128 a) {
+#ifdef __CUDA_ARCH__
+    int exp;
+    __nv_fp128_frexp(a, &exp);
+    return exp - 1;
+#else
+    return static_cast<int32_t>(ilogbq(a));
+#endif
+  }
+  static HDF __float128 round(__float128 a) {
+#ifdef __CUDA_ARCH__
+    return __nv_fp128_rint(a);
+#else
+    return roundq(a);
 #endif
   }
   static HDF __float128 scalbn(__float128 a, int n) {

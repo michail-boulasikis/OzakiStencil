@@ -86,7 +86,7 @@ int main(int argc, char *argv[]) {
 
   try {
     NVTX_PUSH("Initialization");
-    Tensor<Real> input = read_tensor<Real>(input_file);
+    Tensor<__float128> input = read_tensor<__float128>(input_file);
     NVTX_POP();
 
     // Collect stencil specifications
@@ -114,7 +114,8 @@ int main(int argc, char *argv[]) {
             make_ozaki_runner(spec, input, static_cast<int32_t>(timestep), extra_msb, extra_lsb, output_dir, algo);
 
         for (int32_t s = 2; s <= slice_limit && s < runner->get_max_slices(); ++s) {
-          std::string output_path = output_dir + output_prefix + "_" + spec.name + "_" + std::to_string(timestep) + "_" + std::to_string(s) + ".dat";
+          std::string output_path = output_dir + output_prefix + "_" + spec.name + "_" + std::to_string(timestep) +
+                                    "_" + std::to_string(s) + ".dat";
           runner->run_experiment(s, output_path, save_tensors);
           if (save_tensors)
             std::cerr << "  Completed: " << s << " Slices (saved at " << output_path << ")\n";

@@ -204,36 +204,28 @@ slice_stencil(StencilType s, HighPrec a, int32_t extra_msb_shift = 0, int32_t n_
   constexpr int64_t LO = static_cast<int64_t>(std::numeric_limits<Target>::min()) + 1;
   constexpr int64_t HI = static_cast<int64_t>(std::numeric_limits<Target>::max());
 
-  std::array<int64_t, StencilType::size> high_prec_int_coeffs{};
-  // range_msb = min(countl_zero(|coeff_i|)) -- equals 64 when all coefficients are zero.
-  int32_t range_msb = 64;
+  // Ozaki splitting of stencil coefficients: decompose each c/a into int8
+  // digits using __float128 residual tracking (same algorithm as the GPU
+  // slice kernel).  Unlike the previous __int128 rounding approach, this
+  // captures ALL significant bits of every coefficient — small coefficients
+  // that previously lost fractional bits now contribute their full precision
+  // through the lower slices.
+  std::array<HighPrec, StencilType::size> fp_residual{};
+  int32_t p_max = -1;
 
   for (size_t i = 0; i < StencilType::size; ++i) {
-    HighPrec raw = static_cast<HighPrec>(s.coeffs[i]) / a;
-    high_prec_int_coeffs[i] = static_cast<int64_t>(raw + (raw >= HighPrec(0) ? HighPrec(0.5) : HighPrec(-0.5)));
-    int64_t v = high_prec_int_coeffs[i];
-    // Safe conversion to uint64_t: avoids UB from std::abs(INT64_MIN) and the
-    // fact that std::countl_zero only accepts unsigned types in C++20.
-    uint64_t abs_val = (v < 0) ? static_cast<uint64_t>(-v) : static_cast<uint64_t>(v);
-    if (int32_t msb = std::countl_zero(abs_val); msb < range_msb)
-      range_msb = msb;
+    fp_residual[i] = static_cast<HighPrec>(s.coeffs[i]) / a;
+    HighPrec abs_val = (fp_residual[i] >= HighPrec(0)) ? fp_residual[i] : -fp_residual[i];
+    if (abs_val > HighPrec(0)) {
+      int32_t e = OzakiTraits<HighPrec>::ilogb(abs_val);
+      if (e > p_max)
+        p_max = e;
+    }
   }
 
-  // Position (0-indexed from LSB) of the most significant bit across all
-  // absolute coefficients.  -1 when every coefficient rounds to zero.
-  int32_t p_max = 63 - range_msb;
-
   StencilSlices<IntStencilType, N> result;
-  std::array<int64_t, StencilType::size> residual = high_prec_int_coeffs;
 
   for (int32_t k = 0; k < N; ++k) {
-    // Arithmetic shift that aligns the k-th window of target_bits bits
-    // to positions [target_bits-1 : 0].  Consecutive slices are target_bits
-    // apart, matching the carry step (>> target_bits) in the GPU kernel.
-    // For k=0 the shift is always non-negative when M>=2 (p_max >= 7);
-    // max(0,...) protects the M=1 case where p_max < target_bits.
-    // For k>0 the shift can be negative, meaning the residual has fewer
-    // bits than target_bits and must be left-shifted into the window.
     int32_t shift = p_max - (target_bits - 1) + extra_msb_shift - target_bits * k;
     if (k == 0)
       shift = std::max(0, shift);
@@ -241,16 +233,13 @@ slice_stencil(StencilType s, HighPrec a, int32_t extra_msb_shift = 0, int32_t n_
     result.slices[k].offsets = s.offsets;
 
     for (size_t i = 0; i < StencilType::size; ++i) {
-      int64_t val = (shift >= 0) ? (residual[i] >> shift) : (residual[i] << (-shift));
-      // Clamp to the symmetric int8 range [-127, 127] to keep multiplication
-      // well-behaved and to avoid the prohibited INT8_MIN value.
-      val = std::max(LO, std::min(HI, val));
-      result.slices[k].coeffs[i] = static_cast<Target>(val);
-      // Subtract this slice's exact contribution so the residual carries only
-      // the bits not yet captured.
-      residual[i] -= (shift >= 0)
-          ? (static_cast<int64_t>(result.slices[k].coeffs[i]) << shift)
-          : (static_cast<int64_t>(result.slices[k].coeffs[i]) >> (-shift));
+      HighPrec scaled = OzakiTraits<HighPrec>::scalbn(fp_residual[i], -shift);
+      HighPrec rounded = OzakiTraits<HighPrec>::round(scaled);
+      int64_t digit = static_cast<int64_t>(rounded);
+      if (digit > HI) digit = HI;
+      if (digit < LO) digit = LO;
+      result.slices[k].coeffs[i] = static_cast<Target>(digit);
+      fp_residual[i] -= OzakiTraits<HighPrec>::scalbn(static_cast<HighPrec>(result.slices[k].coeffs[i]), shift);
     }
   }
 

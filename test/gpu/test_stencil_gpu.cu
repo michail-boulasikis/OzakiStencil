@@ -21,7 +21,7 @@
 #include <ozaki/gpu/gpu_checks.cuh>
 #include <ozaki/gpu/ozi.cuh>
 #include <ozaki/gpu/ozi_kernels.cuh>
-#include <ozaki/gpu/ozi_stencil_conv.cuh>
+#include <ozaki/gpu/ozi_stencil_conv_v2.cuh>
 #include <ozaki/gpu/ozi_stencil_plain.cuh>
 #include <ozaki/gpu/stencil_gpu.cuh>
 #include <ozaki/utils/stencil_registry.hpp>
@@ -330,8 +330,18 @@ protected:
 
     ozigpu::upload_slice_phys_lut(num_slices_total);
 
+    ozigpu::convstencil::TmaDescriptorsV2 tma;
+    size_t total_height = static_cast<size_t>(num_slices_total) * height;
+    bool tma_ok = ozigpu::convstencil::create_tma_descriptors_v2(tma, d_slices_1, d_slices_2, total_height, ldm);
+    if (!tma_ok)
+      throw std::runtime_error("cvstencil requires ldm >= 128 and ldm % 16 == 0; got ldm=" + std::to_string(ldm));
+
+    cudaFuncSetAttribute(ozigpu::cvstencil_v2<OzPair, M>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         ozigpu::convstencil::DYN_SMEM_BYTES);
+
     for (int32_t t = 0; t < timesteps; ++t) {
-      ozigpu::cvstencil<OzPair, M><<<grid, block>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary);
+      ozigpu::cvstencil_v2<OzPair, M><<<grid, block, ozigpu::convstencil::DYN_SMEM_BYTES>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.h_main[0]);
 
       if (t < timesteps - 1) {
         int32_t min_shifts_now;
@@ -344,9 +354,11 @@ protected:
         ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
       }
       std::swap(d_slices_1, d_slices_2);
+      tma.swap();
     }
     EXPECT_EQ(cudaSuccess, cudaDeviceSynchronize());
 
+    tma.free();
     cudaFree(d_weight);
     return mend_scale_download(timesteps, scaling_factor);
   }
@@ -720,7 +732,7 @@ TEST_F(StencilGPUTest, OzakiV1_CatastrophicCancellation2D) {
 // ============================================================
 
 TEST_F(StencilGPUTest, CvStencil_SingleStepBox7x7) {
-  constexpr size_t H = 64, W = 64;
+  constexpr size_t H = 128, W = 128;
   auto input = generate_random(H * W);
 
   // Uniform 7x7 box: all coefficients = 1/49
@@ -739,7 +751,7 @@ TEST_F(StencilGPUTest, CvStencil_SingleStepBox7x7) {
 }
 
 TEST_F(StencilGPUTest, CvStencil_MatchesStencilV1) {
-  constexpr size_t H = 64, W = 64;
+  constexpr size_t H = 128, W = 128;
   auto input = generate_random(H * W);
 
   ozi::Stencil<Real, 7, 7> box;
@@ -763,7 +775,7 @@ TEST_F(StencilGPUTest, CvStencil_MatchesStencilV1) {
 }
 
 TEST_F(StencilGPUTest, CvStencil_MultiStep10) {
-  constexpr size_t H = 64, W = 64;
+  constexpr size_t H = 128, W = 128;
   constexpr int32_t T = 10;
   auto input = generate_random(H * W);
 
@@ -781,8 +793,8 @@ TEST_F(StencilGPUTest, CvStencil_MultiStep10) {
 }
 
 TEST_F(StencilGPUTest, CvStencil_NonAlignedGrid) {
-  // Non-aligned to tile (32x256) but still multiple of 4
-  constexpr size_t H = 68, W = 36;
+  // Non-aligned to tile (32x128) but still meets TMA requirements (ldm % 16 == 0, ldm >= 128)
+  constexpr size_t H = 68, W = 144;
   static_assert((H * W) % 4 == 0);
   auto input = generate_random(H * W);
 
@@ -800,9 +812,9 @@ TEST_F(StencilGPUTest, CvStencil_NonAlignedGrid) {
 }
 
 TEST_F(StencilGPUTest, CvStencil_MinimalGrid) {
-  // Tiny grid: 8x8 is almost entirely boundary for a 7x7 stencil
-  // Interior: only (8-6)x(8-6) = 2x2 = 4 cells
-  constexpr size_t H = 8, W = 8;
+  // Minimal grid that meets TMA ldm >= 128 requirement.
+  // Single output tile (32x128), exercises boundary handling on all edges.
+  constexpr size_t H = 32, W = 128;
   static_assert((H * W) % 4 == 0);
   auto input = generate_random(H * W);
 
@@ -873,7 +885,7 @@ TEST_F(StencilGPUTest, Boundary_StencilV1_3D) {
 }
 
 TEST_F(StencilGPUTest, Boundary_CvStencil_2D) {
-  constexpr size_t H = 16, W = 16;
+  constexpr size_t H = 32, W = 128;
   static_assert((H * W) % 4 == 0);
   auto input = generate_random(H * W);
 
@@ -982,7 +994,7 @@ TEST_F(StencilGPUTest, OzakiV1_M2_MultiStep5_1D) {
 }
 
 TEST_F(StencilGPUTest, CvStencil_M2_SingleStep_7x7) {
-  constexpr size_t H = 64, W = 64;
+  constexpr size_t H = 128, W = 128;
   auto input = generate_random(H * W);
 
   // 7x7 M=2 stencil: center=-511, 4 cardinal neighbors=200, rest=0
@@ -1007,7 +1019,7 @@ TEST_F(StencilGPUTest, CvStencil_M2_SingleStep_7x7) {
 }
 
 TEST_F(StencilGPUTest, CvStencil_M2_MatchesV1_7x7) {
-  constexpr size_t H = 64, W = 64;
+  constexpr size_t H = 128, W = 128;
   auto input = generate_random(H * W);
 
   // Same 7x7 M=2 stencil as above
@@ -1140,7 +1152,7 @@ TEST_F(StencilGPUTest, OzakiV1_ReactiveOverflow_1D) {
 }
 
 TEST_F(StencilGPUTest, CvStencil_ShiftCount_Heat7x7) {
-  constexpr size_t H = 64, W = 64;
+  constexpr size_t H = 128, W = 128;
   constexpr int32_t T = 5;
   auto input = generate_random(H * W);
 
