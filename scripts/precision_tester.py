@@ -40,8 +40,8 @@ ERROR_THRESHOLD = 1e-8
 BUILD_BIN = "./build/bin"
 TENSOR_DIR = "./data/tensors"
 STENCIL_DIR = "./data/stencils"
-CSV_OUTPUT = "./data/precision_results.csv"
-BREACHES_OUTPUT = "./data/breaches.txt"
+CSV_OUTPUT = "./data/results/precision_results.csv"
+BREACHES_OUTPUT = "./data/results/breaches.txt"
 
 
 def _pick_target_l1(l1_norm, rng):

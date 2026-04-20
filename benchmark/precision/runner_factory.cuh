@@ -65,6 +65,9 @@ dispatch_m(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<__f
   case 10:
     return make_runner_impl<10>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
                                 extra_msb_shift);
+  case 11:
+    return make_runner_impl<11>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
+                                extra_msb_shift);
   default:
     throw std::invalid_argument("  Stencil requires M=" + std::to_string(m) + " slices, but M=" + std::to_string(m) +
                                 " is not a supported instantiation.");
@@ -126,6 +129,9 @@ dispatch_m_convstencil(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, cons
                                            a_coeff, extra_msb_shift);
   case 10:
     return make_convstencil_runner_impl<10>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
+                                            a_coeff, extra_msb_shift);
+  case 11:
+    return make_convstencil_runner_impl<11>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
                                             a_coeff, extra_msb_shift);
   default:
     throw std::invalid_argument("  Stencil requires M=" + std::to_string(m) + " slices, but M=" + std::to_string(m) +

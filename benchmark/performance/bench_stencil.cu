@@ -647,7 +647,8 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
 
       ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
       CUDA_CHECK(cudaDeviceSynchronize());
-      CUDA_CHECK(cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+      CUDA_CHECK(
+          cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
 
       ozigpu::upload_slice_phys_lut(actual_slices);
 
@@ -731,7 +732,8 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
 
       ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
       CUDA_CHECK(cudaDeviceSynchronize());
-      CUDA_CHECK(cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+      CUDA_CHECK(
+          cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
 
       ozigpu::upload_slice_phys_lut(actual_slices);
 
@@ -741,8 +743,8 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
       if (cfg.warmup > 0) {
         NVTX_PUSH("Warmup");
         for (int32_t t = 0; t < cfg.warmup; ++t) {
-          ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(
-              d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.h_main[0], tma.h_extra[0]);
+          ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc,
+                                                          boundary, tma.h_main[0], tma.h_extra[0]);
           if (t < cfg.warmup - 1)
             ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, 0);
           std::swap(d_slices_1, d_slices_2);
@@ -772,8 +774,8 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
       NVTX_PUSH("Integration");
       ev.record_start();
       for (int32_t t = 0; t < cfg.timesteps; ++t) {
-        ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(
-            d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.h_main[0], tma.h_extra[0]);
+        ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary,
+                                                        tma.h_main[0], tma.h_extra[0]);
         if (t < cfg.timesteps - 1) {
           int32_t min_shifts_now;
           if (t == cfg.timesteps - 2)
@@ -855,6 +857,8 @@ PhaseTimings dispatch_bench_direct(int m, const ozi::Stencil<CoeffStorageType, D
     return do_bench.template operator()<9>();
   case 10:
     return do_bench.template operator()<10>();
+  case 11:
+    return do_bench.template operator()<11>();
   default:
     throw std::invalid_argument("M=" + std::to_string(m) + " is not a supported instantiation");
   }
@@ -907,6 +911,8 @@ PhaseTimings dispatch_bench_conv(int m, const ozi::Stencil<CoeffStorageType, Dim
       case 9:
         return do_bench.template operator()<9>();
       case 10:
+        return do_bench.template operator()<10>();
+      case 11:
         return do_bench.template operator()<10>();
       default:
         throw std::invalid_argument("M=" + std::to_string(m) + " is not a supported instantiation");
