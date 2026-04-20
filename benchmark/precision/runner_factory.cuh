@@ -21,7 +21,7 @@ enum class Algorithm { Direct, ConvStencil };
 // Helper: given a concrete stencil type and M, constructs OzakiRunnerDirect<M, Dims...>.
 template <int32_t M, typename CoeffT, size_t... Dims>
 std::unique_ptr<OzakiRunnerBase>
-make_runner_impl(const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Real> &input, int32_t iterations,
+make_runner_impl(const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<__float128> &input, int32_t iterations,
                  int32_t extra_msb, int32_t extra_lsb, const std::string &prefix, CoeffStorageType scaling_factor,
                  CoeffStorageType a_coeff, int32_t extra_msb_shift) {
   return std::make_unique<OzakiRunnerDirect<M, Dims...>>(stencil, input, iterations, extra_msb, extra_lsb, prefix,
@@ -31,7 +31,7 @@ make_runner_impl(const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Real
 // Dispatches on M (1..12) for a given concrete stencil type.
 template <typename CoeffT, size_t... Dims>
 std::unique_ptr<OzakiRunnerBase>
-dispatch_m(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Real> &input, int32_t iterations,
+dispatch_m(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<__float128> &input, int32_t iterations,
            int32_t extra_msb, int32_t extra_lsb, const std::string &prefix, CoeffStorageType scaling_factor,
            CoeffStorageType a_coeff, int32_t extra_msb_shift) {
   switch (m) {
@@ -47,6 +47,15 @@ dispatch_m(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Rea
   case 4:
     return make_runner_impl<4>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
                                extra_msb_shift);
+  case 5:
+    return make_runner_impl<5>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
+                               extra_msb_shift);
+  case 6:
+    return make_runner_impl<6>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
+                               extra_msb_shift);
+  case 7:
+    return make_runner_impl<7>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
+                               extra_msb_shift);
   case 8:
     return make_runner_impl<8>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
                                extra_msb_shift);
@@ -57,8 +66,7 @@ dispatch_m(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Rea
     return make_runner_impl<10>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor, a_coeff,
                                 extra_msb_shift);
   default:
-    throw std::invalid_argument("  Stencil requires M=" + std::to_string(m) +
-                                " slices, but M=" + std::to_string(m) +
+    throw std::invalid_argument("  Stencil requires M=" + std::to_string(m) + " slices, but M=" + std::to_string(m) +
                                 " is not a supported instantiation.");
   }
 }
@@ -69,7 +77,7 @@ dispatch_m(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Rea
 // Uses if constexpr to avoid instantiation errors for other shapes.
 template <int32_t M, typename CoeffT, size_t... Dims>
 std::unique_ptr<OzakiRunnerBase>
-make_convstencil_runner_impl(const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Real> &input,
+make_convstencil_runner_impl(const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<__float128> &input,
                              int32_t iterations, int32_t extra_msb, int32_t extra_lsb, const std::string &prefix,
                              CoeffStorageType scaling_factor, CoeffStorageType a_coeff, int32_t extra_msb_shift) {
   if constexpr (sizeof...(Dims) == 2) {
@@ -85,7 +93,7 @@ make_convstencil_runner_impl(const ozi::Stencil<CoeffT, Dims...> &stencil, const
 // Dispatches on M (1..12) for ConvStencil.
 template <typename CoeffT, size_t... Dims>
 std::unique_ptr<OzakiRunnerBase>
-dispatch_m_convstencil(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Real> &input,
+dispatch_m_convstencil(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<__float128> &input,
                        int32_t iterations, int32_t extra_msb, int32_t extra_lsb, const std::string &prefix,
                        CoeffStorageType scaling_factor, CoeffStorageType a_coeff, int32_t extra_msb_shift) {
   switch (m) {
@@ -101,6 +109,15 @@ dispatch_m_convstencil(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, cons
   case 4:
     return make_convstencil_runner_impl<4>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
                                            a_coeff, extra_msb_shift);
+  case 5:
+    return make_convstencil_runner_impl<5>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
+                                           a_coeff, extra_msb_shift);
+  case 6:
+    return make_convstencil_runner_impl<6>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
+                                           a_coeff, extra_msb_shift);
+  case 7:
+    return make_convstencil_runner_impl<7>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
+                                           a_coeff, extra_msb_shift);
   case 8:
     return make_convstencil_runner_impl<8>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
                                            a_coeff, extra_msb_shift);
@@ -111,8 +128,7 @@ dispatch_m_convstencil(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, cons
     return make_convstencil_runner_impl<10>(stencil, input, iterations, extra_msb, extra_lsb, prefix, scaling_factor,
                                             a_coeff, extra_msb_shift);
   default:
-    throw std::invalid_argument("  Stencil requires M=" + std::to_string(m) +
-                                " slices, but M=" + std::to_string(m) +
+    throw std::invalid_argument("  Stencil requires M=" + std::to_string(m) + " slices, but M=" + std::to_string(m) +
                                 " is not a supported instantiation.");
   }
 }
@@ -121,7 +137,7 @@ dispatch_m_convstencil(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, cons
 
 // Factory: creates the correctly-typed runner from a runtime StencilSpec.
 // Performs shape dispatch (std::visit) and M dispatch (switch) once at construction.
-inline std::unique_ptr<OzakiRunnerBase> make_ozaki_runner(const StencilSpec &spec, const Tensor<Real> &input,
+inline std::unique_ptr<OzakiRunnerBase> make_ozaki_runner(const StencilSpec &spec, const Tensor<__float128> &input,
                                                           int32_t iterations, int32_t extra_msb, int32_t extra_lsb,
                                                           const std::string &prefix,
                                                           Algorithm algo = Algorithm::Direct) {
@@ -142,7 +158,8 @@ inline std::unique_ptr<OzakiRunnerBase> make_ozaki_runner(const StencilSpec &spe
   {
     std::ostringstream oss;
     oss << "  Using stencil " << spec.name << ": #Slices = " << params.m
-        << ", a = " << static_cast<long double>(params.a_coeff) << ", extra_msb_shift = " << params.extra_msb_shift << "\n";
+        << ", a = " << static_cast<long double>(params.a_coeff) << ", extra_msb_shift = " << params.extra_msb_shift
+        << "\n";
     std::cout << oss.str();
   }
 

@@ -22,10 +22,11 @@
 #include <quadmath.h>
 #endif
 
-using Real = double;
 #if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
+using Real = __float128;
 using AccumulatorType = __float128;
 #else
+using Real = double;
 using AccumulatorType = double;
 #endif
 
@@ -53,9 +54,13 @@ protected:
   ozigpu::L2CacheInvalidator cache_invalidator;
 
 public:
-  OzakiRunnerBase(const Tensor<Real> &input, int32_t iterations, int32_t extra_msb, int32_t extra_lsb,
+  OzakiRunnerBase(const Tensor<__float128> &input, int32_t iterations, int32_t extra_msb, int32_t extra_lsb,
                   const std::string &prefix, HighPrecType a)
-      : host_input(input), n_elems(input.size()), n_iterations(iterations), file_prefix(prefix), scaling_factor(a) {
+      : n_elems(input.size()), n_iterations(iterations), file_prefix(prefix), scaling_factor(a) {
+    host_input.shape = input.shape;
+    host_input.data.resize(input.data.size());
+    for (size_t i = 0; i < input.data.size(); ++i)
+      host_input.data[i] = static_cast<Real>(input.data[i]);
     allocate_resources();
     compute_dynamic_range(extra_msb, extra_lsb);
   }
@@ -139,7 +144,7 @@ template <int32_t M, size_t... Dims> class OzakiRunnerDirect : public OzakiRunne
 
 public:
   template <typename CoeffT>
-  OzakiRunnerDirect(const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Real> &input, int32_t iterations,
+  OzakiRunnerDirect(const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<__float128> &input, int32_t iterations,
                     int32_t extra_msb, int32_t extra_lsb, const std::string &prefix, HighPrecType a,
                     HighPrecType a_coeff, int32_t extra_msb_shift = 0)
       : OzakiRunnerBase(input, iterations, extra_msb, extra_lsb, prefix, a) {
@@ -263,7 +268,10 @@ public:
 
     if (save_tensors) {
       NVTX_PUSH("Storing Result");
-      write_tensor<AccumulatorType>(output_path, Tensor<AccumulatorType>{host_input.shape, gpu_result});
+      std::vector<__float128> q_result(n_elems);
+      for (size_t i = 0; i < n_elems; ++i)
+        q_result[i] = static_cast<__float128>(gpu_result[i]);
+      write_tensor<__float128>(output_path, Tensor<__float128>{host_input.shape, q_result});
       NVTX_POP();
     }
 
@@ -282,7 +290,7 @@ template <int32_t M> class OzakiRunnerConvStencil : public OzakiRunnerBase {
 
 public:
   template <typename CoeffT>
-  OzakiRunnerConvStencil(const ozi::Stencil<CoeffT, 7, 7> &stencil, const Tensor<Real> &input, int32_t iterations,
+  OzakiRunnerConvStencil(const ozi::Stencil<CoeffT, 7, 7> &stencil, const Tensor<__float128> &input, int32_t iterations,
                          int32_t extra_msb, int32_t extra_lsb, const std::string &prefix, HighPrecType a,
                          HighPrecType a_coeff, int32_t extra_msb_shift = 0)
       : OzakiRunnerBase(input, iterations, extra_msb, extra_lsb, prefix, a) {
@@ -360,24 +368,63 @@ public:
 
     ozigpu::upload_slice_phys_lut(active_slices);
 
+    size_t total_height = static_cast<size_t>(num_slices_total) * height;
+
     NVTX_PUSH("Integration Loop");
-    for (int32_t t = 0; t < n_iterations; ++t) {
-      ozigpu::cvstencil<ozigpu::OzakiFP_Int8<Real>, M>
-          <<<grid, block>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary_);
+    if constexpr (M <= 3) {
+      cudaFuncSetAttribute(ozigpu::cvstencil_v2<ozigpu::OzakiFP_Int8<Real>, M>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           ozigpu::convstencil::DYN_SMEM_BYTES);
 
-      if (t < n_iterations - 1) {
-        int32_t min_shifts_now;
-        if (t == n_iterations - 2) {
-          min_shifts_now = total_shifts_needed;
-        } else {
-          min_shifts_now = static_cast<int32_t>(
-              std::ceil((t + 1) * log2_sf / 7.0));
+      ozigpu::convstencil::TmaDescriptorsV2 tma;
+      bool tma_ok = ozigpu::convstencil::create_tma_descriptors_v2(tma, d_slices_1, d_slices_2, total_height, ldm);
+      if (!tma_ok)
+        throw std::runtime_error("cvstencil requires ldm >= 128 and ldm % 16 == 0");
+
+      for (int32_t t = 0; t < n_iterations; ++t) {
+        ozigpu::cvstencil_v2<ozigpu::OzakiFP_Int8<Real>, M>
+            <<<grid, block, ozigpu::convstencil::DYN_SMEM_BYTES>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary_, tma.h_main[0]);
+
+        if (t < n_iterations - 1) {
+          int32_t min_shifts_now;
+          if (t == n_iterations - 2) {
+            min_shifts_now = total_shifts_needed;
+          } else {
+            min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
+          }
+          if (min_shifts_now < 0) min_shifts_now = 0;
+          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
         }
-        if (min_shifts_now < 0) min_shifts_now = 0;
-        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
-      }
 
-      std::swap(d_slices_1, d_slices_2);
+        std::swap(d_slices_1, d_slices_2);
+        tma.swap();
+      }
+      tma.free();
+    } else {
+      ozigpu::convstencil::TmaDescriptors tma;
+      bool tma_ok = ozigpu::convstencil::create_tma_descriptors(tma, d_slices_1, d_slices_2, total_height, ldm);
+      if (!tma_ok)
+        throw std::runtime_error("cvstencil requires ldm >= 128 and ldm % 16 == 0");
+
+      for (int32_t t = 0; t < n_iterations; ++t) {
+        ozigpu::cvstencil<ozigpu::OzakiFP_Int8<Real>, M>
+            <<<grid, block>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary_, tma.h_main[0], tma.h_extra[0]);
+
+        if (t < n_iterations - 1) {
+          int32_t min_shifts_now;
+          if (t == n_iterations - 2) {
+            min_shifts_now = total_shifts_needed;
+          } else {
+            min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
+          }
+          if (min_shifts_now < 0) min_shifts_now = 0;
+          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
+        }
+
+        std::swap(d_slices_1, d_slices_2);
+        tma.swap();
+      }
+      tma.free();
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     NVTX_POP();
@@ -412,7 +459,10 @@ public:
 
     if (save_tensors) {
       NVTX_PUSH("Storing Result");
-      write_tensor<AccumulatorType>(output_path, Tensor<AccumulatorType>{host_input.shape, gpu_result});
+      std::vector<__float128> q_result(n_elems);
+      for (size_t i = 0; i < n_elems; ++i)
+        q_result[i] = static_cast<__float128>(gpu_result[i]);
+      write_tensor<__float128>(output_path, Tensor<__float128>{host_input.shape, q_result});
       NVTX_POP();
     }
 

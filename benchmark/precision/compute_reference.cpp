@@ -82,7 +82,7 @@ int main(int argc, char *argv[]) {
   }
 
   try {
-    Tensor<Real> input = read_tensor<Real>(input_file);
+    Tensor<__float128> input = read_tensor<__float128>(input_file);
 
     // Collect stencil specifications
     std::vector<StencilSpec> specs;
@@ -111,7 +111,10 @@ int main(int argc, char *argv[]) {
 
           std::string path =
               output_dir + output_prefix + "_" + spec.name + "_" + type_label + "_" + std::to_string(timestep) + ".dat";
-          write_tensor(path, Tensor<ComputeType>{input.shape, result});
+          std::vector<__float128> q_result(result.size());
+          for (size_t i = 0; i < result.size(); ++i)
+            q_result[i] = static_cast<__float128>(result[i]);
+          write_tensor(path, Tensor<__float128>{input.shape, q_result});
           std::cerr << "  Wrote: " << path << "\n";
         };
 

@@ -1,0 +1,8 @@
+name heat
+shape 3 3
+offsets 1 1
+precision fp128
+coeffs
+0.0 0.1875 0.0
+0.1875 0.25 0.1875
+0.0 0.1875 0.0

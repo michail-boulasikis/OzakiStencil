@@ -1,17 +1,15 @@
 build*/
 target*/
-Testing/
 benchmark/ConvStencil/
-benchmark/DRStencil/
-benchmark/LoRAStencil/
-benchmark/TCStencil/
-data/
+benchmark/EBISU/
+temp/
 
 .cache/
 
-presentation/node_modules/
+data/*.csv
+data/results/**
 
-CLAUDE.md
+presentation/node_modules/
 
 *.csv
 *.dat

@@ -11,12 +11,16 @@
 #include <string>
 #include <vector>
 
+#if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
+using Real = __float128;
+#else
 using Real = double;
+#endif
 
 struct ReferenceSolver {
   // Computes the reference stencil integration at the given precision.
   template <typename ComputeType, typename T, size_t... Dims>
-  static std::vector<ComputeType> compute(const Tensor<Real> &input, const ozi::Stencil<T, Dims...> &raw_stencil,
+  static std::vector<ComputeType> compute(const Tensor<__float128> &input, const ozi::Stencil<T, Dims...> &raw_stencil,
                                           int32_t iterations) {
     // Convert input data to ComputeType
     std::vector<ComputeType> u_curr(input.data.size());
@@ -35,8 +39,8 @@ struct ReferenceSolver {
     for (size_t d = 0; d < ndims && d < input.shape.size(); ++d)
       shape[d] = input.shape[d];
 
-    for (int32_t i = 0; i < iterations + 1; ++i) {
-      raw_stencil.template apply_to<ComputeType>(u_curr, u_next, shape);
+    for (int32_t i = 0; i < iterations; ++i) {
+      raw_stencil.template apply_to<ComputeType>(u_next, u_curr, shape);
       std::swap(u_curr, u_next);
     }
 
