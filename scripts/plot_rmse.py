@@ -12,7 +12,6 @@ sns.set_theme(style="ticks", font_scale=1.5)
 sns.set_context("talk")
 plt.rcParams["ps.fonttype"] = 42  # embed TrueType fonts so text is selectable in LaTeX
 
-# ── Configurable: rename stencil keys to display titles ──────────────────────
 STENCIL_TITLES = {
     "heat": "Heat Equation",
     "ad": "Advection-Diffusion",
@@ -28,10 +27,10 @@ DEFAULT_REFS_CSV = "data/precision_refs.csv"
 
 # Colors from the plot_perf_bar.py palette, one per T value
 T_COLORS = {
-    1000: "#66c5cc",  # blue   (≈ "Ozaki + DSO1")
-    100: "#f6cf71",  # green  (≈ "Ozaki + DSO2")
-    10: "#f89c74",  # orange (≈ "Direct FP32/64")
-    1: "#dcb0f2",  # purple (≈ "Ozaki")
+    1000: "#66c5cc",
+    100: "#f6cf71",
+    10: "#f89c74",
+    1: "#dcb0f2",
 }
 
 # Markers for colorblind accessibility

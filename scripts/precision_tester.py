@@ -63,7 +63,6 @@ def _format_decimal(d):
     return s if s else "0"
 
 
-
 def generate_stencil_spec(
     shape,
     negative_coeffs=True,
@@ -306,10 +305,10 @@ def plot_results(mode):
     """Read precision_results.csv and produce a grid of RMSE-vs-slice-count plots.
     Columns : one per unique stencil shape, in SHAPE_INPUT_PAIRS order.
     Rows    : determined by *mode*:
-              "pos-neg" → 2 rows (negative-coefficient stencils / positive-only)
-              "slices"  → len(REQUESTED_SLICES) rows, one per requested-slice value
-              "sparse"  → 2 rows (sparse / dense)
-              "L1"      → 3 rows (ONE / GT1 / LT1)
+              "pos-neg" 2 rows (negative-coefficient stencils / positive-only)
+              "slices"  len(REQUESTED_SLICES) rows, one per requested-slice value
+              "sparse"  2 rows (sparse / dense)
+              "L1"      3 rows (ONE / GT1 / LT1)
     """
     import pandas as pd
     import matplotlib.pyplot as plt
@@ -321,7 +320,7 @@ def plot_results(mode):
 
     df = pd.read_csv(CSV_OUTPUT)
     if df.empty:
-        print("CSV is empty — nothing to plot.")
+        print("CSV is empty, nothing to plot.")
         return
 
     # Decode stencil metadata from the name column.
@@ -386,7 +385,7 @@ def plot_results(mode):
         "L1": "L1 norm magnitude",
     }[mode]
     fig.suptitle(
-        f"Ozaki stencil precision  —  grouped by {group_desc}",
+        f"Ozaki stencil precision grouped by {group_desc}",
         fontsize=13,
         y=1.01,
     )
@@ -556,8 +555,14 @@ for dim, path in input_tensors.items():
         print(f"Using {dim}D input tensor: {path}")
 
 # --- Precision test loop ---
-_csv_ctx = nullcontext(None) if _args.no_experiments else open(CSV_OUTPUT, "w", newline="")
-_breach_ctx = nullcontext(None) if _args.no_experiments else open(BREACHES_OUTPUT, "w", newline="")
+_csv_ctx = (
+    nullcontext(None) if _args.no_experiments else open(CSV_OUTPUT, "w", newline="")
+)
+_breach_ctx = (
+    nullcontext(None)
+    if _args.no_experiments
+    else open(BREACHES_OUTPUT, "w", newline="")
+)
 with _csv_ctx as csvfile, _breach_ctx as breachfile:
     if not _args.no_experiments:
         writer = csv.writer(csvfile)
