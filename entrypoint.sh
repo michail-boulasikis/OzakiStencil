@@ -17,6 +17,14 @@ export CUDA_COMPUTE_CAPABILITY="${CUDA_COMPUTE_CAPABILITY}"
 
 ./build.sh -c -t -- -DCUDA_COMPUTE_CAPABILITY="${CUDA_COMPUTE_CAPABILITY}" -DOZAKI_USE_BOOST_MULTIPRECISION="ON"
 
+echo "========================================"
+echo "Generating Test Tensors"
+echo "========================================"
+
+./build/bin/gen-tensor --N 262144 --dims 1 -o data/1D_262144.dat
+./build/bin/gen-tensor --N 512 --dims 2 -o data/2D_512x512.dat
+./build/bin/gen-tensor --N 64 --dims 3 -o data/3D_64x64x64.dat
+
 echo ""
 echo "========================================"
 echo "OzakiStencil has been built and environment has been set up."
@@ -24,7 +32,7 @@ echo "You are now inside the OzakiStencil artifact container. You can run the fo
 echo ""
 echo "1. Correctness Tests:"
 echo "   ./correctness.sh <stencils...>"
-echo "   (Example (Figure 6 in paper): ./correctness.sh data/stencils/heat.stc data/stencils/ad.stc data/stencils/7x7box.stc data/stencils/3x3x3box.stc)"
+echo "   (Example (Figure 6 in paper): ./correctness.sh data/stencils/heat.stc data/stencils/ad.stc data/stencils/7x7Lm1_0.stc data/stencils/3x3x3LmNone_0.stc)"
 echo ""
 echo "2. Performance Benchmarks:"
 echo "   ./performance.sh"
