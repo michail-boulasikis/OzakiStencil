@@ -91,13 +91,17 @@ template <typename T> Tensor<T> read_tensor_as(const std::string &filepath) {
     return {shape, data};
   }
 
-  // Otherwise, read raw bytes and convert element-by-element.
+  // Otherwise, read and convert element-by-element using scalar temporaries.
+  // Avoids instantiating std::vector<StoredT>, which is necessary when StoredT
+  // is __float128 in nvcc-compiled code (nvcc rejects std::initializer_list<__float128>
+  // on sub-sm100 architectures).
   std::vector<T> data(n_elems);
   auto read_and_convert = [&]<typename StoredT>() {
-    std::vector<StoredT> raw(n_elems);
-    f.read(reinterpret_cast<char *>(raw.data()), n_elems * sizeof(StoredT));
-    for (size_t i = 0; i < n_elems; ++i)
-      data[i] = static_cast<T>(raw[i]);
+    for (size_t i = 0; i < n_elems; ++i) {
+      StoredT val;
+      f.read(reinterpret_cast<char *>(&val), sizeof(StoredT));
+      data[i] = static_cast<T>(val);
+    }
   };
 
   switch (type_id) {
@@ -110,6 +114,29 @@ template <typename T> Tensor<T> read_tensor_as(const std::string &filepath) {
   default: throw std::runtime_error("Unknown type_id " + std::to_string(type_id) + " in " + filepath);
   }
   return {shape, data};
+}
+
+// Write tensor data as OutT from a std::vector<InT>, converting element-by-element.
+// Avoids instantiating std::vector<OutT>, which is necessary when OutT is __float128
+// in nvcc-compiled code (nvcc rejects std::initializer_list<__float128> on sub-sm100).
+template <typename OutT, typename InT>
+void write_tensor_cast(const std::string &filepath, const std::vector<size_t> &shape, const std::vector<InT> &data) {
+  std::ofstream f(filepath, std::ios::out | std::ios::binary);
+  if (!f.is_open())
+    throw std::runtime_error("Could not open file at " + filepath + ".");
+
+  size_t n_dims = shape.size();
+  f.write(reinterpret_cast<const char *>(&n_dims), sizeof(size_t));
+
+  size_t type_id = get_type_id<OutT>();
+  f.write(reinterpret_cast<const char *>(&type_id), sizeof(size_t));
+
+  f.write(reinterpret_cast<const char *>(shape.data()), n_dims * sizeof(size_t));
+
+  for (size_t i = 0; i < data.size(); ++i) {
+    OutT val = static_cast<OutT>(data[i]);
+    f.write(reinterpret_cast<const char *>(&val), sizeof(OutT));
+  }
 }
 
 template <typename T> void write_tensor(const std::string &filepath, const Tensor<T> &tensor) {

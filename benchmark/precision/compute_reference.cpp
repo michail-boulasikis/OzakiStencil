@@ -68,9 +68,13 @@ int main(int argc, char *argv[]) {
     compute_longdouble_ref = vm.count("longdouble") > 0;
     compute_fp128_ref = vm.count("fp128") > 0;
 
-    // Default: fp128 if nothing specified
-    if (!compute_float_ref && !compute_double_ref && !compute_longdouble_ref && !compute_fp128_ref)
+    if (!compute_float_ref && !compute_double_ref && !compute_longdouble_ref && !compute_fp128_ref) {
+#if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
       compute_fp128_ref = true;
+#else
+      compute_double_ref = true;
+#endif
+    }
 
     if (timesteps.empty())
       timesteps = {1000};

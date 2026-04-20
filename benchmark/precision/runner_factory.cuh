@@ -21,7 +21,7 @@ enum class Algorithm { Direct, ConvStencil };
 // Helper: given a concrete stencil type and M, constructs OzakiRunnerDirect<M, Dims...>.
 template <int32_t M, typename CoeffT, size_t... Dims>
 std::unique_ptr<OzakiRunnerBase>
-make_runner_impl(const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<__float128> &input, int32_t iterations,
+make_runner_impl(const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Real> &input, int32_t iterations,
                  int32_t extra_msb, int32_t extra_lsb, const std::string &prefix, CoeffStorageType scaling_factor,
                  CoeffStorageType a_coeff, int32_t extra_msb_shift) {
   return std::make_unique<OzakiRunnerDirect<M, Dims...>>(stencil, input, iterations, extra_msb, extra_lsb, prefix,
@@ -31,7 +31,7 @@ make_runner_impl(const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<__fl
 // Dispatches on M (1..12) for a given concrete stencil type.
 template <typename CoeffT, size_t... Dims>
 std::unique_ptr<OzakiRunnerBase>
-dispatch_m(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<__float128> &input, int32_t iterations,
+dispatch_m(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Real> &input, int32_t iterations,
            int32_t extra_msb, int32_t extra_lsb, const std::string &prefix, CoeffStorageType scaling_factor,
            CoeffStorageType a_coeff, int32_t extra_msb_shift) {
   switch (m) {
@@ -80,7 +80,7 @@ dispatch_m(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<__f
 // Uses if constexpr to avoid instantiation errors for other shapes.
 template <int32_t M, typename CoeffT, size_t... Dims>
 std::unique_ptr<OzakiRunnerBase>
-make_convstencil_runner_impl(const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<__float128> &input,
+make_convstencil_runner_impl(const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Real> &input,
                              int32_t iterations, int32_t extra_msb, int32_t extra_lsb, const std::string &prefix,
                              CoeffStorageType scaling_factor, CoeffStorageType a_coeff, int32_t extra_msb_shift) {
   if constexpr (sizeof...(Dims) == 2) {
@@ -96,7 +96,7 @@ make_convstencil_runner_impl(const ozi::Stencil<CoeffT, Dims...> &stencil, const
 // Dispatches on M (1..12) for ConvStencil.
 template <typename CoeffT, size_t... Dims>
 std::unique_ptr<OzakiRunnerBase>
-dispatch_m_convstencil(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<__float128> &input,
+dispatch_m_convstencil(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, const Tensor<Real> &input,
                        int32_t iterations, int32_t extra_msb, int32_t extra_lsb, const std::string &prefix,
                        CoeffStorageType scaling_factor, CoeffStorageType a_coeff, int32_t extra_msb_shift) {
   switch (m) {
@@ -143,7 +143,7 @@ dispatch_m_convstencil(int m, const ozi::Stencil<CoeffT, Dims...> &stencil, cons
 
 // Factory: creates the correctly-typed runner from a runtime StencilSpec.
 // Performs shape dispatch (std::visit) and M dispatch (switch) once at construction.
-inline std::unique_ptr<OzakiRunnerBase> make_ozaki_runner(const StencilSpec &spec, const Tensor<__float128> &input,
+inline std::unique_ptr<OzakiRunnerBase> make_ozaki_runner(const StencilSpec &spec, const Tensor<Real> &input,
                                                           int32_t iterations, int32_t extra_msb, int32_t extra_lsb,
                                                           const std::string &prefix,
                                                           Algorithm algo = Algorithm::Direct) {

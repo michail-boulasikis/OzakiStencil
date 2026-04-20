@@ -86,7 +86,7 @@ int main(int argc, char *argv[]) {
 
   try {
     NVTX_PUSH("Initialization");
-    Tensor<__float128> input = read_tensor<__float128>(input_file);
+    Tensor<Real> input = read_tensor_as<Real>(input_file);
     NVTX_POP();
 
     // Collect stencil specifications
