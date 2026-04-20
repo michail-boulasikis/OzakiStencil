@@ -9,7 +9,7 @@ index 8b109d6..7031688 100644
  project(spmm_coo VERSION 0.01 LANGUAGES CXX CUDA)
  set(CMAKE_VERBOSE_MAKEFILE ON)
  
-+set(GPU_ARCH "86" CACHE STRING "Which GPU Compute Architecture to compile for")
++set(GPU_ARCH "120" CACHE STRING "Which GPU Compute Architecture to compile for")
 +
 +find_package(CUDAToolkit REQUIRED)
 +
@@ -124,7 +124,7 @@ index a99c844..d0ceaad 100644
  
  __global__ void kernel2d (const double * __restrict__ in, double * __restrict__ out, const int ldm, const int * __restrict__ lookup_table1, const int * __restrict__ lookup_table2) {
 -    __shared__ double sharedmem[2][SM_SIZE_ROW * SM_SIZE_COL];
-+    __shared__ double sharedmem[2][SM_SIZE_ROW * SM_SIZE_COL + 128];
++    __shared__ double sharedmem[2][SM_SIZE_ROW * SM_SIZE_COL + 2];
      int begin = IDX(blockIdx.x * BLOCK_SIZE_ROW, blockIdx.y * BLOCK_SIZE_COL + 1, ldm);
      int tid = threadIdx.x;
      int totalThreads = blockDim.x;
@@ -133,7 +133,7 @@ index a99c844..d0ceaad 100644
  
  __global__ void breakdown4_kernel (const double * __restrict__ in, double * __restrict__ out, const int ldm, const int * __restrict__ lookup_table1, const int * __restrict__ lookup_table2) {
 -    __shared__ double sharedmem[2][SM_SIZE_ROW * SM_SIZE_COL];
-+    __shared__ double sharedmem[2][SM_SIZE_ROW * SM_SIZE_COL + 128];
++    __shared__ double sharedmem[2][SM_SIZE_ROW * SM_SIZE_COL + 2];
      int begin = IDX(blockIdx.x * BLOCK_SIZE_ROW, blockIdx.y * BLOCK_SIZE_COL + 1, ldm);
      int tid = threadIdx.x;
      int totalThreads = blockDim.x;
@@ -142,7 +142,7 @@ index a99c844..d0ceaad 100644
  
  __global__ void breakdown3_kernel(const double * __restrict__ in, double * __restrict__ out, const int ldm, const int * __restrict__ lookup_table1, const int * __restrict__ lookup_table2) {
 -    __shared__ double sharedmem[2][SM_SIZE_ROW * (SM_SIZE_COL - PAD)];
-+    __shared__ double sharedmem[2][SM_SIZE_ROW * (SM_SIZE_COL - PAD) + 128];
++    __shared__ double sharedmem[2][SM_SIZE_ROW * (SM_SIZE_COL - PAD) + 2];
      int begin = IDX(blockIdx.x * BLOCK_SIZE_ROW, blockIdx.y * BLOCK_SIZE_COL + 1, ldm);
      int tid = threadIdx.x;
      int totalThreads = blockDim.x;
@@ -151,7 +151,7 @@ index a99c844..d0ceaad 100644
  
  __global__ void breakdown2_kernel (const double * __restrict__ in, double * __restrict__ out, const int ldm, const int * __restrict__ lookup_table1, const int * __restrict__ lookup_table2) {
 -    __shared__ double sharedmem[2][SM_SIZE_ROW * (SM_SIZE_COL - PAD)];
-+    __shared__ double sharedmem[2][SM_SIZE_ROW * (SM_SIZE_COL - PAD) + 128];
++    __shared__ double sharedmem[2][SM_SIZE_ROW * (SM_SIZE_COL - PAD) + 2];
  
      int begin = IDX(blockIdx.x * BLOCK_SIZE_ROW, blockIdx.y * BLOCK_SIZE_COL + 1, ldm);//分块
  
@@ -160,7 +160,7 @@ index a99c844..d0ceaad 100644
  
  __global__ void breakdown1_kernel ( double * __restrict__ in, double * __restrict__ out, const int ldm, const int * __restrict__ lookup_table1, const int * __restrict__ lookup_table2,double* __restrict__ la,double * __restrict__ lb) {
 -    __shared__ double sharedmem[2][SM_SIZE_ROW * (SM_SIZE_COL - PAD)];
-+    __shared__ double sharedmem[2][SM_SIZE_ROW * (SM_SIZE_COL - PAD) + 128];
++    __shared__ double sharedmem[2][SM_SIZE_ROW * (SM_SIZE_COL - PAD) + 2];
  
      int begin = IDX(blockIdx.x * BLOCK_SIZE_ROW, blockIdx.y * BLOCK_SIZE_COL + 1, ldm);
  

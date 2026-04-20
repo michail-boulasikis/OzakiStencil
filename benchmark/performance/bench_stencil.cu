@@ -380,7 +380,8 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
     l1_int = 1;
 
   // Proactive shift schedule
-  double log2_sf = (scaling_factor > static_cast<HighPrecType>(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
+  double log2_sf =
+      (scaling_factor > static_cast<HighPrecType>(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
   int32_t total_shifts_needed = static_cast<int32_t>(std::ceil(cfg.timesteps * log2_sf / 7.0));
 
   auto [grid, block] = make_grid_block<ndims>(shape);
@@ -508,7 +509,8 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
   const size_t height = shape[0];
   const size_t ldm = shape[1];
 
-  std::string nvtx_label = "Ozaki ConvStencil (M=" + std::to_string(M) + ", S=" + std::to_string(num_slices_total) + ")";
+  std::string nvtx_label =
+      "Ozaki ConvStencil (M=" + std::to_string(M) + ", S=" + std::to_string(num_slices_total) + ")";
   NVTX_PUSH(nvtx_label.c_str());
 
   // Allocate device resources
@@ -609,7 +611,8 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
     l1_int = 1;
 
   // Proactive shift schedule
-  double log2_sf = (scaling_factor > static_cast<HighPrecType>(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
+  double log2_sf =
+      (scaling_factor > static_cast<HighPrecType>(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
   int32_t total_shifts_needed = static_cast<int32_t>(std::ceil(cfg.timesteps * log2_sf / 7.0));
 
   // ConvStencil grid/block
@@ -618,42 +621,22 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
   dim3 grid_cv((height + ozigpu::convstencil::TILE_SIZE_ROW - 1) / ozigpu::convstencil::TILE_SIZE_ROW,
                (ldm + ozigpu::convstencil::TILE_SIZE_COL - 1) / ozigpu::convstencil::TILE_SIZE_COL);
 
-  for (int32_t r = 0; r < cfg.repeats; ++r) {
-    // Reset state
-    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n_elems * sizeof(Real), cudaMemcpyHostToDevice));
+  size_t total_height = static_cast<size_t>(actual_slices) * height;
 
-    h_desc.n_slices_input = actual_slices;
-    h_desc.shift_required = 0;
-    h_desc.carry_slice_index = 0;
-    h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
-    h_desc.just_shifted = 1;
-    h_desc.n_shifts = 0;
-    CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+  if constexpr (M <= 3) {
+    cudaFuncSetAttribute(ozigpu::cvstencil_v2<Oz, M>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         ozigpu::convstencil::DYN_SMEM_BYTES);
 
-    // Re-slice
-    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+    ozigpu::convstencil::TmaDescriptorsV2 tma;
+    bool tma_ok = ozigpu::convstencil::create_tma_descriptors_v2(tma, d_slices_1, d_slices_2, total_height, ldm);
+    if (!tma_ok) {
+      std::cerr << "Skipping cvstencil: TMA requires ldm >= 128 and ldm % 16 == 0\n";
+      return {};
+    }
 
-    ozigpu::upload_slice_phys_lut(actual_slices);
+    for (int32_t r = 0; r < cfg.repeats; ++r) {
+      CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n_elems * sizeof(Real), cudaMemcpyHostToDevice));
 
-    if (cfg.flush_l2)
-      cache_inv.invalidate();
-
-    // Warmup
-    if (cfg.warmup > 0) {
-      NVTX_PUSH("Warmup");
-      for (int32_t t = 0; t < cfg.warmup; ++t) {
-        ozigpu::cvstencil<Oz, M>
-            <<<grid_cv, block_cv>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary);
-        if (t < cfg.warmup - 1)
-          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, 0);
-        std::swap(d_slices_1, d_slices_2);
-      }
-      CUDA_CHECK(cudaDeviceSynchronize());
-      NVTX_POP();
-
-      // Reset desc state after warmup
       h_desc.n_slices_input = actual_slices;
       h_desc.shift_required = 0;
       h_desc.carry_slice_index = 0;
@@ -662,38 +645,155 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
       h_desc.n_shifts = 0;
       CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
 
-      // Re-slice again for clean measurement
       ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
       CUDA_CHECK(cudaDeviceSynchronize());
-      CUDA_CHECK(
-          cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
-    }
+      CUDA_CHECK(cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
 
-    if (cfg.flush_l2)
-      cache_inv.invalidate();
+      ozigpu::upload_slice_phys_lut(actual_slices);
 
-    // Measurement
-    CudaEventPair ev;
-    NVTX_PUSH("Integration");
-    ev.record_start();
-    for (int32_t t = 0; t < cfg.timesteps; ++t) {
-      ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary);
-      if (t < cfg.timesteps - 1) {
-        int32_t min_shifts_now;
-        if (t == cfg.timesteps - 2)
-          min_shifts_now = total_shifts_needed;
-        else
-          min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
-        if (min_shifts_now < 0)
-          min_shifts_now = 0;
-        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
+      if (cfg.flush_l2)
+        cache_inv.invalidate();
+
+      if (cfg.warmup > 0) {
+        NVTX_PUSH("Warmup");
+        for (int32_t t = 0; t < cfg.warmup; ++t) {
+          ozigpu::cvstencil_v2<Oz, M><<<grid_cv, block_cv, ozigpu::convstencil::DYN_SMEM_BYTES>>>(
+              d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.h_main[0]);
+          if (t < cfg.warmup - 1)
+            ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, 0);
+          std::swap(d_slices_1, d_slices_2);
+          tma.swap();
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        NVTX_POP();
+
+        h_desc.n_slices_input = actual_slices;
+        h_desc.shift_required = 0;
+        h_desc.carry_slice_index = 0;
+        h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
+        h_desc.just_shifted = 1;
+        h_desc.n_shifts = 0;
+        CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+
+        ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(
+            cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
       }
-      std::swap(d_slices_1, d_slices_2);
-    }
-    ev.record_stop();
-    NVTX_POP();
 
-    result.integration_ms.push_back(ev.elapsed_ms());
+      if (cfg.flush_l2)
+        cache_inv.invalidate();
+
+      CudaEventPair ev;
+      NVTX_PUSH("Integration");
+      ev.record_start();
+      for (int32_t t = 0; t < cfg.timesteps; ++t) {
+        ozigpu::cvstencil_v2<Oz, M><<<grid_cv, block_cv, ozigpu::convstencil::DYN_SMEM_BYTES>>>(
+            d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.h_main[0]);
+        if (t < cfg.timesteps - 1) {
+          int32_t min_shifts_now;
+          if (t == cfg.timesteps - 2)
+            min_shifts_now = total_shifts_needed;
+          else
+            min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
+          if (min_shifts_now < 0)
+            min_shifts_now = 0;
+          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
+        }
+        std::swap(d_slices_1, d_slices_2);
+        tma.swap();
+      }
+      ev.record_stop();
+      NVTX_POP();
+
+      result.integration_ms.push_back(ev.elapsed_ms());
+    }
+
+    tma.free();
+  } else {
+    ozigpu::convstencil::TmaDescriptors tma;
+    bool tma_ok = ozigpu::convstencil::create_tma_descriptors(tma, d_slices_1, d_slices_2, total_height, ldm);
+    if (!tma_ok) {
+      std::cerr << "Skipping cvstencil: TMA requires ldm >= 128 and ldm % 16 == 0\n";
+      return {};
+    }
+
+    for (int32_t r = 0; r < cfg.repeats; ++r) {
+      CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n_elems * sizeof(Real), cudaMemcpyHostToDevice));
+
+      h_desc.n_slices_input = actual_slices;
+      h_desc.shift_required = 0;
+      h_desc.carry_slice_index = 0;
+      h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
+      h_desc.just_shifted = 1;
+      h_desc.n_shifts = 0;
+      CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+
+      ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
+      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+
+      ozigpu::upload_slice_phys_lut(actual_slices);
+
+      if (cfg.flush_l2)
+        cache_inv.invalidate();
+
+      if (cfg.warmup > 0) {
+        NVTX_PUSH("Warmup");
+        for (int32_t t = 0; t < cfg.warmup; ++t) {
+          ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(
+              d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.h_main[0], tma.h_extra[0]);
+          if (t < cfg.warmup - 1)
+            ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, 0);
+          std::swap(d_slices_1, d_slices_2);
+          tma.swap();
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        NVTX_POP();
+
+        h_desc.n_slices_input = actual_slices;
+        h_desc.shift_required = 0;
+        h_desc.carry_slice_index = 0;
+        h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
+        h_desc.just_shifted = 1;
+        h_desc.n_shifts = 0;
+        CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+
+        ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(
+            cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+      }
+
+      if (cfg.flush_l2)
+        cache_inv.invalidate();
+
+      CudaEventPair ev;
+      NVTX_PUSH("Integration");
+      ev.record_start();
+      for (int32_t t = 0; t < cfg.timesteps; ++t) {
+        ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(
+            d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.h_main[0], tma.h_extra[0]);
+        if (t < cfg.timesteps - 1) {
+          int32_t min_shifts_now;
+          if (t == cfg.timesteps - 2)
+            min_shifts_now = total_shifts_needed;
+          else
+            min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
+          if (min_shifts_now < 0)
+            min_shifts_now = 0;
+          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
+        }
+        std::swap(d_slices_1, d_slices_2);
+        tma.swap();
+      }
+      ev.record_stop();
+      NVTX_POP();
+
+      result.integration_ms.push_back(ev.elapsed_ms());
+    }
+
+    tma.free();
   }
 
   // -- Mend (with warmup + repetition) --
@@ -838,11 +938,8 @@ static void print_header(const cudaDeviceProp &prop, const std::vector<size_t> &
   std::cout << "Warmup:         " << cfg.warmup << "\n";
   std::cout << "Repeats:        " << cfg.repeats << "\n";
   std::cout << "----------------------------------------------------------------\n";
-  std::cout << std::left << std::setw(22) << "Algorithm"
-            << std::right << std::setw(10) << "Min (ms)"
-            << std::setw(10) << "Med (ms)"
-            << std::setw(10) << "Max (ms)"
-            << std::setw(9) << "GStPt/s" << "\n";
+  std::cout << std::left << std::setw(22) << "Algorithm" << std::right << std::setw(10) << "Min (ms)" << std::setw(10)
+            << "Med (ms)" << std::setw(10) << "Max (ms)" << std::setw(9) << "GStPt/s" << "\n";
   std::cout << "----------------------------------------------------------------\n";
 }
 
@@ -852,12 +949,8 @@ static void print_naive_row(const char *name, const PhaseTimings &t, const std::
   float md = stat_median(t.integration_ms);
   float mx = stat_max(t.integration_ms);
   double gstpts = compute_gstpts(shape, timesteps, mn);
-  std::cout << std::left << std::setw(22) << name
-            << std::fixed << std::setprecision(2)
-            << std::right << std::setw(10) << mn
-            << std::setw(10) << md
-            << std::setw(10) << mx
-            << std::setw(9) << gstpts << "\n";
+  std::cout << std::left << std::setw(22) << name << std::fixed << std::setprecision(2) << std::right << std::setw(10)
+            << mn << std::setw(10) << md << std::setw(10) << mx << std::setw(9) << gstpts << "\n";
 }
 
 static void print_ozaki_row(const char *name, const PhaseTimings &t, const std::vector<size_t> &shape,
@@ -872,35 +965,19 @@ static void print_ozaki_row(const char *name, const PhaseTimings &t, const std::
   float total_med = dr_med + sl_med + int_med + mend_med;
   float total_max = dr_max + sl_max + int_max + mend_max;
   double gstpts = compute_gstpts(shape, timesteps, total_min);
-  std::cout << std::left << std::setw(22) << name
-            << std::fixed << std::setprecision(2)
-            << std::right << std::setw(10) << total_min
-            << std::setw(10) << total_med
-            << std::setw(10) << total_max
-            << std::setw(9) << gstpts << "\n";
-  std::cout << "  " << std::left << std::setw(20) << "DynRange"
-            << std::fixed << std::setprecision(2)
-            << std::right << std::setw(10) << dr_min
-            << std::setw(10) << dr_med
-            << std::setw(10) << dr_max << "\n";
-  std::cout << "  " << std::left << std::setw(20) << "Slice"
-            << std::fixed << std::setprecision(2)
-            << std::right << std::setw(10) << sl_min
-            << std::setw(10) << sl_med
-            << std::setw(10) << sl_max << "\n";
+  std::cout << std::left << std::setw(22) << name << std::fixed << std::setprecision(2) << std::right << std::setw(10)
+            << total_min << std::setw(10) << total_med << std::setw(10) << total_max << std::setw(9) << gstpts << "\n";
+  std::cout << "  " << std::left << std::setw(20) << "DynRange" << std::fixed << std::setprecision(2) << std::right
+            << std::setw(10) << dr_min << std::setw(10) << dr_med << std::setw(10) << dr_max << "\n";
+  std::cout << "  " << std::left << std::setw(20) << "Slice" << std::fixed << std::setprecision(2) << std::right
+            << std::setw(10) << sl_min << std::setw(10) << sl_med << std::setw(10) << sl_max << "\n";
 
   double int_gstpts = compute_gstpts(shape, timesteps, int_min);
-  std::cout << "  " << std::left << std::setw(20) << "Integration"
-            << std::fixed << std::setprecision(2)
-            << std::right << std::setw(10) << int_min
-            << std::setw(10) << int_med
-            << std::setw(10) << int_max
-            << std::setw(9) << int_gstpts << "\n";
-  std::cout << "  " << std::left << std::setw(20) << "Mend"
-            << std::fixed << std::setprecision(2)
-            << std::right << std::setw(10) << mend_min
-            << std::setw(10) << mend_med
-            << std::setw(10) << mend_max << "\n";
+  std::cout << "  " << std::left << std::setw(20) << "Integration" << std::fixed << std::setprecision(2) << std::right
+            << std::setw(10) << int_min << std::setw(10) << int_med << std::setw(10) << int_max << std::setw(9)
+            << int_gstpts << "\n";
+  std::cout << "  " << std::left << std::setw(20) << "Mend" << std::fixed << std::setprecision(2) << std::right
+            << std::setw(10) << mend_min << std::setw(10) << mend_med << std::setw(10) << mend_max << "\n";
 }
 
 static void print_skipped_row(const char *name, const char *reason) {
@@ -977,9 +1054,8 @@ static void run_benchmarks(const StencilSpec &spec, const BenchConfig &cfg, int 
 
         // Validate dimensionality
         if (ndims != cfg.shape.size()) {
-          throw std::invalid_argument(
-              "Stencil '" + spec.name + "' has " + std::to_string(ndims) +
-              " dims but shape has " + std::to_string(cfg.shape.size()) + " dims");
+          throw std::invalid_argument("Stencil '" + spec.name + "' has " + std::to_string(ndims) +
+                                      " dims but shape has " + std::to_string(cfg.shape.size()) + " dims");
         }
 
         // -- Naive FP32 --

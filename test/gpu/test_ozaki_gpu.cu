@@ -19,6 +19,24 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#ifdef OZAKI_HAVE_FLOAT128
+#include <quadmath.h>
+#endif
+
+template <typename T> double get_epsilon() {
+  if constexpr (std::is_same_v<T, float>) {
+    return static_cast<double>(std::numeric_limits<float>::epsilon());
+  } else if constexpr (std::is_same_v<T, double>) {
+    return std::numeric_limits<double>::epsilon();
+  } else {
+#ifdef OZAKI_HAVE_FLOAT128
+    return static_cast<double>(FLT128_EPSILON);
+#else
+    return std::numeric_limits<long double>::epsilon();
+#endif
+  }
+}
+
 template <typename T> int32_t get_slice_max_normal() {
   if constexpr (std::is_same_v<T, float>) {
     return 9;
@@ -116,7 +134,7 @@ protected:
       double g1 = gamma_dist(engine);
       double g2 = gamma_dist(engine);
       double beta = g1 / (g1 + g2);
-      double eps = static_cast<double>(std::numeric_limits<T>::epsilon());
+      double eps = get_epsilon<T>();
       double scalar = bool_dist(engine) ? (1.0 / eps) : eps;
       out[i] = static_cast<T>(bool_dist(engine) ? (beta * scalar) : -(beta * scalar));
     }

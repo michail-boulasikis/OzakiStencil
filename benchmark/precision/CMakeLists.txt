@@ -9,3 +9,7 @@ target_link_libraries(run-ozaki PRIVATE CUDA::cudart CUDA::cuda_driver ozigpu qu
 # CPU-only: compute RMSE between reference and result tensors
 add_cpu_app(compute-errors compute_errors.cpp)
 target_link_libraries(compute-errors PRIVATE quadmath)
+
+# CPU-only: generate FP128 Gaussian-peak tensor files
+add_cpu_app(gen-tensor gen_tensor.cpp)
+target_link_libraries(gen-tensor PRIVATE quadmath)
