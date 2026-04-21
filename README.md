@@ -26,6 +26,7 @@ Note that if you want to see correctness results past `double` precision, you wi
 The volume `-v` argument allows accessing the resulting files from outside the container. 
 
 The container is going to run `entrypoint.sh`, which will provide a shell and additional instructions on how to run the experiments.
+In some environments, it might be necessary to explicitly specify `g++` as the host compiler. If you run into compilation errors, try appending the flags `-DCMAKE_CXX_COMPILER="g++" -DCMAKE_CUDA_COMPILER="nvcc" -DCMAKE_CUDA_HOST_COMPILER="g++"` to the `./build.sh` invokation in `entrypoint.sh`.
 
 ## License
 

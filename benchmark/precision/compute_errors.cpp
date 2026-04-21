@@ -8,15 +8,6 @@
 #include <boost/program_options.hpp>
 namespace po = boost::program_options;
 
-#ifdef OZAKI_HAVE_FLOAT128
-#define HIGH_PREC __float128
-#define HIGH_PREC_MAX(X, Y) fmaxq(X, Y)
-#define HIGH_PREC_ABS(X) fabsq(X)
-#else
-#define HIGH_PREC (long double)
-#define HIGH_PREC_ABS(X) std::abs(X)
-#define HIGH_PREC_MAX(X, Y) std::max(X, Y)
-#endif
 
 HIGH_PREC absmax(const Tensor<HIGH_PREC> &a) {
   HIGH_PREC amax = static_cast<HIGH_PREC>(0);

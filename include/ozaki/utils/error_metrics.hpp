@@ -14,8 +14,12 @@
 #ifdef OZAKI_HAVE_FLOAT128
 #include <quadmath.h>
 #define HIGH_PREC __float128
+#define HIGH_PREC_MAX(X, Y) fmaxq(X, Y)
+#define HIGH_PREC_ABS(X) fabsq(X)
 #else
-#define HIGH_PREC (long double)
+#define HIGH_PREC long double
+#define HIGH_PREC_ABS(X) std::abs(X)
+#define HIGH_PREC_MAX(X, Y) std::max(X, Y)
 #endif
 
 template <typename T_Test, typename T_Ref>
