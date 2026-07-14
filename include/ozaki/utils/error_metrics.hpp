@@ -39,4 +39,17 @@ HIGH_PREC calculate_rmse(const std::vector<T_Test> &test, const std::vector<T_Re
 #endif
 }
 
+template <typename T_Test, typename T_Ref>
+HIGH_PREC calculate_max_abs_diff(const std::vector<T_Test> &test, const std::vector<T_Ref> &ref) {
+  if (test.size() != ref.size()) {
+    throw std::runtime_error("Size mismatch in maximum absolute difference calculation");
+  }
+  HIGH_PREC max_diff = static_cast<HIGH_PREC>(0.0);
+  for (size_t i = 0; i < test.size(); ++i) {
+    HIGH_PREC diff = HIGH_PREC_ABS(static_cast<HIGH_PREC>(test[i]) - static_cast<HIGH_PREC>(ref[i]));
+    max_diff = HIGH_PREC_MAX(max_diff, diff);
+  }
+  return max_diff;
+}
+
 #endif // HEADER_ERROR_METRICS_HPP

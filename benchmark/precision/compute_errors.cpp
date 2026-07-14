@@ -70,7 +70,8 @@ int main(int argc, char *argv[]) {
     }
 
     HIGH_PREC error = calculate_rmse(ref.data, result.data);
-    std::cout << static_cast<long double>(error) << "\n";
+    HIGH_PREC max_abs_diff = calculate_max_abs_diff(ref.data, result.data);
+    std::cout << static_cast<long double>(error) << "," << static_cast<long double>(max_abs_diff) << "\n";
 
   } catch (const std::exception &e) {
     std::cerr << "Error: " << e.what() << "\n";

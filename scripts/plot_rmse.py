@@ -25,8 +25,10 @@ STENCIL_ORDER = ["heat", "ad", "7x7Lm1_0", "3x3x3Lm2_0"]
 # Default path for precision reference data
 DEFAULT_REFS_CSV = "data/precision_refs.csv"
 
-# Colors from the plot_perf_bar.py palette, one per T value
+# Colors from the pastel-8 palette, one per T value
 T_COLORS = {
+    100000: "#9eb9f3",
+    10000: "#87c55f",
     1000: "#66c5cc",
     100: "#f6cf71",
     10: "#f89c74",
@@ -35,10 +37,12 @@ T_COLORS = {
 
 # Markers for colorblind accessibility
 T_MARKERS = {
-    1: "o",  # circle
-    10: "s",  # square
-    100: "^",  # triangle-up
+    100000: "P",  # filled plus
+    10000: "v",  # triangle-down
     1000: "D",  # diamond
+    100: "^",  # triangle-up
+    10: "s",  # square
+    1: "o",  # circle
 }
 
 # Linestyles for precision reference lines (per precision type)
@@ -62,14 +66,17 @@ SHARED_Y_AXIS = False  # set True to share the y-axis across all subplots
 
 
 def load_refs(path: str) -> dict:
-    """Return nested dict: refs[stencil][T][precision] = rmse."""
+    """Return refs[stencil][T][precision][metric] for both error metrics."""
     if not os.path.exists(path):
         return {}
     df = pd.read_csv(path)
     refs: dict = {}
     for _, row in df.iterrows():
-        s, t, p, v = row["stencil"], int(row["T"]), row["precision"], float(row["rmse"])
-        refs.setdefault(s, {}).setdefault(t, {})[p] = v
+        s, t, p = row["stencil"], int(row["T"]), row["precision"]
+        refs.setdefault(s, {}).setdefault(t, {})[p] = {
+            "rmse": float(row["rmse"]),
+            "max_abs_diff": float(row["max_abs_diff"]),
+        }
     return refs
 
 
@@ -105,83 +112,89 @@ def main() -> None:
 
     sharey_arg = "row" if SHARED_Y_AXIS else False
     fig, axes = plt.subplots(
-        1,
+        2,
         n,
-        figsize=(3.8 * n, 3.4),
+        figsize=(3.8 * n, 6.8),
         sharey=sharey_arg,
         squeeze=False,
     )
-    axes = axes[0]
 
     T_vals = sorted(df["T"].unique())
+    metrics = ("rmse", "max_abs_diff")
+    metric_labels = {
+        "rmse": "RMSE",
+        "max_abs_diff": "Maximum absolute difference",
+    }
 
-    for ax, stencil in zip(axes, ordered):
-        sub = df[df["stencil"] == stencil]
+    for row, metric in enumerate(metrics):
+        for col, stencil in enumerate(ordered):
+            ax = axes[row, col]
+            sub = df[df["stencil"] == stencil]
 
-        for t in T_vals:
-            tdata = sub[sub["T"] == t].sort_values("slices")
-            if tdata.empty:
-                continue
-            ax.plot(
-                tdata["slices"],
-                tdata["rmse"],
-                color=T_COLORS.get(t, "#999999"),
-                marker=T_MARKERS.get(t, "x"),
-                markersize=MARKER_SIZE,
-                markeredgewidth=0.5,
-                markeredgecolor="white",
-                linewidth=LINE_WIDTH,
-                markevery=1,
-                label=f"$T={t}$",
-                zorder=3,
-            )
+            for t in T_vals:
+                tdata = sub[sub["T"] == t].sort_values("slices")
+                if tdata.empty:
+                    continue
+                ax.plot(
+                    tdata["slices"],
+                    tdata[metric],
+                    color=T_COLORS.get(t, "#999999"),
+                    marker=T_MARKERS.get(t, "x"),
+                    markersize=MARKER_SIZE,
+                    markeredgewidth=0.5,
+                    markeredgecolor="white",
+                    linewidth=LINE_WIDTH,
+                    markevery=1,
+                    label=f"$T={t}$",
+                    zorder=3,
+                )
 
-        stencil_refs = refs.get(stencil, {})
-        for prec in ("float", "double", "longdouble"):
-            values = [
-                stencil_refs[t][prec]
-                for t in T_vals
-                if t in stencil_refs
-                and prec in stencil_refs[t]
-                and stencil_refs[t][prec] > 0
-            ]
-            if not values:
-                continue
-            avg_rmse = sum(values) / len(values)
-            ax.axhline(
-                avg_rmse,
-                color="#444444",
-                linestyle=PREC_LINESTYLES[prec],
-                linewidth=REF_WIDTH,
-                alpha=REF_ALPHA,
-                zorder=2,
-            )
+            stencil_refs = refs.get(stencil, {})
+            for prec in ("float", "double", "longdouble"):
+                values = [
+                    stencil_refs[t][prec][metric]
+                    for t in T_vals
+                    if t in stencil_refs
+                    and prec in stencil_refs[t]
+                    and stencil_refs[t][prec][metric] > 0
+                ]
+                if not values:
+                    continue
+                avg_error = sum(values) / len(values)
+                ax.axhline(
+                    avg_error,
+                    color="#444444",
+                    linestyle=PREC_LINESTYLES[prec],
+                    linewidth=REF_WIDTH,
+                    alpha=REF_ALPHA,
+                    zorder=2,
+                )
 
-        ax.set_yscale("log")
-        ax.set_xlabel("Slices", fontsize=13)
-        ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True, nbins=7))
-        ax.tick_params(axis="both", labelsize=11)
-        title = STENCIL_TITLES.get(stencil, stencil)
-        ax.set_title(title, fontsize=13, fontweight="bold", pad=5)
-        sns.despine(ax=ax)
+            ax.set_yscale("log")
+            if row == len(metrics) - 1:
+                ax.set_xlabel("Slices", fontsize=13)
+            ax.xaxis.set_major_locator(ticker.MaxNLocator(integer=True, nbins=7))
+            ax.tick_params(axis="both", labelsize=11)
+            if row == 0:
+                title = STENCIL_TITLES.get(stencil, stencil)
+                ax.set_title(title, fontsize=13, fontweight="bold", pad=5)
+            sns.despine(ax=ax)
 
-    # Unify y-axis limits across all subplots
-    all_ymins, all_ymaxs = [], []
-    for ax in axes:
-        ymin, ymax = ax.get_ylim()
-        all_ymins.append(ymin)
-        all_ymaxs.append(ymax)
-    global_ymin = min(all_ymins)
-    global_ymax = max(all_ymaxs)
-    for ax in axes:
-        ax.set_ylim(global_ymin, global_ymax)
+    # Unify y-axis limits across subplots within each metric row.
+    for row_axes in axes:
+        ylims = [ax.get_ylim() for ax in row_axes]
+        global_ymin = min(ymin for ymin, _ in ylims)
+        global_ymax = max(ymax for _, ymax in ylims)
+        for ax in row_axes:
+            ax.set_ylim(global_ymin, global_ymax)
 
-    axes[0].set_ylabel("RMSE", fontsize=13)
+    axes[0, 0].set_ylabel(metric_labels["rmse"], fontsize=13)
+    axes[1, 0].set_ylabel(metric_labels["max_abs_diff"], fontsize=13)
 
     # Section 1: T-value lines (colored, with markers)
     handles_T, labels_T = [], []
     seen: set = set()
-    for ax in axes:
+    for ax in axes.flat:
         for h, l in zip(*ax.get_legend_handles_labels()):
             if l not in seen:
                 seen.add(l)

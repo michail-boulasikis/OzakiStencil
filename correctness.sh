@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 # correctness.sh - End-to-end correctness pipeline for ozaki-stencil
 #
-# Usage: ./correctness.sh <stencil1.stc> [stencil2.stc ...]
+# Usage: ./correctness.sh [--skip-refs] [--longer-loops] <stencil1.stc> [stencil2.stc ...]
 #
 # Pipeline:
 #   1. Build check - aborts if any required binary is missing
 #   2. Input tensor generation - one FP128 tensor per dimensionality (1D/2D/3D)
 #   3. CPU reference computation - FP32, FP64, FP80, FP128 for all timesteps
 #   4. GPU Ozaki solver - slices 2..MAX_SLICES, all timesteps, save tensors
-#   5. RMSE computation - Ozaki vs FP128 (slices 5..MAX_SLICES) and
-#                         FP32/FP64/FP80 vs FP128 (for the refs plot)
-#   6. RMSE plot via scripts/plot_rmse.py
+#   5. Error computation - RMSE and maximum absolute difference for Ozaki vs
+#                         FP128 and FP32/FP64/FP80 vs FP128
+#   6. Error plots via scripts/plot_rmse.py
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-readonly TIMESTEPS=(1 10 100 1000)
+readonly BASE_TIMESTEPS=(1 10 100 1000)
 readonly MAX_SLICES=18
 readonly MIN_SLICES=5
 readonly BUILD_BIN="./build/bin"
@@ -33,8 +33,10 @@ readonly PLOT_OUT="${RESULTS_DIR}/correctness_rmse.eps"
 # ---------------------------------------------------------------------------
 usage() {
     cat <<EOF
-Usage: $0 <stencil1.stc> [stencil2.stc ...]
+Usage: $0 [--skip-refs] [--longer-loops] <stencil1.stc> [stencil2.stc ...]
 
+  --skip-refs   Skip CPU reference construction and reuse existing references
+  --longer-loops  Also run the 10000 and 100000 timestep cases
   stencil.stc  One or more stencil specification files
 
 Example:
@@ -43,11 +45,31 @@ EOF
     exit 1
 }
 
-if [[ $# -lt 1 ]]; then
+SKIP_REFS=0
+LONGER_LOOPS=0
+STENCIL_FILES=()
+for arg in "$@"; do
+    case "$arg" in
+        --skip-refs)
+            SKIP_REFS=1
+            ;;
+        --longer-loops)
+            LONGER_LOOPS=1
+            ;;
+        *)
+            STENCIL_FILES+=("$arg")
+            ;;
+    esac
+done
+
+if [[ "${#STENCIL_FILES[@]}" -lt 1 ]]; then
     usage
 fi
 
-STENCIL_FILES=("$@")
+TIMESTEPS=("${BASE_TIMESTEPS[@]}")
+if [[ "$LONGER_LOOPS" -eq 1 ]]; then
+    TIMESTEPS+=(10000 100000)
+fi
 
 # ---------------------------------------------------------------------------
 # Logging helpers
@@ -61,7 +83,11 @@ log_err()  { echo "[$(date '+%H:%M:%S')] ERROR: $*" >&2; }
 # ---------------------------------------------------------------------------
 log "Checking for compiled binaries..."
 NEED_BUILD=0
-for bin in compute-reference run-ozaki compute-errors gen-tensor; do
+REQUIRED_BINS=(run-ozaki compute-errors gen-tensor)
+if [[ "$SKIP_REFS" -eq 0 ]]; then
+    REQUIRED_BINS+=(compute-reference)
+fi
+for bin in "${REQUIRED_BINS[@]}"; do
     if [[ ! -x "${BUILD_BIN}/${bin}" ]]; then
         log "  Missing: ${BUILD_BIN}/${bin}"
         NEED_BUILD=1
@@ -124,21 +150,26 @@ generate_tensor() {
 }
 
 # ---------------------------------------------------------------------------
-# Helper: safe RMSE computation
-# Returns "nan" when a file is missing or compute-errors fails
+# Helper: safe error computation
+# Returns "nan,nan" when a file is missing or compute-errors fails
 # ---------------------------------------------------------------------------
-compute_rmse() {
+compute_errors() {
     local ref="$1" actual="$2"
     if [[ ! -f "$ref" || ! -f "$actual" ]]; then
-        echo "nan"
+        echo "nan,nan"
         return
     fi
     local result
     if result=$("${BUILD_BIN}/compute-errors" -e "$ref" -a "$actual" --scaled 2>/dev/null); then
         # strip trailing whitespace/newlines
-        echo "${result}" | tr -d '[:space:]'
+        result=$(echo "${result}" | tr -d '[:space:]')
+        if [[ "$result" == *,* ]]; then
+            echo "${result}"
+        else
+            echo "nan,nan"
+        fi
     else
-        echo "nan"
+        echo "nan,nan"
     fi
 }
 
@@ -182,8 +213,8 @@ done
 # ---------------------------------------------------------------------------
 log ""
 log "Initialising output CSVs..."
-echo "stencil,T,slices,rmse"     > "${MAIN_CSV}"
-echo "stencil,T,precision,rmse"  > "${REFS_CSV}"
+echo "stencil,T,slices,rmse,max_abs_diff"    > "${MAIN_CSV}"
+echo "stencil,T,precision,rmse,max_abs_diff" > "${REFS_CSV}"
 
 for stencil_file in "${STENCIL_FILES[@]}"; do
     name=$(parse_stencil_name "$stencil_file")
@@ -203,12 +234,16 @@ for stencil_file in "${STENCIL_FILES[@]}"; do
     # ------------------------------------------------------------------
     # 3a: CPU reference — all four precisions, all timesteps, one call
     # ------------------------------------------------------------------
-    log "  [ref] Computing CPU references (fp32 / fp64 / fp80 / fp128)..."
-    "${BUILD_BIN}/compute-reference" \
-        -i  "${tensor_path}" \
-        --stencil-file "${stencil_file}" \
-        -T  "${TIMESTEPS[@]}" \
-        --float --double --longdouble --fp128
+    if [[ "$SKIP_REFS" -eq 0 ]]; then
+        log "  [ref] Computing CPU references (fp32 / fp64 / fp80 / fp128)..."
+        "${BUILD_BIN}/compute-reference" \
+            -i  "${tensor_path}" \
+            --stencil-file "${stencil_file}" \
+            -T  "${TIMESTEPS[@]}" \
+            --float --double --longdouble --fp128
+    else
+        log "  [ref] Skipping CPU reference construction (--skip-refs)."
+    fi
 
     # ------------------------------------------------------------------
     # 3b: GPU Ozaki solver — all timesteps, slices 2..MAX_SLICES, one call
@@ -225,7 +260,7 @@ for stencil_file in "${STENCIL_FILES[@]}"; do
     # ------------------------------------------------------------------
     # 3c: Error computation
     # ------------------------------------------------------------------
-    log "  [errors] Computing RMSE..."
+    log "  [errors] Computing RMSE and maximum absolute difference..."
 
     for T in "${TIMESTEPS[@]}"; do
         ref_fp128="${TENSOR_DIR}/ref_${name}_fp128_${T}.dat"
@@ -238,18 +273,20 @@ for stencil_file in "${STENCIL_FILES[@]}"; do
         # Ozaki vs fp128: slices MIN_SLICES..MAX_SLICES
         for s in $(seq "${MIN_SLICES}" "${MAX_SLICES}"); do
             oz_file="${TENSOR_DIR}/oz_${name}_${T}_${s}.dat"
-            rmse=$(compute_rmse "${ref_fp128}" "${oz_file}")
-            if [[ "$rmse" != "nan" ]]; then
-                printf '%s,%s,%s,%s\n' "${name}" "${T}" "${s}" "${rmse}" >> "${MAIN_CSV}"
+            IFS=',' read -r rmse max_abs_diff < <(compute_errors "${ref_fp128}" "${oz_file}")
+            if [[ "$rmse" != "nan" && "$max_abs_diff" != "nan" ]]; then
+                printf '%s,%s,%s,%s,%s\n' \
+                    "${name}" "${T}" "${s}" "${rmse}" "${max_abs_diff}" >> "${MAIN_CSV}"
             fi
         done
 
         # Precision references vs fp128: float / double / longdouble
         for prec in float double longdouble; do
             ref_prec="${TENSOR_DIR}/ref_${name}_${prec}_${T}.dat"
-            rmse=$(compute_rmse "${ref_fp128}" "${ref_prec}")
-            if [[ "$rmse" != "nan" ]]; then
-                printf '%s,%s,%s,%s\n' "${name}" "${T}" "${prec}" "${rmse}" >> "${REFS_CSV}"
+            IFS=',' read -r rmse max_abs_diff < <(compute_errors "${ref_fp128}" "${ref_prec}")
+            if [[ "$rmse" != "nan" && "$max_abs_diff" != "nan" ]]; then
+                printf '%s,%s,%s,%s,%s\n' \
+                    "${name}" "${T}" "${prec}" "${rmse}" "${max_abs_diff}" >> "${REFS_CSV}"
             fi
         done
 
@@ -263,7 +300,7 @@ done
 # Step 4: Plot
 # ---------------------------------------------------------------------------
 log ""
-log "Generating RMSE plot -> ${PLOT_OUT}"
+log "Generating error plots -> ${PLOT_OUT}"
 python3 scripts/plot_rmse.py "${MAIN_CSV}" \
     --refs   "${REFS_CSV}" \
     --output "${PLOT_OUT}"

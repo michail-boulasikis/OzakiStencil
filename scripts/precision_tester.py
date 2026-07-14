@@ -26,16 +26,15 @@ EXTRA_MSBS = 0
 # Entry: (stencil_shape, label). Dimensionality is len(stencil_shape); the
 # input tensor for that dim is supplied via a positional CLI arg.
 SHAPE_INPUT_PAIRS = [
-    ([5], "1D"),
-    # ([7], "1D"),
-    # ([3, 3], "2D"),
-    # ([5, 5], "2D"),
+    ([3, 3], "2D"),
+    ([5, 5], "2D"),
     ([7, 7], "2D"),
+    ([15, 15], "2D"),
     ([3, 3, 3], "3D"),
-    # ([5, 5, 5], "3D"),
+    ([5, 5, 5], "3D"),
 ]
 
-ERROR_THRESHOLD = 1e-8
+ERROR_THRESHOLD = 1e-29
 
 BUILD_BIN = "./build/bin"
 TENSOR_DIR = "./data/tensors"
@@ -242,7 +241,7 @@ def run_pipeline(name, input_file, input_label, T, algorithm="direct"):
     for i in range(2, max_slices):
         oz_file = f"{TENSOR_DIR}/{oz_prefix}_{name}_{T}_{i}.dat"
 
-        # Step 4: compute-errors, RMSE is printed to stdout
+        # Step 4: compute-errors prints RMSE and max absolute difference to stdout
         err_result = subprocess.run(
             [f"{BUILD_BIN}/compute-errors", "-e", ref_file, "-a", oz_file, "--scaled"],
             capture_output=True,
@@ -256,8 +255,10 @@ def run_pipeline(name, input_file, input_label, T, algorithm="direct"):
             return False, [float("nan")], oz_output
 
         try:
-            error = float(err_result.stdout.strip())
-            errs.append(error)
+            rmse, max_abs_diff = (
+                float(value) for value in err_result.stdout.strip().split(",")
+            )
+            errs.append((rmse, max_abs_diff))
         except ValueError:
             print(
                 f"  [FAIL] compute-errors unparseable output: '{err_result.stdout.strip()}'"
@@ -580,6 +581,7 @@ with _csv_ctx as csvfile, _breach_ctx as breachfile:
                 "result",
                 "n_slices",
                 "rmse",
+                "max_abs_diff",
             ]
         )
 
@@ -611,9 +613,9 @@ with _csv_ctx as csvfile, _breach_ctx as breachfile:
                 stencil_msb_shift = oz_output.split("\n")[0][-1] if oz_output else ""
 
                 if success:
-                    high_error = errs[-1] > ERROR_THRESHOLD
+                    high_error = errs[-1][0] > ERROR_THRESHOLD
                     # Write one CSV row per slice count for plotting.
-                    for i, err in enumerate(errs):
+                    for i, (rmse, max_abs_diff) in enumerate(errs):
                         n_slices = i + 2
                         writer.writerow(
                             [
@@ -624,12 +626,13 @@ with _csv_ctx as csvfile, _breach_ctx as breachfile:
                                 EXTRA_LSBS,
                                 stencil_msb_shift,
                                 "Completed",
-                                "Wrong" if err > ERROR_THRESHOLD else "Correct",
+                                "Wrong" if rmse > ERROR_THRESHOLD else "Correct",
                                 n_slices,
-                                err,
+                                rmse,
+                                max_abs_diff,
                             ]
                         )
-                    print(f"  [OK] error = {errs[-1]:.6e}")
+                    print(f"  [OK] error = {errs[-1][0]:.6e}")
                     if high_error:
                         print(
                             f"  [WARN] error exceeds threshold {ERROR_THRESHOLD:.0e}."
@@ -638,7 +641,10 @@ with _csv_ctx as csvfile, _breach_ctx as breachfile:
                         breachfile.write(f"{T=}\n")
                         breachfile.write(
                             ",\n".join(
-                                [f"\t(S={i + 2} : Err={e})" for i, e in enumerate(errs)]
+                                [
+                                    f"\t(S={i + 2} : RMSE={rmse}, MaxAbsDiff={max_abs_diff})"
+                                    for i, (rmse, max_abs_diff) in enumerate(errs)
+                                ]
                             )
                             + "\n"
                         )
@@ -655,6 +661,7 @@ with _csv_ctx as csvfile, _breach_ctx as breachfile:
                             stencil_msb_shift,
                             "Failed",
                             "N/A",
+                            "",
                             "",
                             "",
                         ]
