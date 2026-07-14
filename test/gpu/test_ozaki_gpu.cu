@@ -4,6 +4,7 @@
 #include <driver_types.h>
 
 #include <ios>
+#include <ozaki/core/device_memory.cuh>
 #include <ozaki/core/stencil.hpp>
 #include <ozaki/gpu/ozi_kernels.cuh>
 #include "../test_utils.hpp"
@@ -62,8 +63,9 @@ public:
   static constexpr uint64_t SEED = 0x123456789;
   static constexpr size_t N_SMALL = 1024;
   static constexpr size_t N = N_SMALL * N_SMALL;
-  T *h_data, *d_data;
-  ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<T>> *d_desc = nullptr;
+  std::vector<T> h_data;
+  core::DeviceArray<T> d_data;
+  core::DeviceArray<ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<T>>> d_desc;
   ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<T>> h_desc;
 
 protected:
@@ -87,19 +89,16 @@ protected:
     using Scalar = T;
 
     datagen();
-    ASSERT_EQ(CUDA_SUCCESS, cudaMemcpy(this->d_data, this->h_data, this->N * sizeof(Scalar), cudaMemcpyHostToDevice));
+    this->d_data.copy_from_host(this->h_data.data(), this->N);
 
-    int8_t *d_slices;
-    ASSERT_EQ(CUDA_SUCCESS,
-              cudaMalloc(&d_slices, (num_slices_max + 1) * this->N * sizeof(int8_t))); // + 1 for the carry slice
+    core::DeviceArray<int8_t> d_slices((num_slices_max + 1) * this->N); // + 1 for the carry slice
 
     h_desc = ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Scalar>>();
     if (dynamic_slicing)
       h_desc.n_slices_input = 0;
     else
       h_desc.n_slices_input = num_slices_max;
-    ASSERT_EQ(CUDA_SUCCESS, cudaMemcpy(d_desc, &h_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Scalar>>),
-                                       cudaMemcpyHostToDevice));
+    this->d_desc.copy_from_host(&h_desc, 1);
 
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
@@ -107,22 +106,19 @@ protected:
     uint32_t nBlocksMap = ((this->N / 4) + nThreadsMap - 1) / nThreadsMap;
     uint32_t nBlocksReduce = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / RDC_THREADS_PER_BLOCK;
 
-    ozigpu::dyn_range<<<nBlocksReduce, RDC_THREADS_PER_BLOCK>>>(this->d_desc, this->d_data, this->N);
+    ozigpu::dyn_range<<<nBlocksReduce, RDC_THREADS_PER_BLOCK>>>(this->d_desc.get(), this->d_data.get(), this->N);
     ozigpu::slice<ozigpu::OzakiFP_Int8<Scalar>>
-        <<<nBlocksMap, nThreadsMap>>>(d_slices, this->d_data, this->d_desc, this->N);
+        <<<nBlocksMap, nThreadsMap>>>(d_slices.get(), this->d_data.get(), this->d_desc.get(), this->N);
     ASSERT_EQ(CUDA_SUCCESS, cudaDeviceSynchronize());
     ozigpu::mend<ozigpu::OzakiFP_Int8<Scalar>>
-        <<<nBlocksMap, nThreadsMap>>>(this->d_data, d_slices, this->d_desc, this->N);
+        <<<nBlocksMap, nThreadsMap>>>(this->d_data.get(), d_slices.get(), this->d_desc.get(), this->N);
     ASSERT_EQ(CUDA_SUCCESS, cudaDeviceSynchronize());
 
-    Scalar *h_op_result = new Scalar[this->N];
-    ASSERT_EQ(CUDA_SUCCESS, cudaMemcpy(h_op_result, this->d_data, this->N * sizeof(Scalar), cudaMemcpyDeviceToHost));
+    std::vector<Scalar> h_op_result(this->N);
+    this->d_data.copy_to_host(h_op_result.data(), this->N);
 
     for (size_t i = 0; i < this->N; ++i)
       ASSERT_EQ(h_op_result[i], this->h_data[i]) << "Iter[" << i << "]";
-
-    delete[] h_op_result;
-    cudaFree(d_slices);
   }
 
   void generate_beta(T *out, size_t size, double a = 0.2, double b = 1.0) {
@@ -149,16 +145,12 @@ protected:
     }
 
     cudaSetDevice(0);
-    h_data = new T[N];
-    cudaMalloc(&d_data, sizeof(T) * N);
-    cudaMalloc(&d_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<T>>));
+    h_data.resize(N);
+    d_data.reset(N);
+    d_desc.reset(1);
   }
 
-  void TearDown() override {
-    delete[] h_data;
-    cudaFree(d_data);
-    cudaFree(d_desc);
-  }
+  void TearDown() override {}
 };
 
 #if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
@@ -172,17 +164,15 @@ TYPED_TEST_SUITE(OzakiTestGPU, TestTypes);
 TYPED_TEST(OzakiTestGPU, ScaleExtraction) {
   using Scalar = TypeParam;
 
-  this->generate_beta(this->h_data, this->N);
-  ASSERT_EQ(CUDA_SUCCESS, cudaMemcpy(this->d_data, this->h_data, this->N * sizeof(Scalar), cudaMemcpyHostToDevice));
+  this->generate_beta(this->h_data.data(), this->N);
+  this->d_data.copy_from_host(this->h_data.data(), this->N);
 
   this->h_desc = ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Scalar>>();
-  ASSERT_EQ(CUDA_SUCCESS,
-            cudaMemcpy(this->d_desc, &this->h_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Scalar>>),
-                       cudaMemcpyHostToDevice));
+  this->d_desc.copy_from_host(&this->h_desc, 1);
   cudaDeviceProp prop;
   cudaGetDeviceProperties(&prop, 0);
   uint32_t nBlocksReduce = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / RDC_THREADS_PER_BLOCK;
-  ozigpu::dyn_range<<<nBlocksReduce, RDC_THREADS_PER_BLOCK>>>(this->d_desc, this->d_data, this->N);
+  ozigpu::dyn_range<<<nBlocksReduce, RDC_THREADS_PER_BLOCK>>>(this->d_desc.get(), this->d_data.get(), this->N);
 
   int32_t hexp_real_max = std::numeric_limits<int32_t>::min();
   for (size_t i = 0; i < this->N; ++i) {
@@ -197,9 +187,7 @@ TYPED_TEST(OzakiTestGPU, ScaleExtraction) {
   }
 
   ASSERT_EQ(CUDA_SUCCESS, cudaDeviceSynchronize());
-  ASSERT_EQ(CUDA_SUCCESS,
-            cudaMemcpy(&this->h_desc, this->d_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Scalar>>),
-                       cudaMemcpyDeviceToHost));
+  this->d_desc.copy_to_host(&this->h_desc, 1);
   ASSERT_EQ(CUDA_SUCCESS, cudaDeviceSynchronize());
   ASSERT_EQ(hexp_real_max, this->h_desc.e_max);
 }
@@ -208,16 +196,16 @@ TYPED_TEST(OzakiTestGPU, SliceAndMendNormal) {
   using Scalar = TypeParam;
   // Test both static and dynamic slicing in a single test
   this->verify_slice_and_mend(get_slice_max_normal<Scalar>(), false,
-                              [this]() { this->generate_normal(this->h_data, this->N); });
+                              [this]() { this->generate_normal(this->h_data.data(), this->N); });
   this->verify_slice_and_mend(get_slice_max_normal<Scalar>(), true,
-                              [this]() { this->generate_normal(this->h_data, this->N); });
+                              [this]() { this->generate_normal(this->h_data.data(), this->N); });
 }
 
 TYPED_TEST(OzakiTestGPU, SliceAndMendBeta) {
   using Scalar = TypeParam;
   // Test both static and dynamic slicing in a single test
   this->verify_slice_and_mend(get_slice_max_beta<Scalar>(), false,
-                              [this]() { this->generate_beta(this->h_data, this->N); });
+                              [this]() { this->generate_beta(this->h_data.data(), this->N); });
   this->verify_slice_and_mend(get_slice_max_beta<Scalar>(), true,
-                              [this]() { this->generate_beta(this->h_data, this->N); });
+                              [this]() { this->generate_beta(this->h_data.data(), this->N); });
 }

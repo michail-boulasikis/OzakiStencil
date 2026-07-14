@@ -2,6 +2,7 @@
 #define HEADER_OZAKI_RUNNER_CUH
 
 #include <ozaki/cpu/ozi.hpp>
+#include <ozaki/core/device_memory.cuh>
 #include <ozaki/gpu/benchmark_utils.cuh>
 #include <ozaki/gpu/gpu_checks.cuh>
 #include <ozaki/gpu/ozi.cuh>
@@ -38,11 +39,11 @@ protected:
   static constexpr size_t STENCIL_BLOCK_DIM_X = 32;
   static constexpr size_t STENCIL_BLOCK_DIM_Y = 16;
 
-  int8_t *d_slices_1 = nullptr, *d_slices_2 = nullptr;
-  ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>> *d_desc = nullptr;
+  core::DeviceArray<int8_t> d_slices_1, d_slices_2;
+  core::DeviceArray<ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>> d_desc;
   ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>> h_desc;
-  Real *d_data = nullptr;
-  AccumulatorType *d_res = nullptr;
+  core::DeviceArray<Real> d_data;
+  core::DeviceArray<AccumulatorType> d_res;
 
   Tensor<Real> host_input;
   int32_t num_slices_total = 0;
@@ -62,23 +63,17 @@ public:
     compute_dynamic_range(extra_msb, extra_lsb);
   }
 
-  virtual ~OzakiRunnerBase() {
-    cudaFree(d_slices_1);
-    cudaFree(d_slices_2);
-    cudaFree(d_desc);
-    cudaFree(d_data);
-    cudaFree(d_res);
-  }
+  virtual ~OzakiRunnerBase() = default;
 
   OzakiRunnerBase(const OzakiRunnerBase &) = delete;
   OzakiRunnerBase &operator=(const OzakiRunnerBase &) = delete;
 
   void allocate_resources() {
     NVTX_PUSH("CUDA Alloc & Upload");
-    CUDA_CHECK(cudaMalloc(&d_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>)));
-    CUDA_CHECK(cudaMalloc(&d_data, n_elems * sizeof(Real)));
-    CUDA_CHECK(cudaMalloc(&d_res, n_elems * sizeof(AccumulatorType)));
-    CUDA_CHECK(cudaMemcpy(d_data, host_input.data.data(), n_elems * sizeof(Real), cudaMemcpyHostToDevice));
+    d_desc.reset(1);
+    d_data.reset(n_elems);
+    d_res.reset(n_elems);
+    d_data.copy_from_host(host_input.data.data(), n_elems);
     NVTX_POP();
   }
 
@@ -88,16 +83,14 @@ public:
     cudaGetDeviceProperties(&prop, 0);
 
     h_desc = ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>();
-    CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>),
-                          cudaMemcpyHostToDevice));
+    d_desc.copy_from_host(&h_desc, 1);
 
     const int32_t nThreads = RDC_THREADS;
     const int32_t nBlocks = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / RDC_THREADS;
 
-    ozigpu::dyn_range<<<nBlocks, nThreads>>>(d_desc, d_data, n_elems);
+    ozigpu::dyn_range<<<nBlocks, nThreads>>>(d_desc.get(), d_data.get(), n_elems);
 
-    CUDA_CHECK(cudaMemcpy(&h_desc, d_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>),
-                          cudaMemcpyDeviceToHost));
+    d_desc.copy_to_host(&h_desc, 1);
 
     h_desc.e_max += extra_msb;
     h_desc.e_min -= extra_lsb;
@@ -107,11 +100,11 @@ public:
 
     h_desc.n_slices_input = num_slices_total;
 
-    CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>),
-                          cudaMemcpyHostToDevice));
+    d_desc.copy_from_host(&h_desc, 1);
 
-    CUDA_CHECK(cudaMalloc(&d_slices_1, num_slices_total * n_elems * sizeof(int8_t) + ozigpu::STENCIL_V1_ALLOC_PAD));
-    CUDA_CHECK(cudaMalloc(&d_slices_2, num_slices_total * n_elems * sizeof(int8_t) + ozigpu::STENCIL_V1_ALLOC_PAD));
+    const size_t slice_allocation = num_slices_total * n_elems + ozigpu::STENCIL_V1_ALLOC_PAD;
+    d_slices_1.reset(slice_allocation);
+    d_slices_2.reset(slice_allocation);
     NVTX_POP();
   }
 
@@ -120,11 +113,11 @@ public:
     const int32_t nThreads = std::min(static_cast<size_t>(RDC_THREADS), n_elems / 4);
     const int32_t nBlocks = ((n_elems / 4) + nThreads - 1) / nThreads;
 
-    ozigpu::slice<ozigpu::OzakiFP_Int8<Real>><<<nBlocks, nThreads>>>(d_slices_1, d_data, d_desc, n_elems);
+    ozigpu::slice<ozigpu::OzakiFP_Int8<Real>>
+        <<<nBlocks, nThreads>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
 
     CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(
-        cudaMemcpy(d_slices_2, d_slices_1, num_slices_total * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+    d_slices_2.copy_from_device(d_slices_1.get(), num_slices_total * n_elems);
     NVTX_POP();
   }
 
@@ -171,8 +164,7 @@ public:
     h_desc.just_shifted = 1;
     h_desc.n_shifts = 0;
 
-    CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>),
-                          cudaMemcpyHostToDevice));
+    d_desc.copy_from_host(&h_desc, 1);
 
     prepare_slices();
     cache_invalidator.invalidate();
@@ -214,7 +206,7 @@ public:
     NVTX_PUSH("Integration Loop");
     for (int32_t t = 0; t < n_iterations; ++t) {
       ozigpu::stencil_v1<ozigpu::OzakiFP_Int8<Real>, M, Dims...>
-          <<<grid, block>>>(d_slices_2, d_slices_1, input_shape, d_desc);
+          <<<grid, block>>>(d_slices_2.get(), d_slices_1.get(), input_shape, d_desc.get());
 
       if (t < n_iterations - 1) {
         // At the penultimate iteration, require ALL shifts so the final
@@ -227,7 +219,7 @@ public:
               std::ceil((t + 1) * log2_sf / 7.0));
         }
         if (min_shifts_now < 0) min_shifts_now = 0;
-        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
+        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), min_shifts_now);
       }
 
       std::swap(d_slices_1, d_slices_2);
@@ -244,23 +236,22 @@ public:
 
     NVTX_PUSH("Mending & Download")
     ozigpu::mend<ozigpu::OzakiFP_Int8<Real>, AccumulatorType>
-        <<<nBlocksMend, nThreadsMend>>>(d_res, d_slices_1, d_desc, n_elems);
-    CUDA_CHECK(cudaMemcpy(&h_desc, d_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>),
-                          cudaMemcpyDeviceToHost));
+        <<<nBlocksMend, nThreadsMend>>>(d_res.get(), d_slices_1.get(), d_desc.get(), n_elems);
+    d_desc.copy_to_host(&h_desc, 1);
 
 #if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
     __float128 factor = ozigpu::total_integration_scale_factor_quad<ozigpu::OzakiFP_Int8<Real>>(
         this->scaling_factor, n_iterations, h_desc.n_shifts);
-    ozigpu::scale<AccumulatorType, __float128><<<nBlocksScale, nThreadsScale>>>(d_res, factor, n_elems);
+    ozigpu::scale<AccumulatorType, __float128><<<nBlocksScale, nThreadsScale>>>(d_res.get(), factor, n_elems);
 #else
     double factor = static_cast<double>(
         ozigpu::total_integration_scale_factor_quad<ozigpu::OzakiFP_Int8<Real>>(
             this->scaling_factor, n_iterations, h_desc.n_shifts));
-    ozigpu::scale<AccumulatorType, double><<<nBlocksScale, nThreadsScale>>>(d_res, factor, n_elems);
+    ozigpu::scale<AccumulatorType, double><<<nBlocksScale, nThreadsScale>>>(d_res.get(), factor, n_elems);
 #endif
 
     std::vector<AccumulatorType> gpu_result(n_elems);
-    CUDA_CHECK(cudaMemcpy(gpu_result.data(), d_res, n_elems * sizeof(AccumulatorType), cudaMemcpyDeviceToHost));
+    d_res.copy_to_host(gpu_result.data(), n_elems);
     NVTX_POP();
 
     if (save_tensors) {
@@ -279,7 +270,7 @@ public:
 template <int32_t M> class OzakiRunnerConvStencil : public OzakiRunnerBase {
   using IntStencilType = ozi::Stencil<int8_t, 7, 7>;
   ozi::StencilSlices<IntStencilType, M> stencil_slices_;
-  int8_t *d_weight = nullptr;
+  core::DeviceArray<int8_t> d_weight;
   ozigpu::convstencil::BoundaryGainData boundary_;
 
 public:
@@ -308,8 +299,8 @@ public:
     ozigpu::convstencil::build_param_matrix<M>(host_weight, flat_coeffs);
 
     // Upload weight matrix to device
-    CUDA_CHECK(cudaMalloc(&d_weight, weight_size));
-    CUDA_CHECK(cudaMemcpy(d_weight, host_weight, weight_size, cudaMemcpyHostToDevice));
+    d_weight.reset(weight_size);
+    d_weight.copy_from_host(host_weight, weight_size);
 
     // Populate boundary gain data
     std::memset(&boundary_, 0, sizeof(boundary_));
@@ -318,7 +309,7 @@ public:
       boundary_.emulated_gain[g] = stencil_slices_.emulated_gain[g];
   }
 
-  ~OzakiRunnerConvStencil() override { cudaFree(d_weight); }
+  ~OzakiRunnerConvStencil() override = default;
 
   std::vector<AccumulatorType> run_experiment(int32_t active_slices, const std::string &output_path,
                                               bool save_tensors) override {
@@ -337,8 +328,7 @@ public:
     h_desc.just_shifted = 1;
     h_desc.n_shifts = 0;
 
-    CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>),
-                          cudaMemcpyHostToDevice));
+    d_desc.copy_from_host(&h_desc, 1);
 
     prepare_slices();
     cache_invalidator.invalidate();
@@ -371,13 +361,13 @@ public:
                            ozigpu::convstencil::DYN_SMEM_BYTES);
 
       ozigpu::convstencil::TmaDescriptorsV2 tma;
-      bool tma_ok = ozigpu::convstencil::create_tma_descriptors_v2(tma, d_slices_1, d_slices_2, total_height, ldm);
+      bool tma_ok = ozigpu::convstencil::create_tma_descriptors_v2(tma, d_slices_1.get(), d_slices_2.get(), total_height, ldm);
       if (!tma_ok)
         throw std::runtime_error("cvstencil requires ldm >= 128 and ldm % 16 == 0");
 
       for (int32_t t = 0; t < n_iterations; ++t) {
         ozigpu::cvstencil_v2<ozigpu::OzakiFP_Int8<Real>, M>
-            <<<grid, block, ozigpu::convstencil::DYN_SMEM_BYTES>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary_, tma.h_main[0]);
+            <<<grid, block, ozigpu::convstencil::DYN_SMEM_BYTES>>>(d_slices_2.get(), d_slices_1.get(), d_weight.get(), ldm, height, d_desc.get(), boundary_, tma.h_main[0]);
 
         if (t < n_iterations - 1) {
           int32_t min_shifts_now;
@@ -387,7 +377,7 @@ public:
             min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
           }
           if (min_shifts_now < 0) min_shifts_now = 0;
-          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
+          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), min_shifts_now);
         }
 
         std::swap(d_slices_1, d_slices_2);
@@ -396,13 +386,13 @@ public:
       tma.free();
     } else {
       ozigpu::convstencil::TmaDescriptors tma;
-      bool tma_ok = ozigpu::convstencil::create_tma_descriptors(tma, d_slices_1, d_slices_2, total_height, ldm);
+      bool tma_ok = ozigpu::convstencil::create_tma_descriptors(tma, d_slices_1.get(), d_slices_2.get(), total_height, ldm);
       if (!tma_ok)
         throw std::runtime_error("cvstencil requires ldm >= 128 and ldm % 16 == 0");
 
       for (int32_t t = 0; t < n_iterations; ++t) {
         ozigpu::cvstencil<ozigpu::OzakiFP_Int8<Real>, M>
-            <<<grid, block>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary_, tma.h_main[0], tma.h_extra[0]);
+            <<<grid, block>>>(d_slices_2.get(), d_slices_1.get(), d_weight.get(), ldm, height, d_desc.get(), boundary_, tma.h_main[0], tma.h_extra[0]);
 
         if (t < n_iterations - 1) {
           int32_t min_shifts_now;
@@ -412,7 +402,7 @@ public:
             min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
           }
           if (min_shifts_now < 0) min_shifts_now = 0;
-          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
+          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), min_shifts_now);
         }
 
         std::swap(d_slices_1, d_slices_2);
@@ -432,23 +422,22 @@ public:
 
     NVTX_PUSH("Mending & Download")
     ozigpu::mend<ozigpu::OzakiFP_Int8<Real>, AccumulatorType>
-        <<<nBlocksMend, nThreadsMend>>>(d_res, d_slices_1, d_desc, n_elems);
-    CUDA_CHECK(cudaMemcpy(&h_desc, d_desc, sizeof(ozigpu::OzakiDescriptor<ozigpu::OzakiFP_Int8<Real>>),
-                          cudaMemcpyDeviceToHost));
+        <<<nBlocksMend, nThreadsMend>>>(d_res.get(), d_slices_1.get(), d_desc.get(), n_elems);
+    d_desc.copy_to_host(&h_desc, 1);
 
 #if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
     __float128 factor = ozigpu::total_integration_scale_factor_quad<ozigpu::OzakiFP_Int8<Real>>(
         this->scaling_factor, n_iterations, h_desc.n_shifts);
-    ozigpu::scale<AccumulatorType, __float128><<<nBlocksScale, nThreadsScale>>>(d_res, factor, n_elems);
+    ozigpu::scale<AccumulatorType, __float128><<<nBlocksScale, nThreadsScale>>>(d_res.get(), factor, n_elems);
 #else
     double factor = static_cast<double>(
         ozigpu::total_integration_scale_factor_quad<ozigpu::OzakiFP_Int8<Real>>(
             this->scaling_factor, n_iterations, h_desc.n_shifts));
-    ozigpu::scale<AccumulatorType, double><<<nBlocksScale, nThreadsScale>>>(d_res, factor, n_elems);
+    ozigpu::scale<AccumulatorType, double><<<nBlocksScale, nThreadsScale>>>(d_res.get(), factor, n_elems);
 #endif
 
     std::vector<AccumulatorType> gpu_result(n_elems);
-    CUDA_CHECK(cudaMemcpy(gpu_result.data(), d_res, n_elems * sizeof(AccumulatorType), cudaMemcpyDeviceToHost));
+    d_res.copy_to_host(gpu_result.data(), n_elems);
     NVTX_POP();
 
     if (save_tensors) {

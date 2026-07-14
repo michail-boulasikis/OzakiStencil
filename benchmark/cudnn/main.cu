@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cudnn.h>
+#include <ozaki/core/device_memory.cuh>
 #include <ozaki/gpu/gpu_checks.cuh>
 #include <string>
 #include <vector>
@@ -45,15 +46,14 @@ int main(int argc, char *argv[]) {
   size_t output_bytes = N * c_out * h_out * w_out * sizeof(double);
   size_t filter_bytes = K * C * R * S * sizeof(double);
 
-  double *d_input, *d_output, *d_filter;
-  CUDA_CHECK(cudaMalloc(&d_input, input_bytes));
-  CUDA_CHECK(cudaMalloc(&d_output, output_bytes));
-  CUDA_CHECK(cudaMalloc(&d_filter, filter_bytes));
+  core::DeviceArray<double> d_input(input_bytes / sizeof(double));
+  core::DeviceArray<double> d_output(output_bytes / sizeof(double));
+  core::DeviceArray<double> d_filter(filter_bytes / sizeof(double));
 
   std::vector<double> h_input(H * W, 1.0);
   std::vector<double> h_filter(R * S, 0.255); // just a random number
-  CUDA_CHECK(cudaMemcpy(d_input, h_input.data(), input_bytes, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_filter, h_filter.data(), filter_bytes, cudaMemcpyHostToDevice));
+  d_input.copy_from_host(h_input.data(), h_input.size());
+  d_filter.copy_from_host(h_filter.data(), h_filter.size());
 
   cudnnConvolutionFwdAlgoPerf_t perf;
   int returnedAlgoCount = 0;
@@ -71,33 +71,27 @@ int main(int argc, char *argv[]) {
   size_t ws_size = 0;
   CUDNN_CHECK(cudnnGetConvolutionForwardWorkspaceSize(cudnn, in_desc, filt_desc, conv_desc, out_desc, algo, &ws_size));
 
-  void *d_workspace = nullptr;
+  core::DeviceArray<std::byte> d_workspace;
   if (ws_size > 0)
-    CUDA_CHECK(cudaMalloc(&d_workspace, ws_size));
+    d_workspace.reset(ws_size);
 
   const double alpha = 1.0f, beta = 0.0f;
 
   // warmup
   for (int i = 0; i < 10; ++i) {
-    CUDNN_CHECK(cudnnConvolutionForward(cudnn, &alpha, in_desc, d_input, filt_desc, d_filter, conv_desc, algo,
-                                        d_workspace, ws_size, &beta, out_desc, d_output));
+    CUDNN_CHECK(cudnnConvolutionForward(cudnn, &alpha, in_desc, d_input.get(), filt_desc, d_filter.get(), conv_desc,
+                                        algo, d_workspace.get(), ws_size, &beta, out_desc, d_output.get()));
     std::swap(d_input, d_output);
   }
 
   NVTX_PUSH("INTEGRATION");
   for (int i = 0; i < iterations; ++i) {
-    CUDNN_CHECK(cudnnConvolutionForward(cudnn, &alpha, in_desc, d_input, filt_desc, d_filter, conv_desc, algo,
-                                        d_workspace, ws_size, &beta, out_desc, d_output));
+    CUDNN_CHECK(cudnnConvolutionForward(cudnn, &alpha, in_desc, d_input.get(), filt_desc, d_filter.get(), conv_desc,
+                                        algo, d_workspace.get(), ws_size, &beta, out_desc, d_output.get()));
     std::swap(d_input, d_output);
   }
   CUDA_CHECK(cudaDeviceSynchronize());
   NVTX_POP();
-
-  if (d_workspace)
-    cudaFree(d_workspace);
-  cudaFree(d_input);
-  cudaFree(d_output);
-  cudaFree(d_filter);
 
   cudnnDestroyTensorDescriptor(in_desc);
   cudnnDestroyTensorDescriptor(out_desc);

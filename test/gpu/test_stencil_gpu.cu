@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 
+#include <ozaki/core/device_memory.cuh>
 #include <ozaki/core/stencil.hpp>
 #include <ozaki/cpu/ozi.hpp>
 #include <ozaki/gpu/gpu_checks.cuh>
@@ -86,11 +87,11 @@ protected:
   static constexpr uint64_t SEED = 0xABCDEF01;
   static constexpr int32_t RDC_THREADS = RDC_THREADS_PER_BLOCK;
 
-  Real *d_data = nullptr;
-  int8_t *d_slices_1 = nullptr, *d_slices_2 = nullptr;
-  ozigpu::OzakiDescriptor<OzPair> *d_desc = nullptr;
+  core::DeviceArray<Real> d_data;
+  core::DeviceArray<int8_t> d_slices_1, d_slices_2;
+  core::DeviceArray<ozigpu::OzakiDescriptor<OzPair>> d_desc;
   ozigpu::OzakiDescriptor<OzPair> h_desc;
-  AccType *d_res = nullptr;
+  core::DeviceArray<AccType> d_res;
 
   size_t n_elems = 0;
   int32_t num_slices_total = 0;
@@ -102,13 +103,7 @@ protected:
     cudaSetDevice(0);
   }
 
-  void TearDown() override {
-    if (d_data)     { cudaFree(d_data);     d_data = nullptr; }
-    if (d_slices_1) { cudaFree(d_slices_1); d_slices_1 = nullptr; }
-    if (d_slices_2) { cudaFree(d_slices_2); d_slices_2 = nullptr; }
-    if (d_desc)     { cudaFree(d_desc);     d_desc = nullptr; }
-    if (d_res)      { cudaFree(d_res);      d_res = nullptr; }
-  }
+  void TearDown() override {}
 
   // --- Data generation ---
 
@@ -127,41 +122,41 @@ protected:
     n_elems = input.size();
     ASSERT_EQ(n_elems % 4, 0u) << "n_elems must be divisible by 4 for vectorized kernels";
 
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_data, n_elems * sizeof(Real)));
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_data, input.data(), n_elems * sizeof(Real), cudaMemcpyHostToDevice));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_desc, sizeof(ozigpu::OzakiDescriptor<OzPair>)));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_res, n_elems * sizeof(AccType)));
+    d_data.reset(n_elems);
+    d_data.copy_from_host(input.data(), n_elems);
+    d_desc.reset(1);
+    d_res.reset(n_elems);
   }
 
   void compute_dynamic_range(int32_t extra_msb = 0, int32_t extra_lsb = 0) {
     h_desc = ozigpu::OzakiDescriptor<OzPair>();
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+    d_desc.copy_from_host(&h_desc, 1);
 
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
     int32_t nBlocks = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / RDC_THREADS;
 
-    ozigpu::dyn_range<<<nBlocks, RDC_THREADS>>>(d_desc, d_data, n_elems);
+    ozigpu::dyn_range<<<nBlocks, RDC_THREADS>>>(d_desc.get(), d_data.get(), n_elems);
     ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(&h_desc, d_desc, sizeof(h_desc), cudaMemcpyDeviceToHost));
+    d_desc.copy_to_host(&h_desc, 1);
 
     h_desc.e_max += extra_msb;
     h_desc.e_min -= extra_lsb;
     num_slices_total = 2 + (h_desc.e_max - h_desc.e_min) / (CHAR_BIT * sizeof(int8_t) - 1);
     h_desc.n_slices_input = num_slices_total;
 
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_slices_1, num_slices_total * n_elems * sizeof(int8_t) + ozigpu::STENCIL_V1_ALLOC_PAD));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&d_slices_2, num_slices_total * n_elems * sizeof(int8_t) + ozigpu::STENCIL_V1_ALLOC_PAD));
+    d_desc.copy_from_host(&h_desc, 1);
+    const size_t slice_allocation = num_slices_total * n_elems + ozigpu::STENCIL_V1_ALLOC_PAD;
+    d_slices_1.reset(slice_allocation);
+    d_slices_2.reset(slice_allocation);
   }
 
   void prepare_slices() {
     int32_t nThreads = std::min(static_cast<size_t>(RDC_THREADS), n_elems / 4);
     int32_t nBlocks = static_cast<int32_t>(((n_elems / 4) + nThreads - 1) / nThreads);
-    ozigpu::slice<OzPair><<<nBlocks, nThreads>>>(d_slices_1, d_data, d_desc, n_elems);
+    ozigpu::slice<OzPair><<<nBlocks, nThreads>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
     ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
-    ASSERT_EQ(cudaSuccess,
-              cudaMemcpy(d_slices_2, d_slices_1, num_slices_total * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+    d_slices_2.copy_from_device(d_slices_1.get(), num_slices_total * n_elems);
   }
 
   // --- Stencil_v1 pipeline helpers ---
@@ -177,7 +172,7 @@ protected:
     h_desc.just_shifted = 1;
     h_desc.n_shifts = 0;
 
-    ASSERT_EQ(cudaSuccess, cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+    d_desc.copy_from_host(&h_desc, 1);
   }
 
   template <int32_t M, size_t... Dims>
@@ -212,7 +207,7 @@ protected:
     ozigpu::upload_slice_phys_lut(num_slices_total);
 
     for (int32_t t = 0; t < timesteps; ++t) {
-      ozigpu::stencil_v1<OzPair, M, Dims...><<<grid, block>>>(d_slices_2, d_slices_1, input_shape, d_desc);
+      ozigpu::stencil_v1<OzPair, M, Dims...><<<grid, block>>>(d_slices_2.get(), d_slices_1.get(), input_shape, d_desc.get());
 
       if (t < timesteps - 1) {
         int32_t min_shifts_now;
@@ -222,7 +217,7 @@ protected:
           min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
         if (min_shifts_now < 0)
           min_shifts_now = 0;
-        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
+        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), min_shifts_now);
       }
       std::swap(d_slices_1, d_slices_2);
     }
@@ -235,22 +230,22 @@ protected:
     int32_t nTScale = static_cast<int32_t>(std::min(static_cast<size_t>(RDC_THREADS), n_elems));
     int32_t nBScale = static_cast<int32_t>((n_elems + nTScale - 1) / nTScale);
 
-    ozigpu::mend<OzPair, AccType><<<nBMend, nTMend>>>(d_res, d_slices_1, d_desc, n_elems);
-    EXPECT_EQ(cudaSuccess, cudaMemcpy(&h_desc, d_desc, sizeof(h_desc), cudaMemcpyDeviceToHost));
+    ozigpu::mend<OzPair, AccType><<<nBMend, nTMend>>>(d_res.get(), d_slices_1.get(), d_desc.get(), n_elems);
+    d_desc.copy_to_host(&h_desc, 1);
 
 #if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
     __float128 factor =
         ozigpu::total_integration_scale_factor_quad<OzPair>(scaling_factor, timesteps, h_desc.n_shifts);
-    ozigpu::scale<AccType, __float128><<<nBScale, nTScale>>>(d_res, factor, n_elems);
+    ozigpu::scale<AccType, __float128><<<nBScale, nTScale>>>(d_res.get(), factor, n_elems);
 #else
     double factor = static_cast<double>(
         ozigpu::total_integration_scale_factor_quad<OzPair>(scaling_factor, timesteps, h_desc.n_shifts));
-    ozigpu::scale<AccType, double><<<nBScale, nTScale>>>(d_res, factor, n_elems);
+    ozigpu::scale<AccType, double><<<nBScale, nTScale>>>(d_res.get(), factor, n_elems);
 #endif
     EXPECT_EQ(cudaSuccess, cudaDeviceSynchronize());
 
     std::vector<AccType> result_q(n_elems);
-    EXPECT_EQ(cudaSuccess, cudaMemcpy(result_q.data(), d_res, n_elems * sizeof(AccType), cudaMemcpyDeviceToHost));
+    d_res.copy_to_host(result_q.data(), n_elems);
 
     std::vector<Real> result(n_elems);
     for (size_t i = 0; i < n_elems; ++i)
@@ -305,9 +300,8 @@ protected:
     int8_t host_weight[weight_size];
     ozigpu::convstencil::build_param_matrix<M>(host_weight, flat_coeffs);
 
-    int8_t *d_weight = nullptr;
-    EXPECT_EQ(cudaSuccess, cudaMalloc(&d_weight, weight_size));
-    EXPECT_EQ(cudaSuccess, cudaMemcpy(d_weight, host_weight, weight_size, cudaMemcpyHostToDevice));
+    core::DeviceArray<int8_t> d_weight(weight_size);
+    d_weight.copy_from_host(host_weight, weight_size);
 
     // Build boundary gain data
     ozigpu::convstencil::BoundaryGainData boundary{};
@@ -332,7 +326,7 @@ protected:
 
     ozigpu::convstencil::TmaDescriptorsV2 tma;
     size_t total_height = static_cast<size_t>(num_slices_total) * height;
-    bool tma_ok = ozigpu::convstencil::create_tma_descriptors_v2(tma, d_slices_1, d_slices_2, total_height, ldm);
+    bool tma_ok = ozigpu::convstencil::create_tma_descriptors_v2(tma, d_slices_1.get(), d_slices_2.get(), total_height, ldm);
     if (!tma_ok)
       throw std::runtime_error("cvstencil requires ldm >= 128 and ldm % 16 == 0; got ldm=" + std::to_string(ldm));
 
@@ -341,7 +335,7 @@ protected:
                          ozigpu::convstencil::DYN_SMEM_BYTES);
 
     for (int32_t t = 0; t < timesteps; ++t) {
-      ozigpu::cvstencil_v2<OzPair, M><<<grid, block, ozigpu::convstencil::DYN_SMEM_BYTES>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.h_main[0]);
+      ozigpu::cvstencil_v2<OzPair, M><<<grid, block, ozigpu::convstencil::DYN_SMEM_BYTES>>>(d_slices_2.get(), d_slices_1.get(), d_weight.get(), ldm, height, d_desc.get(), boundary, tma.h_main[0]);
 
       if (t < timesteps - 1) {
         int32_t min_shifts_now;
@@ -351,7 +345,7 @@ protected:
           min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
         if (min_shifts_now < 0)
           min_shifts_now = 0;
-        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
+        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), min_shifts_now);
       }
       std::swap(d_slices_1, d_slices_2);
       tma.swap();
@@ -359,7 +353,6 @@ protected:
     EXPECT_EQ(cudaSuccess, cudaDeviceSynchronize());
 
     tma.free();
-    cudaFree(d_weight);
     return mend_scale_download(timesteps, scaling_factor);
   }
 };
@@ -378,28 +371,24 @@ TEST_F(StencilGPUTest, Naive_Identity1D) {
   ASSERT_EQ(cudaSuccess, cudaMemcpyToSymbol(ozi::stencil_cmem, &identity, sizeof(identity)));
 
   // Allocate device buffers
-  Real *d_in = nullptr, *d_out = nullptr;
-  ASSERT_EQ(cudaSuccess, cudaMalloc(&d_in, N * sizeof(Real)));
-  ASSERT_EQ(cudaSuccess, cudaMalloc(&d_out, N * sizeof(Real)));
-  ASSERT_EQ(cudaSuccess, cudaMemcpy(d_in, input.data(), N * sizeof(Real), cudaMemcpyHostToDevice));
-  ASSERT_EQ(cudaSuccess, cudaMemset(d_out, 0, N * sizeof(Real)));
+  core::DeviceArray<Real> d_in(N), d_out(N);
+  d_in.copy_from_host(input.data(), N);
+  d_out.zero();
 
   dim3 block(256);
   dim3 grid((N + 255) / 256);
 
   std::array<size_t, 1> shape = {N};
-  ozi::stencil_fp64<3><<<grid, block>>>(d_out, d_in, shape);
+  ozi::stencil_fp64<3><<<grid, block>>>(d_out.get(), d_in.get(), shape);
   ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
 
   std::vector<Real> result(N);
-  ASSERT_EQ(cudaSuccess, cudaMemcpy(result.data(), d_out, N * sizeof(Real), cudaMemcpyDeviceToHost));
+  d_out.copy_to_host(result.data(), N);
 
   // Interior cells should be bit-exact copy
   for (size_t i = identity.offsets[0]; i < N - identity.offsets[0]; ++i)
     EXPECT_EQ(result[i], input[i]) << "Mismatch at " << i;
 
-  cudaFree(d_in);
-  cudaFree(d_out);
 }
 
 TEST_F(StencilGPUTest, Naive_SecondOrderFD1D) {
@@ -409,21 +398,19 @@ TEST_F(StencilGPUTest, Naive_SecondOrderFD1D) {
   ozi::Stencil<Real, 3> d2x({1.0, -2.0, 1.0});
   ASSERT_EQ(cudaSuccess, cudaMemcpyToSymbol(ozi::stencil_cmem, &d2x, sizeof(d2x)));
 
-  Real *d_in = nullptr, *d_out = nullptr;
-  ASSERT_EQ(cudaSuccess, cudaMalloc(&d_in, N * sizeof(Real)));
-  ASSERT_EQ(cudaSuccess, cudaMalloc(&d_out, N * sizeof(Real)));
-  ASSERT_EQ(cudaSuccess, cudaMemcpy(d_in, input.data(), N * sizeof(Real), cudaMemcpyHostToDevice));
-  ASSERT_EQ(cudaSuccess, cudaMemset(d_out, 0, N * sizeof(Real)));
+  core::DeviceArray<Real> d_in(N), d_out(N);
+  d_in.copy_from_host(input.data(), N);
+  d_out.zero();
 
   dim3 block(256);
   dim3 grid((N + 255) / 256);
 
   std::array<size_t, 1> shape = {N};
-  ozi::stencil_fp64<3><<<grid, block>>>(d_out, d_in, shape);
+  ozi::stencil_fp64<3><<<grid, block>>>(d_out.get(), d_in.get(), shape);
   ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
 
   std::vector<Real> gpu_result(N);
-  ASSERT_EQ(cudaSuccess, cudaMemcpy(gpu_result.data(), d_out, N * sizeof(Real), cudaMemcpyDeviceToHost));
+  d_out.copy_to_host(gpu_result.data(), N);
 
   // CPU reference
   std::vector<Real> cpu_result(N, 0.0);
@@ -432,8 +419,6 @@ TEST_F(StencilGPUTest, Naive_SecondOrderFD1D) {
   for (size_t i = d2x.offsets[0]; i < N - d2x.offsets[0]; ++i)
     EXPECT_DOUBLE_EQ(gpu_result[i], cpu_result[i]) << "Mismatch at " << i;
 
-  cudaFree(d_in);
-  cudaFree(d_out);
 }
 
 TEST_F(StencilGPUTest, Naive_Laplace2D) {
@@ -443,21 +428,19 @@ TEST_F(StencilGPUTest, Naive_Laplace2D) {
   ozi::Stencil<Real, 3, 3> laplacian({0, 1, 0, 1, -4, 1, 0, 1, 0});
   ASSERT_EQ(cudaSuccess, cudaMemcpyToSymbol(ozi::stencil_cmem, &laplacian, sizeof(laplacian)));
 
-  Real *d_in = nullptr, *d_out = nullptr;
-  ASSERT_EQ(cudaSuccess, cudaMalloc(&d_in, H * W * sizeof(Real)));
-  ASSERT_EQ(cudaSuccess, cudaMalloc(&d_out, H * W * sizeof(Real)));
-  ASSERT_EQ(cudaSuccess, cudaMemcpy(d_in, input.data(), H * W * sizeof(Real), cudaMemcpyHostToDevice));
-  ASSERT_EQ(cudaSuccess, cudaMemset(d_out, 0, H * W * sizeof(Real)));
+  core::DeviceArray<Real> d_in(H * W), d_out(H * W);
+  d_in.copy_from_host(input.data(), H * W);
+  d_out.zero();
 
   dim3 block(32, 16);
   dim3 grid((W + 31) / 32, (H + 15) / 16);
 
   std::array<size_t, 2> shape = {H, W};
-  ozi::stencil_fp64<3, 3><<<grid, block>>>(d_out, d_in, shape);
+  ozi::stencil_fp64<3, 3><<<grid, block>>>(d_out.get(), d_in.get(), shape);
   ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
 
   std::vector<Real> gpu_result(H * W);
-  ASSERT_EQ(cudaSuccess, cudaMemcpy(gpu_result.data(), d_out, H * W * sizeof(Real), cudaMemcpyDeviceToHost));
+  d_out.copy_to_host(gpu_result.data(), H * W);
 
   std::vector<Real> cpu_result(H * W, 0.0);
   laplacian.template apply_to<Real>(cpu_result, input, shape);
@@ -466,8 +449,6 @@ TEST_F(StencilGPUTest, Naive_Laplace2D) {
       test_utils::interior_relative_rmse<Real, 2>(gpu_result, cpu_result, {H, W}, laplacian.offsets);
   EXPECT_LT(rmse, 1e-14) << "GPU vs CPU RMSE too high for 2D Laplacian";
 
-  cudaFree(d_in);
-  cudaFree(d_out);
 }
 
 TEST_F(StencilGPUTest, Naive_Box3D) {
@@ -479,22 +460,20 @@ TEST_F(StencilGPUTest, Naive_Box3D) {
     c = 1.0 / 27.0;
   ASSERT_EQ(cudaSuccess, cudaMemcpyToSymbol(ozi::stencil_cmem, &box, sizeof(box)));
 
-  Real *d_in = nullptr, *d_out = nullptr;
+  core::DeviceArray<Real> d_in(D * H * W), d_out(D * H * W);
   size_t total = D * H * W;
-  ASSERT_EQ(cudaSuccess, cudaMalloc(&d_in, total * sizeof(Real)));
-  ASSERT_EQ(cudaSuccess, cudaMalloc(&d_out, total * sizeof(Real)));
-  ASSERT_EQ(cudaSuccess, cudaMemcpy(d_in, input.data(), total * sizeof(Real), cudaMemcpyHostToDevice));
-  ASSERT_EQ(cudaSuccess, cudaMemset(d_out, 0, total * sizeof(Real)));
+  d_in.copy_from_host(input.data(), total);
+  d_out.zero();
 
   dim3 block(8, 8, 4);
   dim3 grid((W + 7) / 8, (H + 7) / 8, (D + 3) / 4);
 
   std::array<size_t, 3> shape = {D, H, W};
-  ozi::stencil_fp64<3, 3, 3><<<grid, block>>>(d_out, d_in, shape);
+  ozi::stencil_fp64<3, 3, 3><<<grid, block>>>(d_out.get(), d_in.get(), shape);
   ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
 
   std::vector<Real> gpu_result(total);
-  ASSERT_EQ(cudaSuccess, cudaMemcpy(gpu_result.data(), d_out, total * sizeof(Real), cudaMemcpyDeviceToHost));
+  d_out.copy_to_host(gpu_result.data(), total);
 
   std::vector<Real> cpu_result(total, 0.0);
   box.template apply_to<Real>(cpu_result, input, shape);
@@ -502,8 +481,6 @@ TEST_F(StencilGPUTest, Naive_Box3D) {
   double rmse = test_utils::interior_relative_rmse<Real, 3>(gpu_result, cpu_result, {D, H, W}, box.offsets);
   EXPECT_LT(rmse, 1e-14) << "GPU vs CPU RMSE too high for 3D Box";
 
-  cudaFree(d_in);
-  cudaFree(d_out);
 }
 
 TEST_F(StencilGPUTest, Naive_PolynomialExact2D) {
@@ -518,29 +495,25 @@ TEST_F(StencilGPUTest, Naive_PolynomialExact2D) {
   ozi::Stencil<Real, 3, 3> laplacian({0, 1, 0, 1, -4, 1, 0, 1, 0});
   ASSERT_EQ(cudaSuccess, cudaMemcpyToSymbol(ozi::stencil_cmem, &laplacian, sizeof(laplacian)));
 
-  Real *d_in = nullptr, *d_out = nullptr;
-  ASSERT_EQ(cudaSuccess, cudaMalloc(&d_in, H * W * sizeof(Real)));
-  ASSERT_EQ(cudaSuccess, cudaMalloc(&d_out, H * W * sizeof(Real)));
-  ASSERT_EQ(cudaSuccess, cudaMemcpy(d_in, input.data(), H * W * sizeof(Real), cudaMemcpyHostToDevice));
-  ASSERT_EQ(cudaSuccess, cudaMemset(d_out, 0, H * W * sizeof(Real)));
+  core::DeviceArray<Real> d_in(H * W), d_out(H * W);
+  d_in.copy_from_host(input.data(), H * W);
+  d_out.zero();
 
   dim3 block(32, 16);
   dim3 grid((W + 31) / 32, (H + 15) / 16);
 
   std::array<size_t, 2> shape = {H, W};
-  ozi::stencil_fp64<3, 3><<<grid, block>>>(d_out, d_in, shape);
+  ozi::stencil_fp64<3, 3><<<grid, block>>>(d_out.get(), d_in.get(), shape);
   ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
 
   std::vector<Real> result(H * W);
-  ASSERT_EQ(cudaSuccess, cudaMemcpy(result.data(), d_out, H * W * sizeof(Real), cudaMemcpyDeviceToHost));
+  d_out.copy_to_host(result.data(), H * W);
 
   // Interior cells should be exactly 4.0 (d2u/dx2 + d2u/dy2 = 2 + 2 = 4, grid spacing h=1)
   for (size_t r = 1; r < H - 1; ++r)
     for (size_t c = 1; c < W - 1; ++c)
       EXPECT_DOUBLE_EQ(result[r * W + c], 4.0) << "At (" << r << "," << c << ")";
 
-  cudaFree(d_in);
-  cudaFree(d_out);
 }
 
 // ============================================================

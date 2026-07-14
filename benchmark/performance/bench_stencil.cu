@@ -1,4 +1,5 @@
 #include <ozaki/cpu/ozi.hpp>
+#include <ozaki/core/device_memory.cuh>
 #include <ozaki/gpu/benchmark_utils.cuh>
 #include <ozaki/gpu/gpu_checks.cuh>
 #include <ozaki/gpu/ozi.cuh>
@@ -204,9 +205,7 @@ PhaseTimings bench_naive(const ozi::Stencil<CoeffStorageType, Dims...> &coeff_st
     h_stencil.coeffs[i] = static_cast<FPType>(coeff_stencil.coeffs[i]);
 
   // Allocate device memory
-  FPType *d_in = nullptr, *d_out = nullptr;
-  CUDA_CHECK(cudaMalloc(&d_in, n_elems * sizeof(FPType)));
-  CUDA_CHECK(cudaMalloc(&d_out, n_elems * sizeof(FPType)));
+  core::DeviceArray<FPType> d_in(n_elems), d_out(n_elems);
   CUDA_CHECK(cudaMemcpyToSymbol(ozi::stencil_cmem, &h_stencil, sizeof(h_stencil)));
 
   // Generate random data on host and upload
@@ -215,8 +214,8 @@ PhaseTimings bench_naive(const ozi::Stencil<CoeffStorageType, Dims...> &coeff_st
   std::uniform_real_distribution<double> dist(-1.0, 1.0);
   for (size_t i = 0; i < n_elems; ++i)
     h_data[i] = static_cast<FPType>(dist(rng));
-  CUDA_CHECK(cudaMemcpy(d_in, h_data.data(), n_elems * sizeof(FPType), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemset(d_out, 0, n_elems * sizeof(FPType)));
+  d_in.copy_from_host(h_data.data(), n_elems);
+  d_out.zero();
 
   const dim3 *blk_ptr = (cfg.block_size.x > 0) ? &cfg.block_size : nullptr;
   auto [grid, block] = make_grid_block<ndims>(shape, blk_ptr);
@@ -231,7 +230,7 @@ PhaseTimings bench_naive(const ozi::Stencil<CoeffStorageType, Dims...> &coeff_st
 
   for (int32_t r = 0; r < cfg.repeats; ++r) {
     // Re-upload data for each repeat to get a clean state
-    CUDA_CHECK(cudaMemcpy(d_in, h_data.data(), n_elems * sizeof(FPType), cudaMemcpyHostToDevice));
+    d_in.copy_from_host(h_data.data(), n_elems);
 
     if (cfg.flush_l2)
       cache_inv.invalidate();
@@ -239,7 +238,7 @@ PhaseTimings bench_naive(const ozi::Stencil<CoeffStorageType, Dims...> &coeff_st
     // Warmup
     NVTX_PUSH("Warmup");
     for (int32_t t = 0; t < cfg.warmup; ++t) {
-      launch_naive_kernel<FPType, Dims...>(d_out, d_in, input_shape, grid, block);
+      launch_naive_kernel<FPType, Dims...>(d_out.get(), d_in.get(), input_shape, grid, block);
       CUDA_CHECK(cudaGetLastError());
       std::swap(d_in, d_out);
     }
@@ -254,7 +253,7 @@ PhaseTimings bench_naive(const ozi::Stencil<CoeffStorageType, Dims...> &coeff_st
     NVTX_PUSH("Integration");
     ev.record_start();
     for (int32_t t = 0; t < cfg.timesteps; ++t) {
-      launch_naive_kernel<FPType, Dims...>(d_out, d_in, input_shape, grid, block);
+      launch_naive_kernel<FPType, Dims...>(d_out.get(), d_in.get(), input_shape, grid, block);
       CUDA_CHECK(cudaGetLastError());
       std::swap(d_in, d_out);
     }
@@ -266,8 +265,6 @@ PhaseTimings bench_naive(const ozi::Stencil<CoeffStorageType, Dims...> &coeff_st
 
   NVTX_POP(); // label
 
-  cudaFree(d_in);
-  cudaFree(d_out);
   return result;
 }
 
@@ -288,13 +285,10 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
   NVTX_PUSH(nvtx_label.c_str());
 
   // Allocate device resources
-  Real *d_data = nullptr;
-  int8_t *d_slices_1 = nullptr, *d_slices_2 = nullptr;
-  ozigpu::OzakiDescriptor<Oz> *d_desc = nullptr;
+  core::DeviceArray<Real> d_data(n_elems);
+  core::DeviceArray<int8_t> d_slices_1, d_slices_2;
+  core::DeviceArray<ozigpu::OzakiDescriptor<Oz>> d_desc(1);
   ozigpu::OzakiDescriptor<Oz> h_desc;
-
-  CUDA_CHECK(cudaMalloc(&d_desc, sizeof(ozigpu::OzakiDescriptor<Oz>)));
-  CUDA_CHECK(cudaMalloc(&d_data, n_elems * sizeof(Real)));
 
   // Upload random data
   std::vector<Real> h_data(n_elems);
@@ -302,7 +296,7 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
   std::uniform_real_distribution<double> dist(-1.0, 1.0);
   for (size_t i = 0; i < n_elems; ++i)
     h_data[i] = dist(rng);
-  CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n_elems * sizeof(Real), cudaMemcpyHostToDevice));
+  d_data.copy_from_host(h_data.data(), n_elems);
 
   PhaseTimings result;
   CudaEventPair ev_phase;
@@ -316,24 +310,24 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
   // Warmup
   if (cfg.warmup > 0) {
     h_desc = ozigpu::OzakiDescriptor<Oz>();
-    CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
-    ozigpu::dyn_range<Oz><<<nBlocksDR, RDC_THREADS>>>(d_desc, d_data, n_elems);
+    d_desc.copy_from_host(&h_desc, 1);
+    ozigpu::dyn_range<Oz><<<nBlocksDR, RDC_THREADS>>>(d_desc.get(), d_data.get(), n_elems);
     CUDA_CHECK(cudaDeviceSynchronize());
   }
 
   // Measured repeats
   for (int32_t r = 0; r < cfg.repeats; ++r) {
     h_desc = ozigpu::OzakiDescriptor<Oz>();
-    CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+    d_desc.copy_from_host(&h_desc, 1);
     ev_phase.record_start();
-    ozigpu::dyn_range<Oz><<<nBlocksDR, RDC_THREADS>>>(d_desc, d_data, n_elems);
+    ozigpu::dyn_range<Oz><<<nBlocksDR, RDC_THREADS>>>(d_desc.get(), d_data.get(), n_elems);
     ev_phase.record_stop();
     result.dyn_range_ms.push_back(ev_phase.elapsed_ms());
   }
   NVTX_POP();
 
   // Download descriptor from last repeat and compute actual slice count
-  CUDA_CHECK(cudaMemcpy(&h_desc, d_desc, sizeof(h_desc), cudaMemcpyDeviceToHost));
+  d_desc.copy_to_host(&h_desc, 1);
   h_desc.e_max += cfg.extra_msb;
   h_desc.e_min -= cfg.extra_lsb;
 
@@ -345,10 +339,11 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
   }
 
   h_desc.n_slices_input = actual_slices;
-  CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+  d_desc.copy_from_host(&h_desc, 1);
 
-  CUDA_CHECK(cudaMalloc(&d_slices_1, actual_slices * n_elems * sizeof(int8_t) + ozigpu::STENCIL_V1_ALLOC_PAD));
-  CUDA_CHECK(cudaMalloc(&d_slices_2, actual_slices * n_elems * sizeof(int8_t) + ozigpu::STENCIL_V1_ALLOC_PAD));
+  const size_t slice_allocation = actual_slices * n_elems + ozigpu::STENCIL_V1_ALLOC_PAD;
+  d_slices_1.reset(slice_allocation);
+  d_slices_2.reset(slice_allocation);
 
   // -- Slice (with warmup + repetition; D2D copy excluded from timing) --
   NVTX_PUSH("Slice");
@@ -357,21 +352,21 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
 
   // Warmup
   if (cfg.warmup > 0) {
-    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
+    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
     CUDA_CHECK(cudaDeviceSynchronize());
   }
 
   // Measured repeats
   for (int32_t r = 0; r < cfg.repeats; ++r) {
     ev_phase.record_start();
-    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
+    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
     ev_phase.record_stop();
     result.slice_ms.push_back(ev_phase.elapsed_ms());
   }
 
   // Set up ping-pong buffer (not part of slice timing - benchmark infrastructure)
   CUDA_CHECK(cudaDeviceSynchronize());
-  CUDA_CHECK(cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+  d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
   NVTX_POP();
 
   // Compute overflow threshold
@@ -393,7 +388,7 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
 
   for (int32_t r = 0; r < cfg.repeats; ++r) {
     // Reset state for each repeat
-    CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n_elems * sizeof(Real), cudaMemcpyHostToDevice));
+    d_data.copy_from_host(h_data.data(), n_elems);
 
     h_desc.n_slices_input = actual_slices;
     h_desc.shift_required = 0;
@@ -401,12 +396,12 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
     h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
     h_desc.just_shifted = 1;
     h_desc.n_shifts = 0;
-    CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+    d_desc.copy_from_host(&h_desc, 1);
 
     // Re-slice
-    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
+    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
     CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+    d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
 
     if (cfg.flush_l2)
       cache_inv.invalidate();
@@ -419,9 +414,9 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
     if (cfg.warmup > 0) {
       NVTX_PUSH("Warmup");
       for (int32_t t = 0; t < cfg.warmup; ++t) {
-        ozigpu::stencil_v1<Oz, M, Dims...><<<grid, block>>>(d_slices_2, d_slices_1, input_shape, d_desc);
+        ozigpu::stencil_v1<Oz, M, Dims...><<<grid, block>>>(d_slices_2.get(), d_slices_1.get(), input_shape, d_desc.get());
         if (t < cfg.warmup - 1)
-          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, 0);
+          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), 0);
         std::swap(d_slices_1, d_slices_2);
       }
       CUDA_CHECK(cudaDeviceSynchronize());
@@ -434,13 +429,12 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
       h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
       h_desc.just_shifted = 1;
       h_desc.n_shifts = 0;
-      CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+      d_desc.copy_from_host(&h_desc, 1);
 
       // Re-slice again for clean measurement
-      ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
+      ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
       CUDA_CHECK(cudaDeviceSynchronize());
-      CUDA_CHECK(
-          cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+      d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
     }
 
     if (cfg.flush_l2)
@@ -451,7 +445,7 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
     NVTX_PUSH("Integration");
     ev.record_start();
     for (int32_t t = 0; t < cfg.timesteps; ++t) {
-      ozigpu::stencil_v1<Oz, M, Dims...><<<grid, block>>>(d_slices_2, d_slices_1, input_shape, d_desc);
+      ozigpu::stencil_v1<Oz, M, Dims...><<<grid, block>>>(d_slices_2.get(), d_slices_1.get(), input_shape, d_desc.get());
       if (t < cfg.timesteps - 1) {
         int32_t min_shifts_now;
         if (t == cfg.timesteps - 2)
@@ -460,7 +454,7 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
           min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
         if (min_shifts_now < 0)
           min_shifts_now = 0;
-        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
+        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), min_shifts_now);
       }
       std::swap(d_slices_1, d_slices_2);
     }
@@ -477,14 +471,14 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
 
   // Warmup
   if (cfg.warmup > 0) {
-    ozigpu::mend<Oz><<<nBlocksMend, nThreadsMend>>>(d_data, d_slices_1, d_desc, n_elems);
+    ozigpu::mend<Oz><<<nBlocksMend, nThreadsMend>>>(d_data.get(), d_slices_1.get(), d_desc.get(), n_elems);
     CUDA_CHECK(cudaDeviceSynchronize());
   }
 
   // Measured repeats (mend reads slices+desc without modifying them, so repeats are safe)
   for (int32_t r = 0; r < cfg.repeats; ++r) {
     ev_phase.record_start();
-    ozigpu::mend<Oz><<<nBlocksMend, nThreadsMend>>>(d_data, d_slices_1, d_desc, n_elems);
+    ozigpu::mend<Oz><<<nBlocksMend, nThreadsMend>>>(d_data.get(), d_slices_1.get(), d_desc.get(), n_elems);
     ev_phase.record_stop();
     result.mend_ms.push_back(ev_phase.elapsed_ms());
   }
@@ -492,10 +486,6 @@ PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Di
 
   NVTX_POP(); // nvtx_label
 
-  cudaFree(d_data);
-  cudaFree(d_slices_1);
-  cudaFree(d_slices_2);
-  cudaFree(d_desc);
   return result;
 }
 
@@ -515,17 +505,14 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
   NVTX_PUSH(nvtx_label.c_str());
 
   // Allocate device resources
-  Real *d_data = nullptr;
-  int8_t *d_slices_1 = nullptr, *d_slices_2 = nullptr, *d_weight = nullptr;
-  ozigpu::OzakiDescriptor<Oz> *d_desc = nullptr;
+  core::DeviceArray<Real> d_data(n_elems);
+  core::DeviceArray<int8_t> d_slices_1, d_slices_2, d_weight;
+  core::DeviceArray<ozigpu::OzakiDescriptor<Oz>> d_desc(1);
   ozigpu::OzakiDescriptor<Oz> h_desc;
 
-  CUDA_CHECK(cudaMalloc(&d_desc, sizeof(ozigpu::OzakiDescriptor<Oz>)));
-  CUDA_CHECK(cudaMalloc(&d_data, n_elems * sizeof(Real)));
-
   constexpr size_t weight_size = M * 2 * ozigpu::convstencil::WT_SIZE;
-  CUDA_CHECK(cudaMalloc(&d_weight, weight_size));
-  CUDA_CHECK(cudaMemcpy(d_weight, host_weight, weight_size, cudaMemcpyHostToDevice));
+  d_weight.reset(weight_size);
+  d_weight.copy_from_host(host_weight, weight_size);
 
   // Upload random data
   std::vector<Real> h_data(n_elems);
@@ -533,7 +520,7 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
   std::uniform_real_distribution<double> dist(-1.0, 1.0);
   for (size_t i = 0; i < n_elems; ++i)
     h_data[i] = dist(rng);
-  CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n_elems * sizeof(Real), cudaMemcpyHostToDevice));
+  d_data.copy_from_host(h_data.data(), n_elems);
 
   PhaseTimings result;
   CudaEventPair ev_phase;
@@ -547,24 +534,24 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
   // Warmup
   if (cfg.warmup > 0) {
     h_desc = ozigpu::OzakiDescriptor<Oz>();
-    CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
-    ozigpu::dyn_range<Oz><<<nBlocksDR, RDC_THREADS>>>(d_desc, d_data, n_elems);
+    d_desc.copy_from_host(&h_desc, 1);
+    ozigpu::dyn_range<Oz><<<nBlocksDR, RDC_THREADS>>>(d_desc.get(), d_data.get(), n_elems);
     CUDA_CHECK(cudaDeviceSynchronize());
   }
 
   // Measured repeats
   for (int32_t r = 0; r < cfg.repeats; ++r) {
     h_desc = ozigpu::OzakiDescriptor<Oz>();
-    CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+    d_desc.copy_from_host(&h_desc, 1);
     ev_phase.record_start();
-    ozigpu::dyn_range<Oz><<<nBlocksDR, RDC_THREADS>>>(d_desc, d_data, n_elems);
+    ozigpu::dyn_range<Oz><<<nBlocksDR, RDC_THREADS>>>(d_desc.get(), d_data.get(), n_elems);
     ev_phase.record_stop();
     result.dyn_range_ms.push_back(ev_phase.elapsed_ms());
   }
   NVTX_POP();
 
   // Download descriptor from last repeat and compute slice count
-  CUDA_CHECK(cudaMemcpy(&h_desc, d_desc, sizeof(h_desc), cudaMemcpyDeviceToHost));
+  d_desc.copy_to_host(&h_desc, 1);
   h_desc.e_max += cfg.extra_msb;
   h_desc.e_min -= cfg.extra_lsb;
 
@@ -576,10 +563,11 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
   }
 
   h_desc.n_slices_input = actual_slices;
-  CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+  d_desc.copy_from_host(&h_desc, 1);
 
-  CUDA_CHECK(cudaMalloc(&d_slices_1, actual_slices * n_elems * sizeof(int8_t) + ozigpu::STENCIL_V1_ALLOC_PAD));
-  CUDA_CHECK(cudaMalloc(&d_slices_2, actual_slices * n_elems * sizeof(int8_t) + ozigpu::STENCIL_V1_ALLOC_PAD));
+  const size_t slice_allocation = actual_slices * n_elems + ozigpu::STENCIL_V1_ALLOC_PAD;
+  d_slices_1.reset(slice_allocation);
+  d_slices_2.reset(slice_allocation);
 
   // -- Slice (with warmup + repetition; D2D copy excluded from timing) --
   NVTX_PUSH("Slice");
@@ -588,21 +576,21 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
 
   // Warmup
   if (cfg.warmup > 0) {
-    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
+    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
     CUDA_CHECK(cudaDeviceSynchronize());
   }
 
   // Measured repeats
   for (int32_t r = 0; r < cfg.repeats; ++r) {
     ev_phase.record_start();
-    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
+    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
     ev_phase.record_stop();
     result.slice_ms.push_back(ev_phase.elapsed_ms());
   }
 
   // Set up ping-pong buffer (not part of slice timing -- benchmark infrastructure)
   CUDA_CHECK(cudaDeviceSynchronize());
-  CUDA_CHECK(cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+  d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
   NVTX_POP();
 
   // Compute overflow threshold
@@ -629,14 +617,14 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
                          ozigpu::convstencil::DYN_SMEM_BYTES);
 
     ozigpu::convstencil::TmaDescriptorsV2 tma;
-    bool tma_ok = ozigpu::convstencil::create_tma_descriptors_v2(tma, d_slices_1, d_slices_2, total_height, ldm);
+    bool tma_ok = ozigpu::convstencil::create_tma_descriptors_v2(tma, d_slices_1.get(), d_slices_2.get(), total_height, ldm);
     if (!tma_ok) {
       std::cerr << "Skipping cvstencil: TMA requires ldm >= 128 and ldm % 16 == 0\n";
       return {};
     }
 
     for (int32_t r = 0; r < cfg.repeats; ++r) {
-      CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n_elems * sizeof(Real), cudaMemcpyHostToDevice));
+      d_data.copy_from_host(h_data.data(), n_elems);
 
       h_desc.n_slices_input = actual_slices;
       h_desc.shift_required = 0;
@@ -644,12 +632,11 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
       h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
       h_desc.just_shifted = 1;
       h_desc.n_shifts = 0;
-      CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+      d_desc.copy_from_host(&h_desc, 1);
 
-      ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
+      ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
       CUDA_CHECK(cudaDeviceSynchronize());
-      CUDA_CHECK(
-          cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+      d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
 
       ozigpu::upload_slice_phys_lut(actual_slices);
 
@@ -660,9 +647,9 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
         NVTX_PUSH("Warmup");
         for (int32_t t = 0; t < cfg.warmup; ++t) {
           ozigpu::cvstencil_v2<Oz, M><<<grid_cv, block_cv, ozigpu::convstencil::DYN_SMEM_BYTES>>>(
-              d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.h_main[0]);
+              d_slices_2.get(), d_slices_1.get(), d_weight.get(), ldm, height, d_desc.get(), boundary, tma.h_main[0]);
           if (t < cfg.warmup - 1)
-            ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, 0);
+            ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), 0);
           std::swap(d_slices_1, d_slices_2);
           tma.swap();
         }
@@ -675,12 +662,11 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
         h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
         h_desc.just_shifted = 1;
         h_desc.n_shifts = 0;
-        CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+        d_desc.copy_from_host(&h_desc, 1);
 
-        ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
+        ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
         CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(
-            cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+        d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
       }
 
       if (cfg.flush_l2)
@@ -691,7 +677,7 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
       ev.record_start();
       for (int32_t t = 0; t < cfg.timesteps; ++t) {
         ozigpu::cvstencil_v2<Oz, M><<<grid_cv, block_cv, ozigpu::convstencil::DYN_SMEM_BYTES>>>(
-            d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary, tma.h_main[0]);
+            d_slices_2.get(), d_slices_1.get(), d_weight.get(), ldm, height, d_desc.get(), boundary, tma.h_main[0]);
         if (t < cfg.timesteps - 1) {
           int32_t min_shifts_now;
           if (t == cfg.timesteps - 2)
@@ -700,7 +686,7 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
             min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
           if (min_shifts_now < 0)
             min_shifts_now = 0;
-          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
+          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), min_shifts_now);
         }
         std::swap(d_slices_1, d_slices_2);
         tma.swap();
@@ -714,14 +700,14 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
     tma.free();
   } else {
     ozigpu::convstencil::TmaDescriptors tma;
-    bool tma_ok = ozigpu::convstencil::create_tma_descriptors(tma, d_slices_1, d_slices_2, total_height, ldm);
+    bool tma_ok = ozigpu::convstencil::create_tma_descriptors(tma, d_slices_1.get(), d_slices_2.get(), total_height, ldm);
     if (!tma_ok) {
       std::cerr << "Skipping cvstencil: TMA requires ldm >= 128 and ldm % 16 == 0\n";
       return {};
     }
 
     for (int32_t r = 0; r < cfg.repeats; ++r) {
-      CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n_elems * sizeof(Real), cudaMemcpyHostToDevice));
+      d_data.copy_from_host(h_data.data(), n_elems);
 
       h_desc.n_slices_input = actual_slices;
       h_desc.shift_required = 0;
@@ -729,12 +715,11 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
       h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
       h_desc.just_shifted = 1;
       h_desc.n_shifts = 0;
-      CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+      d_desc.copy_from_host(&h_desc, 1);
 
-      ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
+      ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
       CUDA_CHECK(cudaDeviceSynchronize());
-      CUDA_CHECK(
-          cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+      d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
 
       ozigpu::upload_slice_phys_lut(actual_slices);
 
@@ -744,10 +729,10 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
       if (cfg.warmup > 0) {
         NVTX_PUSH("Warmup");
         for (int32_t t = 0; t < cfg.warmup; ++t) {
-          ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc,
+          ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(d_slices_2.get(), d_slices_1.get(), d_weight.get(), ldm, height, d_desc.get(),
                                                           boundary, tma.h_main[0], tma.h_extra[0]);
           if (t < cfg.warmup - 1)
-            ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, 0);
+            ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), 0);
           std::swap(d_slices_1, d_slices_2);
           tma.swap();
         }
@@ -760,12 +745,11 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
         h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
         h_desc.just_shifted = 1;
         h_desc.n_shifts = 0;
-        CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+        d_desc.copy_from_host(&h_desc, 1);
 
-        ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1, d_data, d_desc, n_elems);
+        ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
         CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(
-            cudaMemcpy(d_slices_2, d_slices_1, actual_slices * n_elems * sizeof(int8_t), cudaMemcpyDeviceToDevice));
+        d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
       }
 
       if (cfg.flush_l2)
@@ -775,7 +759,7 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
       NVTX_PUSH("Integration");
       ev.record_start();
       for (int32_t t = 0; t < cfg.timesteps; ++t) {
-        ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(d_slices_2, d_slices_1, d_weight, ldm, height, d_desc, boundary,
+        ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(d_slices_2.get(), d_slices_1.get(), d_weight.get(), ldm, height, d_desc.get(), boundary,
                                                         tma.h_main[0], tma.h_extra[0]);
         if (t < cfg.timesteps - 1) {
           int32_t min_shifts_now;
@@ -785,7 +769,7 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
             min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
           if (min_shifts_now < 0)
             min_shifts_now = 0;
-          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc, min_shifts_now);
+          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), min_shifts_now);
         }
         std::swap(d_slices_1, d_slices_2);
         tma.swap();
@@ -806,14 +790,14 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
 
   // Warmup
   if (cfg.warmup > 0) {
-    ozigpu::mend<Oz><<<nBlocksMend, nThreadsMend>>>(d_data, d_slices_1, d_desc, n_elems);
+    ozigpu::mend<Oz><<<nBlocksMend, nThreadsMend>>>(d_data.get(), d_slices_1.get(), d_desc.get(), n_elems);
     CUDA_CHECK(cudaDeviceSynchronize());
   }
 
   // Measured repeats (mend reads slices+desc without modifying them, so repeats are safe)
   for (int32_t r = 0; r < cfg.repeats; ++r) {
     ev_phase.record_start();
-    ozigpu::mend<Oz><<<nBlocksMend, nThreadsMend>>>(d_data, d_slices_1, d_desc, n_elems);
+    ozigpu::mend<Oz><<<nBlocksMend, nThreadsMend>>>(d_data.get(), d_slices_1.get(), d_desc.get(), n_elems);
     ev_phase.record_stop();
     result.mend_ms.push_back(ev_phase.elapsed_ms());
   }
@@ -821,11 +805,6 @@ PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7
 
   NVTX_POP(); // nvtx_label
 
-  cudaFree(d_data);
-  cudaFree(d_slices_1);
-  cudaFree(d_slices_2);
-  cudaFree(d_weight);
-  cudaFree(d_desc);
   return result;
 }
 
@@ -1010,29 +989,25 @@ static int32_t compute_actual_slices(const std::vector<size_t> &shape, const Ben
   for (size_t i = 0; i < n_elems; ++i)
     h_data[i] = dist(rng);
 
-  Real *d_data = nullptr;
-  ozigpu::OzakiDescriptor<Oz> *d_desc = nullptr;
+  core::DeviceArray<Real> d_data(n_elems);
+  core::DeviceArray<ozigpu::OzakiDescriptor<Oz>> d_desc(1);
   ozigpu::OzakiDescriptor<Oz> h_desc;
-  CUDA_CHECK(cudaMalloc(&d_data, n_elems * sizeof(Real)));
-  CUDA_CHECK(cudaMalloc(&d_desc, sizeof(h_desc)));
-  CUDA_CHECK(cudaMemcpy(d_data, h_data.data(), n_elems * sizeof(Real), cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_desc, &h_desc, sizeof(h_desc), cudaMemcpyHostToDevice));
+  d_data.copy_from_host(h_data.data(), n_elems);
+  d_desc.copy_from_host(&h_desc, 1);
 
   cudaDeviceProp prop;
   cudaGetDeviceProperties(&prop, 0);
   const int32_t nBlocks = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / RDC_THREADS;
 
-  ozigpu::dyn_range<Oz><<<nBlocks, RDC_THREADS>>>(d_desc, d_data, n_elems);
+  ozigpu::dyn_range<Oz><<<nBlocks, RDC_THREADS>>>(d_desc.get(), d_data.get(), n_elems);
   CUDA_CHECK(cudaDeviceSynchronize());
 
-  CUDA_CHECK(cudaMemcpy(&h_desc, d_desc, sizeof(h_desc), cudaMemcpyDeviceToHost));
+  d_desc.copy_to_host(&h_desc, 1);
   h_desc.e_max += cfg.extra_msb;
   h_desc.e_min -= cfg.extra_lsb;
 
   int32_t actual = 2 + (h_desc.e_max - h_desc.e_min) / (CHAR_BIT * sizeof(int8_t) - 1);
 
-  cudaFree(d_data);
-  cudaFree(d_desc);
   return actual;
 }
 

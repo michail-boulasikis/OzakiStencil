@@ -1,6 +1,7 @@
 #ifndef HEADER_BENCHMARK_UTILS_CUH
 #define HEADER_BENCHMARK_UTILS_CUH
 
+#include <ozaki/core/device_memory.cuh>
 #include "gpu_checks.cuh"
 
 #include <cstddef>
@@ -10,7 +11,7 @@
 namespace ozigpu {
 
 struct L2CacheInvalidator {
-  int32_t *d_buffer = nullptr;
+  core::DeviceArray<std::byte> d_buffer;
   size_t buffer_size = 0;
 
   L2CacheInvalidator() {
@@ -19,17 +20,15 @@ struct L2CacheInvalidator {
     CUDA_CHECK(cudaGetDevice(&device_id));
     CUDA_CHECK(cudaDeviceGetAttribute(&l2_cache_size, cudaDevAttrL2CacheSize, device_id));
     buffer_size = static_cast<size_t>(l2_cache_size) * 2;
-    CUDA_CHECK(cudaMalloc(&d_buffer, buffer_size));
+    d_buffer.reset(buffer_size);
   }
-
-  ~L2CacheInvalidator() { cudaFree(d_buffer); }
 
   L2CacheInvalidator(const L2CacheInvalidator &) = delete;
   L2CacheInvalidator &operator=(const L2CacheInvalidator &) = delete;
 
   void invalidate() {
     NVTX_PUSH("Flushing L2")
-    CUDA_CHECK(cudaMemset(d_buffer, 0, buffer_size));
+    d_buffer.zero();
     CUDA_CHECK(cudaDeviceSynchronize());
     NVTX_POP();
   }
