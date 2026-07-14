@@ -260,34 +260,4 @@ StencilParams compute_stencil_params(const StencilSpec &spec) {
   return p;
 }
 
-const std::vector<StencilSpec> &default_stencils() {
-  static const std::vector<StencilSpec> stencils = {
-      {"Heat",
-       {3, 3},
-       {1, 1},
-       {CoeffStorageType(0), CoeffStorageType(3.0/16), CoeffStorageType(0), CoeffStorageType(3.0/16), CoeffStorageType(4.0/16),
-        CoeffStorageType(3.0/16), CoeffStorageType(0), CoeffStorageType(3.0/16), CoeffStorageType(0)},
-       OriginalPrecision::Double},
-      {"AdvectionDiffusion",
-       {3, 3},
-       {1, 1},
-       {CoeffStorageType(0), CoeffStorageType(11.0/61), CoeffStorageType(0), CoeffStorageType(11.0/61), CoeffStorageType(15.0/61),
-        CoeffStorageType(12.0/61), CoeffStorageType(0), CoeffStorageType(12.0/61), CoeffStorageType(0)},
-       OriginalPrecision::Double},
-      {"BoxAvg",
-       {3, 3},
-       {1, 1},
-       {CoeffStorageType(1.0/9), CoeffStorageType(1.0/9), CoeffStorageType(1.0/9), CoeffStorageType(1.0/9), CoeffStorageType(1.0/9),
-        CoeffStorageType(1.0/9), CoeffStorageType(1.0/9), CoeffStorageType(1.0/9), CoeffStorageType(1.0/9)},
-       OriginalPrecision::Double},
-      {"BoxRandom",
-       {3, 3},
-       {1, 1},
-       {CoeffStorageType(-3.0/34), CoeffStorageType(2.0/34), CoeffStorageType(1.0/34), CoeffStorageType(-8.0/34), CoeffStorageType(4.0/34),
-        CoeffStorageType(-5.0/34), CoeffStorageType(-1.0/34), CoeffStorageType(-1.0/34), CoeffStorageType(9.0/34)},
-       OriginalPrecision::Double},
-  };
-  return stencils;
-}
-
 } // namespace ozi

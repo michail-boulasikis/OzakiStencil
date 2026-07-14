@@ -6,6 +6,7 @@
 
 #include <iostream>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 #include <boost/program_options.hpp>
@@ -22,7 +23,6 @@ int main(int argc, char *argv[]) {
   std::vector<size_t> timesteps;
   int32_t extra_msb;
   int32_t extra_lsb;
-  bool all_stencils = false;
   bool save_tensors = false;
 
   po::options_description desc("run-ozaki: run Ozaki stencil GPU integration");
@@ -37,9 +37,10 @@ int main(int argc, char *argv[]) {
      "Output file prefix")
     ("stencil", po::value<std::string>(&stencil_arg),
      "Inline stencil spec: \"RxC:c0,c1,...\"")
+    ("stencil-arg", po::value<std::string>(&stencil_arg),
+     "Alias for --stencil")
     ("stencil-file", po::value<std::string>(&stencil_file),
      "Path to stencil text file")
-    ("all-stencils", "Use all default stencil configurations")
     ("timesteps,T", po::value<std::vector<size_t>>(&timesteps)->multitoken(),
      "Timesteps to compute (e.g., -T 100 1000 10000)")
     ("slice-limit,s", po::value<int32_t>(&slice_limit)->default_value(24),
@@ -64,9 +65,11 @@ int main(int argc, char *argv[]) {
       return 0;
     }
 
+    if (!vm.count("stencil") && !vm.count("stencil-arg") && !vm.count("stencil-file"))
+      throw std::invalid_argument("Must specify --stencil, --stencil-arg, or --stencil-file");
+
     po::notify(vm);
 
-    all_stencils = vm.count("all-stencils") > 0;
     save_tensors = vm.count("save-tensors") > 0;
 
     if (timesteps.empty())
@@ -91,14 +94,10 @@ int main(int argc, char *argv[]) {
 
     // Collect stencil specifications
     std::vector<StencilSpec> specs;
-    if (all_stencils) {
-      specs = ozi::default_stencils();
-    } else if (!stencil_arg.empty()) {
+    if (!stencil_arg.empty()) {
       specs.push_back(parse_stencil_arg(stencil_arg));
-    } else if (!stencil_file.empty()) {
-      specs.push_back(read_stencil_file(stencil_file));
     } else {
-      specs = ozi::default_stencils();
+      specs.push_back(read_stencil_file(stencil_file));
     }
 
     for (const auto &spec : specs) {

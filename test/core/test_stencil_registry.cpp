@@ -10,6 +10,43 @@
 #include <quadmath.h>
 #endif
 
+static StencilSpec make_heat_stencil() {
+  return {"Heat",
+          {3, 3},
+          {1, 1},
+          {CoeffStorageType(0), CoeffStorageType(3.0 / 16), CoeffStorageType(0),
+           CoeffStorageType(3.0 / 16), CoeffStorageType(4.0 / 16), CoeffStorageType(3.0 / 16),
+           CoeffStorageType(0), CoeffStorageType(3.0 / 16), CoeffStorageType(0)},
+          OriginalPrecision::Double};
+}
+
+static std::vector<StencilSpec> make_test_stencils() {
+  return {
+      make_heat_stencil(),
+      {"AdvectionDiffusion",
+       {3, 3},
+       {1, 1},
+       {CoeffStorageType(0), CoeffStorageType(11.0 / 61), CoeffStorageType(0),
+        CoeffStorageType(11.0 / 61), CoeffStorageType(15.0 / 61), CoeffStorageType(12.0 / 61),
+        CoeffStorageType(0), CoeffStorageType(12.0 / 61), CoeffStorageType(0)},
+       OriginalPrecision::Double},
+      {"BoxAvg",
+       {3, 3},
+       {1, 1},
+       {CoeffStorageType(1.0 / 9), CoeffStorageType(1.0 / 9), CoeffStorageType(1.0 / 9),
+        CoeffStorageType(1.0 / 9), CoeffStorageType(1.0 / 9), CoeffStorageType(1.0 / 9),
+        CoeffStorageType(1.0 / 9), CoeffStorageType(1.0 / 9), CoeffStorageType(1.0 / 9)},
+       OriginalPrecision::Double},
+      {"BoxRandom",
+       {3, 3},
+       {1, 1},
+       {CoeffStorageType(-3.0 / 34), CoeffStorageType(2.0 / 34), CoeffStorageType(1.0 / 34),
+        CoeffStorageType(-8.0 / 34), CoeffStorageType(4.0 / 34), CoeffStorageType(-5.0 / 34),
+        CoeffStorageType(-1.0 / 34), CoeffStorageType(-1.0 / 34), CoeffStorageType(9.0 / 34)},
+       OriginalPrecision::Double},
+  };
+}
+
 // ============================================================
 // find_integer_basis tests
 // ============================================================
@@ -148,10 +185,7 @@ TEST(ComputeStencilParams, SimpleD2x) {
 }
 
 TEST(ComputeStencilParams, HeatStencil) {
-  const auto &stencils = ozi::default_stencils();
-  ASSERT_GT(stencils.size(), 0u);
-  const auto &heat = stencils[0]; // "Heat"
-  EXPECT_EQ(heat.name, "Heat");
+  const auto heat = make_heat_stencil();
 
   auto p = ozi::compute_stencil_params(heat);
   EXPECT_TRUE(p.exact_basis);
@@ -242,16 +276,16 @@ TEST(MakeStencil, CoeffPreservation) {
 }
 
 // ============================================================
-// default_stencils tests
+// Locally constructed stencil tests
 // ============================================================
 
-TEST(DefaultStencils, Count) {
-  const auto &stencils = ozi::default_stencils();
+TEST(ConstructedStencils, Count) {
+  const auto stencils = make_test_stencils();
   EXPECT_EQ(stencils.size(), 4u);
 }
 
-TEST(DefaultStencils, Names) {
-  const auto &stencils = ozi::default_stencils();
+TEST(ConstructedStencils, Names) {
+  const auto stencils = make_test_stencils();
   ASSERT_EQ(stencils.size(), 4u);
   EXPECT_EQ(stencils[0].name, "Heat");
   EXPECT_EQ(stencils[1].name, "AdvectionDiffusion");
@@ -259,8 +293,8 @@ TEST(DefaultStencils, Names) {
   EXPECT_EQ(stencils[3].name, "BoxRandom");
 }
 
-TEST(DefaultStencils, AllValid) {
-  const auto &stencils = ozi::default_stencils();
+TEST(ConstructedStencils, AllValid) {
+  const auto stencils = make_test_stencils();
   for (const auto &s : stencils) {
     EXPECT_EQ(s.shape.size(), 2u) << "Stencil " << s.name << " should be 2D";
     EXPECT_EQ(s.shape[0], 3) << "Stencil " << s.name << " first dim should be 3";

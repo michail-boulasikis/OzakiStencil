@@ -21,6 +21,7 @@
 #include <random>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <variant>
@@ -1163,8 +1164,9 @@ int main(int argc, char **argv) {
   desc.add_options()
     ("help,h", "Show help")
     ("shape,S", po::value<std::string>()->required(), "Input grid shape (e.g., 1024x1024)")
-    ("stencil", po::value<std::string>(), "Inline stencil spec: \"7x7:c0,c1,...\"")("stencil-file", po::value<std::string>(), "Stencil .stc file path")
-    ("all-stencils", po::bool_switch(), "Run all default stencils")
+    ("stencil", po::value<std::string>(), "Inline stencil spec: \"7x7:c0,c1,...\"")
+    ("stencil-arg", po::value<std::string>(), "Alias for --stencil")
+    ("stencil-file", po::value<std::string>(), "Stencil .stc file path")
     ("timesteps,T", po::value<int32_t>()->default_value(100), "Integration timesteps")
     ("warmup,W", po::value<int32_t>()->default_value(10), "Warmup timesteps")
     ("repeats,R", po::value<int32_t>()->default_value(3), "Measurement repeats")
@@ -1184,6 +1186,8 @@ int main(int argc, char **argv) {
       std::cout << desc << "\n";
       return 0;
     }
+    if (!vm.count("stencil") && !vm.count("stencil-arg") && !vm.count("stencil-file"))
+      throw std::invalid_argument("Must specify --stencil, --stencil-arg, or --stencil-file");
     po::notify(vm);
   } catch (const po::error &e) {
     std::cerr << "Error: " << e.what() << "\n" << desc << "\n";
@@ -1223,15 +1227,14 @@ int main(int argc, char **argv) {
 
   // Collect stencil specs
   std::vector<StencilSpec> specs;
-  if (vm["all-stencils"].as<bool>()) {
-    specs = ozi::default_stencils();
-  } else if (vm.count("stencil-file")) {
+  if (vm.count("stencil-file")) {
     specs.push_back(read_stencil_file(vm["stencil-file"].as<std::string>()));
   } else if (vm.count("stencil")) {
     specs.push_back(parse_stencil_arg(vm["stencil"].as<std::string>()));
+  } else if (vm.count("stencil-arg")) {
+    specs.push_back(parse_stencil_arg(vm["stencil-arg"].as<std::string>()));
   } else {
-    std::cerr << "Error: must specify --stencil, --stencil-file, or --all-stencils\n";
-    return 1;
+    throw std::invalid_argument("Must specify --stencil, --stencil-arg, or --stencil-file");
   }
 
   NVTX_PUSH("bench-stencil");

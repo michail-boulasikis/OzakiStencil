@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <cstddef>
 #include <variant>
-#include <vector>
 
 namespace ozi {
 
@@ -67,8 +66,6 @@ struct StencilParams {
 
 // Computes all derived parameters needed to run an Ozaki stencil computation from a StencilSpec.
 StencilParams compute_stencil_params(const StencilSpec &spec);
-
-const std::vector<StencilSpec> &default_stencils();
 
 } // namespace ozi
 

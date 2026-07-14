@@ -6,6 +6,7 @@
 #include <ozaki/utils/tensor.hpp>
 
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <variant>
 #include <vector>
@@ -20,7 +21,6 @@ int main(int argc, char *argv[]) {
   std::string stencil_arg;
   std::string stencil_file;
   std::vector<size_t> timesteps;
-  bool all_stencils = false;
   bool compute_float_ref = false;
   bool compute_double_ref = false;
   bool compute_longdouble_ref = false;
@@ -38,9 +38,10 @@ int main(int argc, char *argv[]) {
      "Output file prefix")
     ("stencil", po::value<std::string>(&stencil_arg),
      "Inline stencil spec: \"RxC:c0,c1,...\"")
+    ("stencil-arg", po::value<std::string>(&stencil_arg),
+     "Alias for --stencil")
     ("stencil-file", po::value<std::string>(&stencil_file),
      "Path to stencil text file")
-    ("all-stencils", "Use all default stencil configurations")
     ("timesteps,T", po::value<std::vector<size_t>>(&timesteps)->multitoken(),
      "Timesteps to compute (e.g., -T 100 1000 10000)")
     ("float", "Compute float-precision reference")
@@ -60,9 +61,11 @@ int main(int argc, char *argv[]) {
       return 0;
     }
 
+    if (!vm.count("stencil") && !vm.count("stencil-arg") && !vm.count("stencil-file"))
+      throw std::invalid_argument("Must specify --stencil, --stencil-arg, or --stencil-file");
+
     po::notify(vm);
 
-    all_stencils = vm.count("all-stencils") > 0;
     compute_float_ref = vm.count("float") > 0;
     compute_double_ref = vm.count("double") > 0;
     compute_longdouble_ref = vm.count("longdouble") > 0;
@@ -90,14 +93,10 @@ int main(int argc, char *argv[]) {
 
     // Collect stencil specifications
     std::vector<StencilSpec> specs;
-    if (all_stencils) {
-      specs = ozi::default_stencils();
-    } else if (!stencil_arg.empty()) {
+    if (!stencil_arg.empty()) {
       specs.push_back(parse_stencil_arg(stencil_arg));
-    } else if (!stencil_file.empty()) {
-      specs.push_back(read_stencil_file(stencil_file));
     } else {
-      specs = ozi::default_stencils();
+      specs.push_back(read_stencil_file(stencil_file));
     }
 
     for (const auto &spec : specs) {
