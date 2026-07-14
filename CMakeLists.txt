@@ -14,7 +14,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/lib")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # options
-set(CUDA_COMPUTE_CAPABILITY "90a" CACHE STRING "Target CUDA compute capability (single value, e.g. '90a', '100', '120').")
+set(CUDA_COMPUTE_CAPABILITY "120" CACHE STRING "Target CUDA compute capability (single value, e.g. '90a', '100', '120').")
 option(BUILD_TESTING "Build the project's tests" ON)
 option(OZAKI_NVTX_EVENTS "Whether to record NVTX events" ON)
 option(OZAKI_USE_BOOST_MULTIPRECISION "Use Boost.Multiprecision for high-precision scale factor computation" OFF)
