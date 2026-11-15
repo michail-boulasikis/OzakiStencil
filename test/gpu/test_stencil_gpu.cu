@@ -1,1159 +1,329 @@
-/**
- * GPU stencil kernel test suite.
- *
- * Test suites:
- *   1. NaiveGPUStencil  - FP64 shared-memory stencil (ozi::stencil)
- *   2. OzakiStencilV1   - Ozaki INT8 scalar stencil (ozigpu::stencil_v1)
- *   3. ConvStencilWMMA  - Ozaki INT8 tensor-core stencil (ozigpu::cvstencil)
- *   4. BoundaryTests    - Boundary cell correctness across kernels
- *   6. M > 1 Stencil Tests (multi-slice precision)
- *   7. Overflow/Shift Mechanism Tests
- */
-
 #include <gtest/gtest.h>
 
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <cuda_runtime_api.h>
-
-#include <ozaki/core/device_memory.cuh>
-#include <ozaki/core/stencil.hpp>
-#include <ozaki/cpu/ozi.hpp>
-#include <ozaki/gpu/gpu_checks.cuh>
-#include <ozaki/gpu/ozi.cuh>
-#include <ozaki/gpu/ozi_kernels.cuh>
-#include <ozaki/gpu/ozi_stencil_conv_v2.cuh>
-#include <ozaki/gpu/ozi_stencil_plain.cuh>
-#include <ozaki/gpu/stencil_gpu.cuh>
+#include <ozaki/gpu/stencil_integrator.cuh>
 #include <ozaki/utils/stencil_registry.hpp>
-
-#include "../test_utils.hpp"
+#include <ozaki/utils/stencil_spec.hpp>
+#include <ozaki/utils/zero_boundary.hpp>
 
 #include <algorithm>
 #include <array>
-#include <climits>
 #include <cmath>
 #include <cstdint>
-#include <cstring>
-#include <limits>
-#include <numeric>
-#include <random>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
-#ifdef OZAKI_HAVE_FLOAT128
-#include <quadmath.h>
-#endif
+namespace {
 
-// ============================================================
-// Type aliases
-// ============================================================
-using Real = double;
-#if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
-using AccType = __float128;
-#else
-using AccType = double;
-#endif
-using OzPair = ozigpu::OzakiFP_Int8<Real>;
+bool sm90_available() {
+  int count = 0;
+  if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
+    return false;
+  }
+  int major = 0;
+  return cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0) == cudaSuccess && major >= 9;
+}
 
-// ============================================================
-// Stencil parameter computation helper
-// ============================================================
-struct OzakiSetup {
-  HighPrecType a_coeff;
-  int32_t m;
-  HighPrecType scaling_factor;
-  int32_t extra_msb_shift;
-};
-
-template <size_t... Dims> static OzakiSetup compute_ozaki_setup(const ozi::Stencil<Real, Dims...> &s) {
+// A centered 3x3 stencil with the given (exactly representable) coefficients.
+StencilSpec make_3x3(std::array<double, 9> coefficients) {
   StencilSpec spec;
-  spec.name = "test";
-  for (auto d : s.get_shape())
-    spec.shape.push_back(static_cast<int>(d));
-  for (auto o : s.offsets)
-    spec.offsets.push_back(static_cast<int>(o));
-  for (size_t i = 0; i < s.size; ++i)
-    spec.coeffs.push_back(static_cast<CoeffStorageType>(s.coeffs[i]));
-
-  auto params = ozi::compute_stencil_params(spec);
-  return {params.a_coeff, params.m, params.scaling_factor, params.extra_msb_shift};
+  spec.name = "test3x3";
+  spec.shape = {3, 3};
+  spec.offsets = {1, 1};
+  spec.specified_precision = OriginalPrecision::Double;
+  spec.coeffs.assign(coefficients.begin(), coefficients.end());
+  return spec;
 }
 
-// ============================================================
-// GPU Test Fixture
-// ============================================================
-class StencilGPUTest : public ::testing::Test {
-protected:
-  static constexpr uint64_t SEED = 0xABCDEF01;
-  static constexpr int32_t RDC_THREADS = RDC_THREADS_PER_BLOCK;
+// A stencil with exactly `active_slices` base-128 coefficient digits.
+CoeffStorageType pow2(int32_t exponent) {
+  return core::RealTraits<CoeffStorageType>::scalbn(static_cast<CoeffStorageType>(1), exponent);
+}
 
-  core::DeviceArray<Real> d_data;
-  core::DeviceArray<int8_t> d_slices_1, d_slices_2;
-  core::DeviceArray<ozigpu::OzakiDescriptor<OzPair>> d_desc;
-  ozigpu::OzakiDescriptor<OzPair> h_desc;
-  core::DeviceArray<AccType> d_res;
-
-  size_t n_elems = 0;
-  int32_t num_slices_total = 0;
-
-  void SetUp() override {
-    int deviceCount = 0;
-    if (cudaGetDeviceCount(&deviceCount) != cudaSuccess || deviceCount == 0)
-      GTEST_SKIP() << "No CUDA device found";
-    cudaSetDevice(0);
+StencilSpec make_capacity_stencil(int32_t dimensions, int32_t side, int32_t active_slices) {
+  StencilSpec spec;
+  spec.name = std::to_string(side) + "d" + std::to_string(dimensions) + "s" + std::to_string(active_slices);
+  spec.shape.assign(static_cast<size_t>(dimensions), side);
+  spec.offsets.assign(static_cast<size_t>(dimensions), side / 2);
+  spec.specified_precision = OriginalPrecision::Float128;
+  size_t coefficient_count = 1;
+  for (int32_t dimension = 0; dimension < dimensions; ++dimension)
+    coefficient_count *= static_cast<size_t>(side);
+  spec.coeffs.resize(coefficient_count);
+  for (size_t coefficient = 0; coefficient < coefficient_count; ++coefficient) {
+    if (coefficient % 5 == 0)
+      continue;
+    const int32_t digit = static_cast<int32_t>(coefficient % 3) + 1;
+    spec.coeffs[coefficient] =
+        pow2(-core::SLICE_STEP) * static_cast<CoeffStorageType>((coefficient & 1U) == 0U ? digit : -digit);
   }
+  const size_t marker = coefficient_count / 2;
+  spec.coeffs[marker] = pow2(-core::SLICE_STEP);
+  if (active_slices > 1)
+    spec.coeffs[marker] += pow2(-core::SLICE_STEP * active_slices);
+  return spec;
+}
 
-  void TearDown() override {}
 
-  // --- Data generation ---
+template <typename Real>
+std::vector<Real> cpu_reference(const StencilSpec &spec, const Tensor<Real> &input, int32_t timesteps) {
+  return std::visit(
+      [&](const auto &source_stencil) -> std::vector<Real> {
+        using SourceStencil = std::decay_t<decltype(source_stencil)>;
+        using RealStencil = ozaki::RebindStencil_t<SourceStencil, Real>;
+        RealStencil stencil;
+        stencil.offsets = source_stencil.offsets;
+        for (size_t i = 0; i < source_stencil.coeffs.size(); ++i)
+          stencil.coeffs[i] = static_cast<Real>(source_stencil.coeffs[i]);
+        typename RealStencil::shape_type shape{};
+        std::copy(input.shape.begin(), input.shape.end(), shape.begin());
+        // Same homogeneous Dirichlet problem as StencilIntegrator: zero halo.
+        const Tensor<Real> bounded = zero_boundary_copy(input, static_cast<size_t>(spec.shape.front() / 2));
+        // apply_to writes only interior cells, so both halos stay zero.
+        std::vector<Real> current = bounded.data;
+        std::vector<Real> next = bounded.data;
+        for (int32_t step = 0; step < timesteps; ++step) {
+          stencil.template apply_to<Real>(next, current, shape);
+          std::swap(current, next);
+        }
+        return current;
+      },
+      ozaki::make_stencil(spec));
+}
 
-  std::vector<Real> generate_random(size_t size, double mean = 0.0, double stddev = 1.0) {
-    std::vector<Real> vec(size);
-    std::mt19937 engine(SEED);
-    std::normal_distribution<double> dist(mean, stddev);
-    for (auto &v : vec)
-      v = dist(engine);
-    return vec;
-  }
-
-  // --- CUDA resource management ---
-
-  void alloc_and_upload(const std::vector<Real> &input) {
-    n_elems = input.size();
-    ASSERT_EQ(n_elems % 4, 0u) << "n_elems must be divisible by 4 for vectorized kernels";
-
-    d_data.reset(n_elems);
-    d_data.copy_from_host(input.data(), n_elems);
-    d_desc.reset(1);
-    d_res.reset(n_elems);
-  }
-
-  void compute_dynamic_range(int32_t extra_msb = 0, int32_t extra_lsb = 0) {
-    h_desc = ozigpu::OzakiDescriptor<OzPair>();
-    d_desc.copy_from_host(&h_desc, 1);
-
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-    int32_t nBlocks = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / RDC_THREADS;
-
-    ozigpu::dyn_range<<<nBlocks, RDC_THREADS>>>(d_desc.get(), d_data.get(), n_elems);
-    ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
-    d_desc.copy_to_host(&h_desc, 1);
-
-    h_desc.e_max += extra_msb;
-    h_desc.e_min -= extra_lsb;
-    num_slices_total = 2 + (h_desc.e_max - h_desc.e_min) / (CHAR_BIT * sizeof(int8_t) - 1);
-    h_desc.n_slices_input = num_slices_total;
-
-    d_desc.copy_from_host(&h_desc, 1);
-    const size_t slice_allocation = num_slices_total * n_elems + ozigpu::STENCIL_V1_ALLOC_PAD;
-    d_slices_1.reset(slice_allocation);
-    d_slices_2.reset(slice_allocation);
-  }
-
-  void prepare_slices() {
-    int32_t nThreads = std::min(static_cast<size_t>(RDC_THREADS), n_elems / 4);
-    int32_t nBlocks = static_cast<int32_t>(((n_elems / 4) + nThreads - 1) / nThreads);
-    ozigpu::slice<OzPair><<<nBlocks, nThreads>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
-    ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
-    d_slices_2.copy_from_device(d_slices_1.get(), num_slices_total * n_elems);
-  }
-
-  // --- Stencil_v1 pipeline helpers ---
-
-  template <int32_t M, size_t... Dims>
-  void configure_descriptor(const ozi::StencilSlices<ozi::Stencil<int8_t, Dims...>, M> &ss) {
-    double slice0_l1 = ss.slices[0].template l1_norm<double>();
-    int32_t l1_int = std::max(1, static_cast<int32_t>(slice0_l1));
-
-    h_desc.shift_required = 0;
-    h_desc.carry_slice_index = 0;
-    h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
-    h_desc.just_shifted = 1;
-    h_desc.n_shifts = 0;
-
-    d_desc.copy_from_host(&h_desc, 1);
-  }
-
-  template <int32_t M, size_t... Dims>
-  void run_stencil_v1_loop(const ozi::StencilSlices<ozi::Stencil<int8_t, Dims...>, M> &ss,
-                           const std::array<size_t, sizeof...(Dims)> &shape, int32_t timesteps,
-                           HighPrecType scaling_factor) {
-    constexpr size_t ndims = sizeof...(Dims);
-    dim3 block, grid;
-
-    // Grid config: i->fastest dim (last), j->second, k->slowest (first)
-    if constexpr (ndims == 1) {
-      block = dim3(256);
-      grid = dim3((shape[0] + 255) / 256);
-    } else if constexpr (ndims == 2) {
-      block = dim3(32, 16);
-      grid = dim3((shape[1] + 31) / 32, (shape[0] + 15) / 16);
-    } else {
-      block = dim3(8, 8, 4);
-      grid = dim3((shape[2] + 7) / 8, (shape[1] + 7) / 8, (shape[0] + 3) / 4);
+template <typename Real>
+void expect_close(const std::vector<Real> &actual, const std::vector<Real> &expected,
+                  long double relative_tolerance = 1.0e-11L) {
+  ASSERT_EQ(actual.size(), expected.size());
+  long double worst_ratio = 0;
+  long double worst_error = 0;
+  size_t worst_index = 0;
+  for (size_t i = 0; i < actual.size(); ++i) {
+    const long double a = static_cast<long double>(actual[i]);
+    const long double e = static_cast<long double>(expected[i]);
+    const long double tolerance = relative_tolerance * std::max(1.0L, std::abs(e));
+    const long double error = std::abs(a - e);
+    if (error / tolerance > worst_ratio) {
+      worst_ratio = error / tolerance;
+      worst_error = error;
+      worst_index = i;
     }
+  }
+  EXPECT_LE(worst_ratio, 1.0L) << "worst error " << static_cast<double>(worst_error) << " at linear index "
+                               << worst_index;
+}
 
-    typename ozi::Stencil<int8_t, Dims...>::shape_type input_shape{};
-    for (size_t d = 0; d < ndims; ++d)
-      input_shape[d] = shape[d];
-
-    double log2_sf =
-        (scaling_factor > static_cast<HighPrecType>(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
-    int32_t total_shifts_needed = static_cast<int32_t>(std::ceil(timesteps * log2_sf / 7.0));
-
-    // Copy stencil slices to constant memory before kernel launch
-    ASSERT_EQ(cudaSuccess, cudaMemcpyToSymbol(ozigpu::stencil_v1_cmem, &ss, sizeof(ss)));
-    ozigpu::upload_slice_phys_lut(num_slices_total);
-
-    for (int32_t t = 0; t < timesteps; ++t) {
-      ozigpu::stencil_v1<OzPair, M, Dims...><<<grid, block>>>(d_slices_2.get(), d_slices_1.get(), input_shape, d_desc.get());
-
-      if (t < timesteps - 1) {
-        int32_t min_shifts_now;
-        if (t == timesteps - 2)
-          min_shifts_now = total_shifts_needed;
-        else
-          min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
-        if (min_shifts_now < 0)
-          min_shifts_now = 0;
-        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), min_shifts_now);
+TEST(ZeroBoundaryHost, ClearsCompleteHalo) {
+  for (const size_t halo : {1U, 2U, 3U, 7U}) {
+    Tensor<double> input;
+    input.shape = {2 * halo + 3, 2 * halo + 5};
+    input.data.assign(input.shape[0] * input.shape[1], 7.0);
+    const Tensor<double> bounded = zero_boundary_copy(input, halo);
+    for (size_t y = 0; y < input.shape[0]; ++y) {
+      for (size_t x = 0; x < input.shape[1]; ++x) {
+        const bool boundary = y < halo || y + halo >= input.shape[0] || x < halo || x + halo >= input.shape[1];
+        EXPECT_EQ(bounded.data[y * input.shape[1] + x], boundary ? 0.0 : 7.0);
       }
-      std::swap(d_slices_1, d_slices_2);
     }
-    ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
   }
+}
 
-  std::vector<Real> mend_scale_download(int32_t timesteps, HighPrecType scaling_factor) {
-    int32_t nTMend = static_cast<int32_t>(std::min(static_cast<size_t>(RDC_THREADS), n_elems / 4));
-    int32_t nBMend = static_cast<int32_t>(((n_elems / 4) + nTMend - 1) / nTMend);
-    int32_t nTScale = static_cast<int32_t>(std::min(static_cast<size_t>(RDC_THREADS), n_elems));
-    int32_t nBScale = static_cast<int32_t>((n_elems + nTScale - 1) / nTScale);
-
-    ozigpu::mend<OzPair, AccType><<<nBMend, nTMend>>>(d_res.get(), d_slices_1.get(), d_desc.get(), n_elems);
-    d_desc.copy_to_host(&h_desc, 1);
-
-#if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
-    __float128 factor =
-        ozigpu::total_integration_scale_factor_quad<OzPair>(scaling_factor, timesteps, h_desc.n_shifts);
-    ozigpu::scale<AccType, __float128><<<nBScale, nTScale>>>(d_res.get(), factor, n_elems);
-#else
-    double factor = static_cast<double>(
-        ozigpu::total_integration_scale_factor_quad<OzPair>(scaling_factor, timesteps, h_desc.n_shifts));
-    ozigpu::scale<AccType, double><<<nBScale, nTScale>>>(d_res.get(), factor, n_elems);
-#endif
-    EXPECT_EQ(cudaSuccess, cudaDeviceSynchronize());
-
-    std::vector<AccType> result_q(n_elems);
-    d_res.copy_to_host(result_q.data(), n_elems);
-
-    std::vector<Real> result(n_elems);
-    for (size_t i = 0; i < n_elems; ++i)
-      result[i] = static_cast<Real>(result_q[i]);
-    return result;
-  }
-
-  // --- High-level pipeline: run full Ozaki stencil_v1 ---
-
-  template <int32_t M, size_t... Dims>
-  std::vector<Real> run_full_ozaki_v1(const ozi::Stencil<Real, Dims...> &stencil,
-                                      const std::vector<Real> &input,
-                                      const std::array<size_t, sizeof...(Dims)> &shape, int32_t timesteps,
-                                      HighPrecType a_coeff, HighPrecType scaling_factor,
-                                      int32_t extra_msb_shift = 0) {
-    alloc_and_upload(input);
-    compute_dynamic_range();
-
-    auto ss = ozicpu::slice_stencil<ozicpu::OzakiFP_Int8<Real>, ozi::Stencil<Real, Dims...>, M>(
-        stencil, a_coeff, extra_msb_shift, num_slices_total);
-
-    configure_descriptor(ss);
-    prepare_slices();
-    run_stencil_v1_loop(ss, shape, timesteps, scaling_factor);
-    return mend_scale_download(timesteps, scaling_factor);
-  }
-
-  // --- High-level pipeline: run full ConvStencil ---
-
-  template <int32_t M>
-  std::vector<Real> run_full_cvstencil(const ozi::Stencil<Real, 7, 7> &stencil, const std::vector<Real> &input,
-                                       const std::array<size_t, 2> &shape, int32_t timesteps,
-                                       HighPrecType a_coeff, HighPrecType scaling_factor,
-                                       int32_t extra_msb_shift = 0) {
-    alloc_and_upload(input);
-    compute_dynamic_range();
-
-    auto ss = ozicpu::slice_stencil<ozicpu::OzakiFP_Int8<Real>, ozi::Stencil<Real, 7, 7>, M>(
-        stencil, a_coeff, extra_msb_shift, num_slices_total);
-
-    configure_descriptor(ss);
-    prepare_slices();
-
-    // Build weight matrix
-    constexpr int32_t N_COEFFS = 7 * 7;
-    int8_t flat_coeffs[M * N_COEFFS];
-    for (int32_t si = 0; si < M; ++si)
-      for (int32_t c = 0; c < N_COEFFS; ++c)
-        flat_coeffs[si * N_COEFFS + c] = ss.slices[si].coeffs[c];
-
-    constexpr size_t weight_size = M * 2 * ozigpu::convstencil::WT_SIZE;
-    int8_t host_weight[weight_size];
-    ozigpu::convstencil::build_param_matrix<M>(host_weight, flat_coeffs);
-
-    core::DeviceArray<int8_t> d_weight(weight_size);
-    d_weight.copy_from_host(host_weight, weight_size);
-
-    // Build boundary gain data
-    ozigpu::convstencil::BoundaryGainData boundary{};
-    boundary.n_slices = ss.n_emulated_gain_slices;
-    for (int32_t g = 0; g < boundary.n_slices; ++g)
-      boundary.emulated_gain[g] = ss.emulated_gain[g];
-
-    // Grid/block
-    const size_t height = shape[0];
-    const size_t ldm = shape[1];
-    constexpr int32_t BLOCK_THREADS = ozigpu::convstencil::NUM_WARPS * WARP_SIZE;
-    dim3 block(BLOCK_THREADS);
-    dim3 grid((height + ozigpu::convstencil::TILE_SIZE_ROW - 1) / ozigpu::convstencil::TILE_SIZE_ROW,
-              (ldm + ozigpu::convstencil::TILE_SIZE_COL - 1) / ozigpu::convstencil::TILE_SIZE_COL);
-
-    // Shift schedule
-    double log2_sf =
-        (scaling_factor > static_cast<HighPrecType>(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
-    int32_t total_shifts_needed = static_cast<int32_t>(std::ceil(timesteps * log2_sf / 7.0));
-
-    ozigpu::upload_slice_phys_lut(num_slices_total);
-
-    ozigpu::convstencil::TmaDescriptorsV2 tma;
-    size_t total_height = static_cast<size_t>(num_slices_total) * height;
-    bool tma_ok = ozigpu::convstencil::create_tma_descriptors_v2(tma, d_slices_1.get(), d_slices_2.get(), total_height, ldm);
-    if (!tma_ok)
-      throw std::runtime_error("cvstencil requires ldm >= 128 and ldm % 16 == 0; got ldm=" + std::to_string(ldm));
-
-    cudaFuncSetAttribute(ozigpu::cvstencil_v2<OzPair, M>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         ozigpu::convstencil::DYN_SMEM_BYTES);
-
-    for (int32_t t = 0; t < timesteps; ++t) {
-      ozigpu::cvstencil_v2<OzPair, M><<<grid, block, ozigpu::convstencil::DYN_SMEM_BYTES>>>(d_slices_2.get(), d_slices_1.get(), d_weight.get(), ldm, height, d_desc.get(), boundary, tma.h_main[0]);
-
-      if (t < timesteps - 1) {
-        int32_t min_shifts_now;
-        if (t == timesteps - 2)
-          min_shifts_now = total_shifts_needed;
-        else
-          min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
-        if (min_shifts_now < 0)
-          min_shifts_now = 0;
-        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), min_shifts_now);
+TEST(ZeroBoundaryHost, ClearsThreeDimensionalHaloAndRejectsEmptyInterior) {
+  Tensor<double> input;
+  input.shape = {7, 8, 9};
+  input.data.assign(7 * 8 * 9, -3.0);
+  const Tensor<double> bounded = zero_boundary_copy(input, 2);
+  for (size_t z = 0; z < input.shape[0]; ++z) {
+    for (size_t y = 0; y < input.shape[1]; ++y) {
+      for (size_t x = 0; x < input.shape[2]; ++x) {
+        const bool boundary =
+            z < 2 || z + 2 >= input.shape[0] || y < 2 || y + 2 >= input.shape[1] || x < 2 || x + 2 >= input.shape[2];
+        const size_t index = (z * input.shape[1] + y) * input.shape[2] + x;
+        EXPECT_EQ(bounded.data[index], boundary ? 0.0 : -3.0);
       }
-      std::swap(d_slices_1, d_slices_2);
-      tma.swap();
     }
-    EXPECT_EQ(cudaSuccess, cudaDeviceSynchronize());
-
-    tma.free();
-    return mend_scale_download(timesteps, scaling_factor);
   }
+  input.shape = {4, 8, 9};
+  input.data.resize(4 * 8 * 9);
+  EXPECT_THROW(zero_boundary_copy(input, 2), std::invalid_argument);
+}
+
+TEST(StencilIntegratorGpu, IdentityKeepsInteriorAndZeroHalo) {
+  if (!sm90_available()) {
+    GTEST_SKIP() << "SM90 or newer is required";
+  }
+  StencilSpec spec = make_3x3({0, 0, 0, 0, 1, 0, 0, 0, 0});
+  spec.name = "identity";
+  using Real = ozaki::gpu::IntegrationReal;
+  Tensor<Real> input;
+  input.shape = {9, 37};
+  input.data.resize(9 * 37);
+  for (size_t i = 0; i < input.data.size(); ++i) {
+    input.data[i] = static_cast<Real>(static_cast<int32_t>(i % 29) - 14) / static_cast<Real>(7);
+  }
+  ozaki::gpu::StencilIntegrator integrator(spec, input, 10);
+  integrator.integrate(10);
+  const std::vector<Real> result = integrator.reconstruct();
+  for (size_t y = 0; y < input.shape[0]; ++y) {
+    for (size_t x = 0; x < input.shape[1]; ++x) {
+      const size_t index = y * input.shape[1] + x;
+      if (y == 0 || y + 1 == input.shape[0] || x == 0 || x + 1 == input.shape[1]) {
+        EXPECT_EQ(result[index], static_cast<Real>(0));
+      } else {
+        EXPECT_NEAR(static_cast<double>(result[index]), static_cast<double>(input.data[index]), 1.0e-12);
+      }
+    }
+  }
+}
+
+TEST(StencilIntegratorGpu, WindowFollowsAttenuationAndAmplification) {
+  if (!sm90_available()) {
+    GTEST_SKIP() << "SM90 or newer is required";
+  }
+  using Real = ozaki::gpu::IntegrationReal;
+  Tensor<Real> input;
+  input.shape = {9, 37};
+  input.data.assign(9 * 37, static_cast<Real>(64));
+
+  StencilSpec attenuation = make_3x3({0, 0, 0, 0, 0.0078125, 0, 0, 0, 0});
+  attenuation.name = "attenuation_moves_window_down";
+  ozaki::gpu::StencilIntegrator lowered(attenuation, input, 12);
+  lowered.integrate(8);
+  expect_close(lowered.reconstruct(), cpu_reference(attenuation, input, 8), 1.0e-12L);
+
+  StencilSpec amplification = make_3x3({0, 0, 0, 0, 128, 0, 0, 0, 0});
+  amplification.name = "amplification_moves_window_up";
+  ozaki::gpu::StencilIntegrator raised(amplification, input, 12);
+  raised.integrate(3);
+  expect_close(raised.reconstruct(), cpu_reference(amplification, input, 3), 1.0e-12L);
+}
+
+// Each step grows the values by up to 9 * 127^2, i.e. by more than two base-128
+// digits; the digit window must follow.
+TEST(StencilIntegratorGpu, LargeGrowthPerStepMatchesCpuReference) {
+  if (!sm90_available()) {
+    GTEST_SKIP() << "SM90 or newer is required";
+  }
+  StencilSpec spec = make_3x3({127, 127, 127, 127, 127, 127, 127, 127, 127});
+  spec.name = "large_l1";
+  using Real = ozaki::gpu::IntegrationReal;
+  Tensor<Real> input;
+  input.shape = {7, 35};
+  input.data.assign(7 * 35, static_cast<Real>(127));
+  ozaki::gpu::StencilIntegrator integrator(spec, input, 12);
+  integrator.integrate(3);
+  expect_close(integrator.reconstruct(), cpu_reference(spec, input, 3), 1.0e-12L);
+}
+
+// With enough data slices, slicing and reconstructing (no step) is exact.
+TEST(StencilIntegratorGpu, ZeroStepsReturnTheInputExactly) {
+  if (!sm90_available()) {
+    GTEST_SKIP() << "SM90 or newer is required";
+  }
+  using Real = ozaki::gpu::IntegrationReal;
+  Tensor<Real> input;
+  input.shape = {9, 37};
+  input.data.resize(9 * 37);
+  for (size_t i = 0; i < input.data.size(); ++i) {
+    input.data[i] = core::RealTraits<Real>::scalbn(static_cast<Real>(static_cast<int32_t>(i % 31) - 15) / 3, -20);
+  }
+  ozaki::gpu::StencilIntegrator integrator(make_3x3({0, 0, 0, 0, 1, 0, 0, 0, 0}), input, 31);
+  EXPECT_EQ(integrator.reconstruct(), zero_boundary_copy(input, 1).data);
+}
+
+struct KernelCase {
+  int32_t dimensions;
+  int32_t side;
+  int32_t slices;
 };
 
-// ============================================================
-// Test Suite 1: NaiveGPUStencil
-// ============================================================
-
-TEST_F(StencilGPUTest, Naive_Identity1D) {
-  constexpr size_t N = 1024;
-  auto input = generate_random(N);
-
-  ozi::Stencil<Real, 3> identity({0.0, 1.0, 0.0});
-
-  // Upload stencil to constant memory
-  ASSERT_EQ(cudaSuccess, cudaMemcpyToSymbol(ozi::stencil_cmem, &identity, sizeof(identity)));
-
-  // Allocate device buffers
-  core::DeviceArray<Real> d_in(N), d_out(N);
-  d_in.copy_from_host(input.data(), N);
-  d_out.zero();
-
-  dim3 block(256);
-  dim3 grid((N + 255) / 256);
-
-  std::array<size_t, 1> shape = {N};
-  ozi::stencil_fp64<3><<<grid, block>>>(d_out.get(), d_in.get(), shape);
-  ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
-
-  std::vector<Real> result(N);
-  d_out.copy_to_host(result.data(), N);
-
-  // Interior cells should be bit-exact copy
-  for (size_t i = identity.offsets[0]; i < N - identity.offsets[0]; ++i)
-    EXPECT_EQ(result[i], input[i]) << "Mismatch at " << i;
-
-}
-
-TEST_F(StencilGPUTest, Naive_SecondOrderFD1D) {
-  constexpr size_t N = 1024;
-  auto input = generate_random(N);
-
-  ozi::Stencil<Real, 3> d2x({1.0, -2.0, 1.0});
-  ASSERT_EQ(cudaSuccess, cudaMemcpyToSymbol(ozi::stencil_cmem, &d2x, sizeof(d2x)));
-
-  core::DeviceArray<Real> d_in(N), d_out(N);
-  d_in.copy_from_host(input.data(), N);
-  d_out.zero();
-
-  dim3 block(256);
-  dim3 grid((N + 255) / 256);
-
-  std::array<size_t, 1> shape = {N};
-  ozi::stencil_fp64<3><<<grid, block>>>(d_out.get(), d_in.get(), shape);
-  ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
-
-  std::vector<Real> gpu_result(N);
-  d_out.copy_to_host(gpu_result.data(), N);
-
-  // CPU reference
-  std::vector<Real> cpu_result(N, 0.0);
-  d2x.template apply_to<Real>(cpu_result, input, shape);
-
-  for (size_t i = d2x.offsets[0]; i < N - d2x.offsets[0]; ++i)
-    EXPECT_DOUBLE_EQ(gpu_result[i], cpu_result[i]) << "Mismatch at " << i;
-
-}
-
-TEST_F(StencilGPUTest, Naive_Laplace2D) {
-  constexpr size_t H = 64, W = 64;
-  auto input = generate_random(H * W);
-
-  ozi::Stencil<Real, 3, 3> laplacian({0, 1, 0, 1, -4, 1, 0, 1, 0});
-  ASSERT_EQ(cudaSuccess, cudaMemcpyToSymbol(ozi::stencil_cmem, &laplacian, sizeof(laplacian)));
-
-  core::DeviceArray<Real> d_in(H * W), d_out(H * W);
-  d_in.copy_from_host(input.data(), H * W);
-  d_out.zero();
-
-  dim3 block(32, 16);
-  dim3 grid((W + 31) / 32, (H + 15) / 16);
-
-  std::array<size_t, 2> shape = {H, W};
-  ozi::stencil_fp64<3, 3><<<grid, block>>>(d_out.get(), d_in.get(), shape);
-  ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
-
-  std::vector<Real> gpu_result(H * W);
-  d_out.copy_to_host(gpu_result.data(), H * W);
-
-  std::vector<Real> cpu_result(H * W, 0.0);
-  laplacian.template apply_to<Real>(cpu_result, input, shape);
-
-  double rmse =
-      test_utils::interior_relative_rmse<Real, 2>(gpu_result, cpu_result, {H, W}, laplacian.offsets);
-  EXPECT_LT(rmse, 1e-14) << "GPU vs CPU RMSE too high for 2D Laplacian";
-
-}
-
-TEST_F(StencilGPUTest, Naive_Box3D) {
-  constexpr size_t D = 32, H = 32, W = 32;
-  auto input = generate_random(D * H * W);
-
-  ozi::Stencil<Real, 3, 3, 3> box;
-  for (auto &c : box.coeffs)
-    c = 1.0 / 27.0;
-  ASSERT_EQ(cudaSuccess, cudaMemcpyToSymbol(ozi::stencil_cmem, &box, sizeof(box)));
-
-  core::DeviceArray<Real> d_in(D * H * W), d_out(D * H * W);
-  size_t total = D * H * W;
-  d_in.copy_from_host(input.data(), total);
-  d_out.zero();
-
-  dim3 block(8, 8, 4);
-  dim3 grid((W + 7) / 8, (H + 7) / 8, (D + 3) / 4);
-
-  std::array<size_t, 3> shape = {D, H, W};
-  ozi::stencil_fp64<3, 3, 3><<<grid, block>>>(d_out.get(), d_in.get(), shape);
-  ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
-
-  std::vector<Real> gpu_result(total);
-  d_out.copy_to_host(gpu_result.data(), total);
-
-  std::vector<Real> cpu_result(total, 0.0);
-  box.template apply_to<Real>(cpu_result, input, shape);
-
-  double rmse = test_utils::interior_relative_rmse<Real, 3>(gpu_result, cpu_result, {D, H, W}, box.offsets);
-  EXPECT_LT(rmse, 1e-14) << "GPU vs CPU RMSE too high for 3D Box";
-
-}
-
-TEST_F(StencilGPUTest, Naive_PolynomialExact2D) {
-  constexpr size_t H = 64, W = 64;
-
-  // u(x,y) = x^2 + y^2, Laplacian should give 4.0 for interior cells
-  std::vector<Real> input(H * W);
-  for (size_t r = 0; r < H; ++r)
-    for (size_t c = 0; c < W; ++c)
-      input[r * W + c] = static_cast<Real>(r * r + c * c);
-
-  ozi::Stencil<Real, 3, 3> laplacian({0, 1, 0, 1, -4, 1, 0, 1, 0});
-  ASSERT_EQ(cudaSuccess, cudaMemcpyToSymbol(ozi::stencil_cmem, &laplacian, sizeof(laplacian)));
-
-  core::DeviceArray<Real> d_in(H * W), d_out(H * W);
-  d_in.copy_from_host(input.data(), H * W);
-  d_out.zero();
-
-  dim3 block(32, 16);
-  dim3 grid((W + 31) / 32, (H + 15) / 16);
-
-  std::array<size_t, 2> shape = {H, W};
-  ozi::stencil_fp64<3, 3><<<grid, block>>>(d_out.get(), d_in.get(), shape);
-  ASSERT_EQ(cudaSuccess, cudaDeviceSynchronize());
-
-  std::vector<Real> result(H * W);
-  d_out.copy_to_host(result.data(), H * W);
-
-  // Interior cells should be exactly 4.0 (d2u/dx2 + d2u/dy2 = 2 + 2 = 4, grid spacing h=1)
-  for (size_t r = 1; r < H - 1; ++r)
-    for (size_t c = 1; c < W - 1; ++c)
-      EXPECT_DOUBLE_EQ(result[r * W + c], 4.0) << "At (" << r << "," << c << ")";
-
-}
-
-// ============================================================
-// Test Suite 2: OzakiStencilV1
-// ============================================================
-
-TEST_F(StencilGPUTest, OzakiV1_SingleStep_d2x_1D) {
-  constexpr size_t N = 1024;
-  auto input = generate_random(N);
-
-  ozi::Stencil<Real, 3> d2x({1.0, -2.0, 1.0});
-  auto setup = compute_ozaki_setup(d2x);
-  ASSERT_EQ(setup.m, 1);
-
-  auto result = run_full_ozaki_v1<1>(d2x, input, {N}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard(d2x, input, std::array<size_t, 1>{N});
-
-  double rmse = test_utils::interior_relative_rmse<Real, 1>(result, gold, {N}, d2x.offsets);
-  EXPECT_LT(rmse, 1e-12) << "1D d2x single-step RMSE too high: " << rmse;
-}
-
-TEST_F(StencilGPUTest, OzakiV1_SingleStepHeat2D) {
-  constexpr size_t H = 64, W = 64;
-  auto input = generate_random(H * W);
-
-  ozi::Stencil<Real, 3, 3> heat({0, 3.0 / 16, 0, 3.0 / 16, 4.0 / 16, 3.0 / 16, 0, 3.0 / 16, 0});
-  auto setup = compute_ozaki_setup(heat);
-  ASSERT_EQ(setup.m, 1);
-
-  auto result =
-      run_full_ozaki_v1<1>(heat, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard(heat, input, std::array<size_t, 2>{H, W});
-
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result, gold, {H, W}, heat.offsets);
-  EXPECT_LT(rmse, 1e-12) << "2D Heat single-step RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, OzakiV1_SingleStepAdvDiff2D) {
-  constexpr size_t H = 128, W = 128;
-  auto input = generate_random(H * W);
-
-  ozi::Stencil<Real, 3, 3> advdiff(
-      {0, 11.0 / 61, 0, 11.0 / 61, 15.0 / 61, 12.0 / 61, 0, 12.0 / 61, 0});
-  auto setup = compute_ozaki_setup(advdiff);
-  ASSERT_EQ(setup.m, 1);
-
-  auto result =
-      run_full_ozaki_v1<1>(advdiff, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard(advdiff, input, std::array<size_t, 2>{H, W});
-
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result, gold, {H, W}, advdiff.offsets);
-  EXPECT_LT(rmse, 1e-12) << "2D AdvDiff single-step RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, OzakiV1_SingleStep3D) {
-  constexpr size_t D = 32, H = 32, W = 32;
-  auto input = generate_random(D * H * W);
-
-  // Uniform 3x3x3 box: L1 = 1.0
-  ozi::Stencil<Real, 3, 3, 3> box;
-  for (auto &c : box.coeffs)
-    c = 1.0 / 27.0;
-  auto setup = compute_ozaki_setup(box);
-
-  auto result = run_full_ozaki_v1<1>(box, input, {D, H, W}, 1, setup.a_coeff, setup.scaling_factor,
-                                     setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard(box, input, std::array<size_t, 3>{D, H, W});
-
-  double rmse = test_utils::interior_relative_rmse<Real, 3>(result, gold, {D, H, W}, box.offsets);
-  EXPECT_LT(rmse, 1e-12) << "3D Box single-step RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, OzakiV1_SingleStepNonAligned2D) {
-  // Non-power-of-2 grid (must still be multiple of 4 for vectorized kernels)
-  constexpr size_t H = 68, W = 36;
-  static_assert((H * W) % 4 == 0);
-  auto input = generate_random(H * W);
-
-  ozi::Stencil<Real, 3, 3> heat({0, 3.0 / 16, 0, 3.0 / 16, 4.0 / 16, 3.0 / 16, 0, 3.0 / 16, 0});
-  auto setup = compute_ozaki_setup(heat);
-
-  auto result =
-      run_full_ozaki_v1<1>(heat, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard(heat, input, std::array<size_t, 2>{H, W});
-
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result, gold, {H, W}, heat.offsets);
-  EXPECT_LT(rmse, 1e-12) << "Non-aligned 2D RMSE: " << rmse;
-}
-
-// --- Multi-step tests ---
-
-TEST_F(StencilGPUTest, OzakiV1_MultiStep100_Stable2D) {
-  constexpr size_t H = 64, W = 64;
-  constexpr int32_t T = 100;
-  auto input = generate_random(H * W);
-
-  // Stable stencil: Heat * 0.9 (L1 = 0.9 < 1, guaranteed no divergence)
-  ozi::Stencil<Real, 3, 3> stable_heat(
-      {0, 0.9 * 3.0 / 16, 0, 0.9 * 3.0 / 16, 0.9 * 4.0 / 16, 0.9 * 3.0 / 16, 0, 0.9 * 3.0 / 16, 0});
-  auto setup = compute_ozaki_setup(stable_heat);
-
-  auto result = run_full_ozaki_v1<1>(stable_heat, input, {H, W}, T, setup.a_coeff, setup.scaling_factor,
-                                     setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard_multistep(stable_heat, input, std::array<size_t, 2>{H, W}, T);
-
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result, gold, {H, W}, stable_heat.offsets);
-  EXPECT_LT(rmse, T * 5e-12) << "Multi-step (T=100) stable RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, OzakiV1_MultiStep10_1D) {
-  constexpr size_t N = 512;
-  constexpr int32_t T = 10;
-  auto input = generate_random(N);
-
-  // Averaging stencil: {0.25, 0.5, 0.25}, L1 = 1.0
-  ozi::Stencil<Real, 3> avg({0.25, 0.5, 0.25});
-  auto setup = compute_ozaki_setup(avg);
-
-  auto result =
-      run_full_ozaki_v1<1>(avg, input, {N}, T, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard_multistep(avg, input, std::array<size_t, 1>{N}, T);
-
-  double rmse = test_utils::interior_relative_rmse<Real, 1>(result, gold, {N}, avg.offsets);
-  EXPECT_LT(rmse, T * 5e-12) << "Multi-step (T=10) 1D RMSE: " << rmse;
-}
-
-// --- Edge cases ---
-
-TEST_F(StencilGPUTest, OzakiV1_AllZeroInput) {
-  constexpr size_t H = 64, W = 64;
-  std::vector<Real> input(H * W, 0.0);
-
-  ozi::Stencil<Real, 3, 3> heat({0, 3.0 / 16, 0, 3.0 / 16, 4.0 / 16, 3.0 / 16, 0, 3.0 / 16, 0});
-  auto setup = compute_ozaki_setup(heat);
-
-  auto result =
-      run_full_ozaki_v1<1>(heat, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-
-  for (size_t i = 0; i < result.size(); ++i)
-    EXPECT_EQ(result[i], 0.0) << "Non-zero output for zero input at " << i;
-}
-
-TEST_F(StencilGPUTest, OzakiV1_ConstantInput) {
-  constexpr size_t H = 64, W = 64;
-  constexpr Real C = 42.0;
-  std::vector<Real> input(H * W, C);
-
-  // Heat stencil with L1=1: should preserve constant
-  ozi::Stencil<Real, 3, 3> heat({0, 3.0 / 16, 0, 3.0 / 16, 4.0 / 16, 3.0 / 16, 0, 3.0 / 16, 0});
-  auto setup = compute_ozaki_setup(heat);
-
-  auto result =
-      run_full_ozaki_v1<1>(heat, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-
-  // Interior cells should be C (stencil coeffs sum to 1)
-  for (size_t r = 1; r < H - 1; ++r)
-    for (size_t c = 1; c < W - 1; ++c) {
-      double err = std::abs(result[r * W + c] - C);
-      EXPECT_LT(err, 1e-10) << "Constant preservation failed at (" << r << "," << c << "): got "
-                             << result[r * W + c];
-    }
-}
-
-TEST_F(StencilGPUTest, OzakiV1_CatastrophicCancellation2D) {
-  constexpr size_t H = 64, W = 64;
-
-  // Data with huge dynamic range: mix of large and small values
-  std::vector<Real> input(H * W);
-  std::mt19937 engine(SEED);
-  std::uniform_int_distribution<int> sign_dist(0, 1);
-  for (size_t i = 0; i < H * W; ++i) {
-    double base = (i % 3 == 0) ? 1e15 : ((i % 3 == 1) ? -1e15 : 1.0);
-    input[i] = base + (sign_dist(engine) ? 0.001 : -0.001);
+// Every kernel the correctness and performance pipelines use.
+constexpr std::array kernel_cases{KernelCase{2, 3, 1},  KernelCase{2, 3, 2},  KernelCase{2, 3, 9},
+                                  KernelCase{2, 7, 1},  KernelCase{2, 7, 2},  KernelCase{2, 7, 9},
+                                  KernelCase{2, 15, 1}, KernelCase{2, 15, 2}, KernelCase{2, 15, 3},
+                                  KernelCase{2, 15, 9}, KernelCase{3, 3, 1},  KernelCase{3, 3, 2},
+                                  KernelCase{3, 3, 9},  KernelCase{3, 5, 1},  KernelCase{3, 5, 2},
+                                  KernelCase{3, 5, 9}};
+
+// Spans more than one CTA tile in every dimension with partial fringe tiles
+// (2D tiles are 32 or 24 rows x 128 or 256 columns; 3D tiles 192 x 4 x 8 or 2).
+std::vector<size_t> fringe_shape(const KernelCase &c) {
+  const size_t halo = static_cast<size_t>(c.side / 2);
+  if (c.dimensions == 2) {
+    const size_t tile_cols = c.side == 15 ? 256 : 128;
+    return {2 * 32 + 2 * halo + 3, tile_cols + 2 * halo + 5};
   }
-
-  ozi::Stencil<Real, 3, 3> heat({0, 3.0 / 16, 0, 3.0 / 16, 4.0 / 16, 3.0 / 16, 0, 3.0 / 16, 0});
-  auto setup = compute_ozaki_setup(heat);
-
-  auto result =
-      run_full_ozaki_v1<1>(heat, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard(heat, input, std::array<size_t, 2>{H, W});
-
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result, gold, {H, W}, heat.offsets);
-  EXPECT_LT(rmse, 1e-12) << "Catastrophic cancellation RMSE: " << rmse;
+  return {2 * 8 + 2 * halo + 3, 4 + 2 * halo + 3, 192 + 2 * halo + 5};
 }
 
-// ============================================================
-// Test Suite 3: ConvStencilWMMA (7x7 stencils only)
-// ============================================================
-
-TEST_F(StencilGPUTest, CvStencil_SingleStepBox7x7) {
-  constexpr size_t H = 128, W = 128;
-  auto input = generate_random(H * W);
-
-  // Uniform 7x7 box: all coefficients = 1/49
-  ozi::Stencil<Real, 7, 7> box;
-  for (auto &c : box.coeffs)
-    c = 1.0 / 49.0;
-  auto setup = compute_ozaki_setup(box);
-  ASSERT_EQ(setup.m, 1);
-
-  auto result =
-      run_full_cvstencil<1>(box, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard(box, input, std::array<size_t, 2>{H, W});
-
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result, gold, {H, W}, box.offsets);
-  EXPECT_LT(rmse, 1e-12) << "CvStencil box7x7 single-step RMSE: " << rmse;
+template <typename Real> Tensor<Real> make_input(const std::vector<size_t> &shape, bool dense) {
+  Tensor<Real> input;
+  input.shape = shape;
+  size_t elements = 1;
+  for (const size_t extent : shape)
+    elements *= extent;
+  input.data.resize(elements);
+  for (size_t i = 0; i < elements; ++i) {
+    // Small integers occupy only the top digit planes (sparse plane masks);
+    // the dense pattern fills every plane.
+    const Real value = static_cast<Real>(static_cast<int32_t>((7 * i + 3) % 17) - 8);
+    input.data[i] = dense ? value / static_cast<Real>(3) : value;
+  }
+  return input;
 }
 
-TEST_F(StencilGPUTest, CvStencil_MatchesStencilV1) {
-  constexpr size_t H = 128, W = 128;
-  auto input = generate_random(H * W);
-
-  ozi::Stencil<Real, 7, 7> box;
-  for (auto &c : box.coeffs)
-    c = 1.0 / 49.0;
-  auto setup = compute_ozaki_setup(box);
-
-  // Run both kernels on the same input
-  auto result_cv =
-      run_full_cvstencil<1>(box, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-
-  // Need fresh GPU state for stencil_v1
-  TearDown();
-  SetUp();
-
-  auto result_v1 =
-      run_full_ozaki_v1<1>(box, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result_cv, result_v1, {H, W}, box.offsets);
-  EXPECT_LT(rmse, 1e-14) << "CvStencil vs StencilV1 cross-kernel RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, CvStencil_MultiStep10) {
-  constexpr size_t H = 128, W = 128;
-  constexpr int32_t T = 10;
-  auto input = generate_random(H * W);
-
-  ozi::Stencil<Real, 7, 7> box;
-  for (auto &c : box.coeffs)
-    c = 1.0 / 49.0;
-  auto setup = compute_ozaki_setup(box);
-
-  auto result =
-      run_full_cvstencil<1>(box, input, {H, W}, T, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard_multistep(box, input, std::array<size_t, 2>{H, W}, T);
-
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result, gold, {H, W}, box.offsets);
-  EXPECT_LT(rmse, T * 5e-12) << "CvStencil multi-step (T=10) RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, CvStencil_NonAlignedGrid) {
-  // Non-aligned to tile (32x128) but still meets TMA requirements (ldm % 16 == 0, ldm >= 128)
-  constexpr size_t H = 68, W = 144;
-  static_assert((H * W) % 4 == 0);
-  auto input = generate_random(H * W);
-
-  ozi::Stencil<Real, 7, 7> box;
-  for (auto &c : box.coeffs)
-    c = 1.0 / 49.0;
-  auto setup = compute_ozaki_setup(box);
-
-  auto result =
-      run_full_cvstencil<1>(box, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard(box, input, std::array<size_t, 2>{H, W});
-
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result, gold, {H, W}, box.offsets);
-  EXPECT_LT(rmse, 1e-12) << "CvStencil non-aligned RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, CvStencil_MinimalGrid) {
-  // Minimal grid that meets TMA ldm >= 128 requirement.
-  // Single output tile (32x128), exercises boundary handling on all edges.
-  constexpr size_t H = 32, W = 128;
-  static_assert((H * W) % 4 == 0);
-  auto input = generate_random(H * W);
-
-  ozi::Stencil<Real, 7, 7> box;
-  for (auto &c : box.coeffs)
-    c = 1.0 / 49.0;
-  auto setup = compute_ozaki_setup(box);
-
-  auto result =
-      run_full_cvstencil<1>(box, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard(box, input, std::array<size_t, 2>{H, W});
-
-  // Only 4 interior cells
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result, gold, {H, W}, box.offsets);
-  EXPECT_LT(rmse, 1e-12) << "CvStencil minimal grid RMSE: " << rmse;
-}
-
-// ============================================================
-// Test Suite 4: BoundaryTests
-// ============================================================
-
-TEST_F(StencilGPUTest, Boundary_StencilV1_1D) {
-  constexpr size_t N = 32;
-  auto input = generate_random(N);
-
-  ozi::Stencil<Real, 3> d2x({1.0, -2.0, 1.0});
-  auto setup = compute_ozaki_setup(d2x);
-
-  auto result =
-      run_full_ozaki_v1<1>(d2x, input, {N}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-
-  // GPU boundary path preserves boundary cells ~= original input via emulated_gain
-  double rmse = test_utils::boundary_relative_rmse<Real, 1>(result, input, {N}, d2x.offsets);
-  EXPECT_LT(rmse, 1e-10) << "1D boundary RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, Boundary_StencilV1_2D) {
-  constexpr size_t H = 16, W = 16;
-  auto input = generate_random(H * W);
-
-  ozi::Stencil<Real, 3, 3> heat({0, 3.0 / 16, 0, 3.0 / 16, 4.0 / 16, 3.0 / 16, 0, 3.0 / 16, 0});
-  auto setup = compute_ozaki_setup(heat);
-
-  auto result =
-      run_full_ozaki_v1<1>(heat, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-
-  // GPU boundary path preserves boundary cells ~= original input via emulated_gain
-  double rmse = test_utils::boundary_relative_rmse<Real, 2>(result, input, {H, W}, heat.offsets);
-  EXPECT_LT(rmse, 1e-10) << "2D boundary RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, Boundary_StencilV1_3D) {
-  constexpr size_t D = 12, H = 12, W = 12;
-  static_assert((D * H * W) % 4 == 0);
-  auto input = generate_random(D * H * W);
-
-  ozi::Stencil<Real, 3, 3, 3> box;
-  for (auto &c : box.coeffs)
-    c = 1.0 / 27.0;
-  auto setup = compute_ozaki_setup(box);
-
-  auto result = run_full_ozaki_v1<1>(box, input, {D, H, W}, 1, setup.a_coeff, setup.scaling_factor,
-                                     setup.extra_msb_shift);
-
-  // GPU boundary path preserves boundary cells ~= original input via emulated_gain
-  double rmse = test_utils::boundary_relative_rmse<Real, 3>(result, input, {D, H, W}, box.offsets);
-  EXPECT_LT(rmse, 1e-10) << "3D boundary RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, Boundary_CvStencil_2D) {
-  constexpr size_t H = 32, W = 128;
-  static_assert((H * W) % 4 == 0);
-  auto input = generate_random(H * W);
-
-  ozi::Stencil<Real, 7, 7> box;
-  for (auto &c : box.coeffs)
-    c = 1.0 / 49.0;
-  auto setup = compute_ozaki_setup(box);
-
-  auto result =
-      run_full_cvstencil<1>(box, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-
-  // GPU boundary path preserves boundary cells ~= original input via emulated_gain
-  // For 7x7 on 16x16, most cells are boundary (interior is only 4x4)
-  double rmse = test_utils::boundary_relative_rmse<Real, 2>(result, input, {H, W}, box.offsets);
-  EXPECT_LT(rmse, 1e-10) << "CvStencil 2D boundary RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, Boundary_StencilV1_AllBoundary) {
-  // Small grid with many boundary cells relative to interior
-  constexpr size_t H = 4, W = 4;
-  static_assert((H * W) % 4 == 0);
-  auto input = generate_random(H * W);
-
-  ozi::Stencil<Real, 3, 3> heat({0, 3.0 / 16, 0, 3.0 / 16, 4.0 / 16, 3.0 / 16, 0, 3.0 / 16, 0});
-  auto setup = compute_ozaki_setup(heat);
-
-  auto result =
-      run_full_ozaki_v1<1>(heat, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-
-  // GPU boundary path preserves boundary cells ~= original input via emulated_gain
-  // Offsets are {1,1}, so interior is [1,3) x [1,3) = 4 cells. Boundary is remaining 12 cells.
-  double rmse = test_utils::boundary_relative_rmse<Real, 2>(result, input, {H, W}, heat.offsets);
-  EXPECT_LT(rmse, 1e-10) << "All-boundary RMSE: " << rmse;
-}
-
-// ============================================================
-// Test Suite 6: M > 1 Stencil Tests (Gap 1)
-// ============================================================
-
-TEST_F(StencilGPUTest, OzakiV1_M2_SingleStep_1D) {
-  constexpr size_t N = 1024;
-  auto input = generate_random(N);
-
-  // {100, -511, 100}: a=1, max_int=511 (10 bits), M=2
-  ozi::Stencil<Real, 3> s({100.0, -511.0, 100.0});
-  auto setup = compute_ozaki_setup(s);
-  ASSERT_EQ(setup.m, 2) << "Expected M=2 for {100,-511,100}";
-
-  auto result =
-      run_full_ozaki_v1<2>(s, input, {N}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard(s, input, std::array<size_t, 1>{N});
-
-  double rmse = test_utils::interior_relative_rmse<Real, 1>(result, gold, {N}, s.offsets);
-  EXPECT_LT(rmse, 1e-10) << "M=2 1D single-step RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, OzakiV1_M2_SingleStep_2D) {
-  constexpr size_t H = 64, W = 64;
-  auto input = generate_random(H * W);
-
-  // 3x3 M=2 stencil: same integer structure as 1D {100,-511,100}
-  ozi::Stencil<Real, 3, 3> s({0, 100, 0, 100, -511, 100, 0, 100, 0});
-  auto setup = compute_ozaki_setup(s);
-  ASSERT_EQ(setup.m, 2) << "Expected M=2 for 2D {100,-511,100} cross";
-
-  auto result =
-      run_full_ozaki_v1<2>(s, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard(s, input, std::array<size_t, 2>{H, W});
-
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result, gold, {H, W}, s.offsets);
-  EXPECT_LT(rmse, 1e-10) << "M=2 2D single-step RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, OzakiV1_M3_SingleStep_1D) {
-  constexpr size_t N = 1024;
-  auto input = generate_random(N);
-
-  // Coprime coefficients with max=32769 (16 bits), a=1 (abs_min=1), p_max=15, M=3
-  ozi::Stencil<Real, 5> s({-1.0, 16385.0, -32769.0, 16385.0, -1.0});
-  auto setup = compute_ozaki_setup(s);
-  ASSERT_EQ(setup.m, 3) << "Expected M=3 for large coprime 5-point stencil";
-
-  auto result =
-      run_full_ozaki_v1<3>(s, input, {N}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard(s, input, std::array<size_t, 1>{N});
-
-  double rmse = test_utils::interior_relative_rmse<Real, 1>(result, gold, {N}, s.offsets);
-  EXPECT_LT(rmse, 1e-8) << "M=3 1D single-step RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, OzakiV1_M2_MultiStep5_1D) {
-  constexpr size_t N = 512;
-  constexpr int32_t T = 5;
-  auto input = generate_random(N);
-
-  ozi::Stencil<Real, 3> s({100.0, -511.0, 100.0});
-  auto setup = compute_ozaki_setup(s);
-  ASSERT_EQ(setup.m, 2);
-
-  auto result =
-      run_full_ozaki_v1<2>(s, input, {N}, T, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard_multistep(s, input, std::array<size_t, 1>{N}, T);
-
-  double rmse = test_utils::interior_relative_rmse<Real, 1>(result, gold, {N}, s.offsets);
-  EXPECT_LT(rmse, T * 1e-10) << "M=2 1D multi-step (T=5) RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, CvStencil_M2_SingleStep_7x7) {
-  constexpr size_t H = 128, W = 128;
-  auto input = generate_random(H * W);
-
-  // 7x7 M=2 stencil: center=-511, 4 cardinal neighbors=200, rest=0
-  // a=1, max_int=511 (10 bits), M=2
-  ozi::Stencil<Real, 7, 7> s;
-  for (auto &c : s.coeffs)
-    c = 0.0;
-  s.coeffs[3 * 7 + 3] = -511.0; // center
-  s.coeffs[2 * 7 + 3] = 200.0;  // up
-  s.coeffs[4 * 7 + 3] = 200.0;  // down
-  s.coeffs[3 * 7 + 2] = 200.0;  // left
-  s.coeffs[3 * 7 + 4] = 200.0;  // right
-  auto setup = compute_ozaki_setup(s);
-  ASSERT_EQ(setup.m, 2) << "Expected M=2 for 7x7 cardinal stencil";
-
-  auto result =
-      run_full_cvstencil<2>(s, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-  auto gold = test_utils::compute_gold_standard(s, input, std::array<size_t, 2>{H, W});
-
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result, gold, {H, W}, s.offsets);
-  EXPECT_LT(rmse, 1e-10) << "CvStencil M=2 7x7 single-step RMSE: " << rmse;
-}
-
-TEST_F(StencilGPUTest, CvStencil_M2_MatchesV1_7x7) {
-  constexpr size_t H = 128, W = 128;
-  auto input = generate_random(H * W);
-
-  // Same 7x7 M=2 stencil as above
-  ozi::Stencil<Real, 7, 7> s;
-  for (auto &c : s.coeffs)
-    c = 0.0;
-  s.coeffs[3 * 7 + 3] = -511.0;
-  s.coeffs[2 * 7 + 3] = 200.0;
-  s.coeffs[4 * 7 + 3] = 200.0;
-  s.coeffs[3 * 7 + 2] = 200.0;
-  s.coeffs[3 * 7 + 4] = 200.0;
-  auto setup = compute_ozaki_setup(s);
-  ASSERT_EQ(setup.m, 2);
-
-  auto result_cv =
-      run_full_cvstencil<2>(s, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-
-  TearDown();
-  SetUp();
-
-  auto result_v1 =
-      run_full_ozaki_v1<2>(s, input, {H, W}, 1, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result_cv, result_v1, {H, W}, s.offsets);
-  EXPECT_LT(rmse, 1e-14) << "CvStencil vs StencilV1 M=2 cross-kernel RMSE: " << rmse;
-}
-
-// ============================================================
-// Test Suite 7: Overflow/Shift Mechanism Tests (Gap 2)
-// ============================================================
-
-TEST_F(StencilGPUTest, OzakiV1_ShiftCount_SingleShift_Heat2D) {
-  constexpr size_t H = 64, W = 64;
-  constexpr int32_t T = 2;
-  auto input = generate_random(H * W);
-
-  ozi::Stencil<Real, 3, 3> heat({0, 3.0 / 16, 0, 3.0 / 16, 4.0 / 16, 3.0 / 16, 0, 3.0 / 16, 0});
-  auto setup = compute_ozaki_setup(heat);
-
-  // Heat: sf=16, log2_sf=4. T=2 gives 1 update_ozaki_desc call, which forces >= 1 shift.
-  auto result =
-      run_full_ozaki_v1<1>(heat, input, {H, W}, T, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-
-  EXPECT_GE(h_desc.n_shifts, 1) << "Expected at least 1 shift for Heat2D T=2 (sf=16)";
-
-  auto gold = test_utils::compute_gold_standard_multistep(heat, input, std::array<size_t, 2>{H, W}, T);
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result, gold, {H, W}, heat.offsets);
-  EXPECT_LT(rmse, T * 5e-12) << "Post-shift accuracy degraded: " << rmse;
-}
-
-TEST_F(StencilGPUTest, OzakiV1_ShiftCount_MultiShift_Heat2D) {
-  constexpr size_t H = 64, W = 64;
-  constexpr int32_t T = 10;
-  auto input = generate_random(H * W);
-
-  ozi::Stencil<Real, 3, 3> heat({0, 3.0 / 16, 0, 3.0 / 16, 4.0 / 16, 3.0 / 16, 0, 3.0 / 16, 0});
-  auto setup = compute_ozaki_setup(heat);
-
-  // Heat: sf=16, log2_sf=4. T=10: ceil(10*4/7) = ceil(5.71) = 6 proactive shifts.
-  auto result =
-      run_full_ozaki_v1<1>(heat, input, {H, W}, T, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-
-  EXPECT_GE(h_desc.n_shifts, 6) << "Expected at least 6 shifts for Heat2D T=10 (sf=16)";
-
-  auto gold = test_utils::compute_gold_standard_multistep(heat, input, std::array<size_t, 2>{H, W}, T);
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result, gold, {H, W}, heat.offsets);
-  EXPECT_LT(rmse, T * 5e-12) << "Post-multi-shift accuracy: " << rmse;
-}
-
-TEST_F(StencilGPUTest, OzakiV1_NoShift_D2x) {
-  constexpr size_t N = 512;
-  constexpr int32_t T = 3;
-  auto input = generate_random(N);
-
-  // {1,-2,1}: M=1, sf=1 (log2_sf=0), no proactive shifts.
-  // Slice L1=4, threshold=floor(127/4)-1=30. N(0,1) data stays bounded -> no reactive shifts.
-  ozi::Stencil<Real, 3> s({1.0, -2.0, 1.0});
-  auto setup = compute_ozaki_setup(s);
-  ASSERT_EQ(setup.m, 1);
-
-  auto result =
-      run_full_ozaki_v1<1>(s, input, {N}, T, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-
-  EXPECT_EQ(h_desc.n_shifts, 0) << "Expected 0 shifts for d2x with sf=1 and low L1";
-
-  auto gold = test_utils::compute_gold_standard_multistep(s, input, std::array<size_t, 1>{N}, T);
-  double rmse = test_utils::interior_relative_rmse<Real, 1>(result, gold, {N}, s.offsets);
-  EXPECT_LT(rmse, T * 5e-12) << "No-shift accuracy: " << rmse;
-}
-
-TEST_F(StencilGPUTest, OzakiV1_CarrySliceIndex_Rotates) {
-  constexpr size_t H = 64, W = 64;
-  constexpr int32_t T = 3;
-  auto input = generate_random(H * W);
-
-  ozi::Stencil<Real, 3, 3> heat({0, 3.0 / 16, 0, 3.0 / 16, 4.0 / 16, 3.0 / 16, 0, 3.0 / 16, 0});
-  auto setup = compute_ozaki_setup(heat);
-
-  // Heat T=3: ceil(3*4/7)=2 proactive shifts -> carry_slice_index should rotate
-  auto result =
-      run_full_ozaki_v1<1>(heat, input, {H, W}, T, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-
-  EXPECT_GE(h_desc.n_shifts, 2) << "Expected at least 2 shifts for carry rotation test";
-  EXPECT_NE(h_desc.carry_slice_index, 0) << "carry_slice_index should have rotated";
-
-  auto gold = test_utils::compute_gold_standard_multistep(heat, input, std::array<size_t, 2>{H, W}, T);
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result, gold, {H, W}, heat.offsets);
-  EXPECT_LT(rmse, T * 5e-12) << "Carry rotation accuracy: " << rmse;
-}
-
-TEST_F(StencilGPUTest, OzakiV1_ReactiveOverflow_1D) {
-  constexpr size_t N = 512;
-  constexpr int32_t T = 5;
-  auto input = generate_random(N);
-
-  // {3, -2, 3}: a=1, sf=1 (log2_sf=0), no proactive shifts.
-  // L1=8, threshold=floor(127/8)-1=14. Stencil amplifies (L1>1),
-  // so reactive overflow should be triggered after a few timesteps.
-  ozi::Stencil<Real, 3> s({3.0, -2.0, 3.0});
-  auto setup = compute_ozaki_setup(s);
-
-  auto result =
-      run_full_ozaki_v1<1>(s, input, {N}, T, setup.a_coeff, setup.scaling_factor, setup.extra_msb_shift);
-
-  EXPECT_GT(h_desc.n_shifts, 0) << "Expected reactive overflow shifts for amplifying stencil";
-
-  auto gold = test_utils::compute_gold_standard_multistep(s, input, std::array<size_t, 1>{N}, T);
-  double rmse = test_utils::interior_relative_rmse<Real, 1>(result, gold, {N}, s.offsets);
-  EXPECT_LT(rmse, T * 1e-10) << "Reactive overflow accuracy: " << rmse;
-}
-
-TEST_F(StencilGPUTest, CvStencil_ShiftCount_Heat7x7) {
-  constexpr size_t H = 128, W = 128;
-  constexpr int32_t T = 5;
-  auto input = generate_random(H * W);
-
-  // Heat 7x7: 0.0234375 = 3/128 for 12 cardinal neighbors, center = 0.71875 = 92/128
-  // a=1/128, int coeffs max=92 (7 bits), L1_int=12*3+92=128.
-  // After sf>=128 fix: extra_msb_shift>=1, M=2, sf=64.
-  // log2_sf=6. T=5: total_shifts=ceil(30/7)=5. With T-1=4 update calls, expect >= 4 shifts.
-  ozi::Stencil<Real, 7, 7> heat7x7;
-  for (auto &c : heat7x7.coeffs)
-    c = 0.0;
-  // Center
-  heat7x7.coeffs[3 * 7 + 3] = 0.71875;
-  // 12 cardinal neighbors (cross shape extending 3 cells each direction)
-  for (int i = 0; i < 7; ++i) {
-    if (i != 3) {
-      heat7x7.coeffs[i * 7 + 3] = 0.0234375; // column 3
-      heat7x7.coeffs[3 * 7 + i] = 0.0234375; // row 3
+TEST(StencilIntegratorGpu, EveryKernelMatchesCpuReference) {
+  if (!sm90_available()) {
+    GTEST_SKIP() << "SM90 or newer is required";
+  }
+  using Real = ozaki::gpu::IntegrationReal;
+  for (const KernelCase c : kernel_cases) {
+    const StencilSpec spec = make_capacity_stencil(c.dimensions, c.side, c.slices);
+    for (const bool dense : {false, true}) {
+      SCOPED_TRACE(spec.name + (dense ? " dense" : " sparse"));
+      const Tensor<Real> input = make_input<Real>(fringe_shape(c), dense);
+      try {
+        ozaki::gpu::StencilIntegrator integrator(spec, input, 31);
+        for (const int32_t timesteps : {1, 7}) {
+          SCOPED_TRACE("timesteps=" + std::to_string(timesteps));
+          integrator.reset();
+          integrator.integrate(timesteps);
+          expect_close(integrator.reconstruct(), cpu_reference(spec, input, timesteps));
+        }
+      } catch (const std::exception &error) {
+        ADD_FAILURE() << "exception: " << error.what();
+      }
     }
   }
-  auto setup = compute_ozaki_setup(heat7x7);
-  ASSERT_EQ(setup.m, 2) << "Expected M=2 for Heat7x7";
-
-  auto result = run_full_cvstencil<2>(heat7x7, input, {H, W}, T, setup.a_coeff, setup.scaling_factor,
-                                       setup.extra_msb_shift);
-
-  EXPECT_GE(h_desc.n_shifts, 4) << "Expected at least 4 shifts for Heat7x7 T=5 (sf=64)";
-
-  auto gold = test_utils::compute_gold_standard_multistep(heat7x7, input, std::array<size_t, 2>{H, W}, T);
-  double rmse = test_utils::interior_relative_rmse<Real, 2>(result, gold, {H, W}, heat7x7.offsets);
-  EXPECT_LT(rmse, T * 1e-10) << "CvStencil heat7x7 post-shift accuracy: " << rmse;
 }
+
+TEST(StencilIntegratorGpu, FewDataSlicesStayAccurateForEveryKernel) {
+  if (!sm90_available()) {
+    GTEST_SKIP() << "SM90 or newer is required";
+  }
+  using Real = ozaki::gpu::IntegrationReal;
+  for (const KernelCase c : kernel_cases) {
+    const StencilSpec spec = make_capacity_stencil(c.dimensions, c.side, c.slices);
+    const Tensor<Real> input = make_input<Real>(fringe_shape(c), true);
+    const std::vector<Real> expected = cpu_reference(spec, input, 3);
+    for (const int32_t data_slices : {2, 3, 5, 8}) {
+      SCOPED_TRACE(spec.name + " data_slices=" + std::to_string(data_slices));
+      ozaki::gpu::StencilIntegrator integrator(spec, input, data_slices);
+      integrator.integrate(3);
+      // A window of n base-128 digits resolves about 7 (n - 1) bits.
+      expect_close(integrator.reconstruct(), expected, std::ldexp(1.0L, -7 * (data_slices - 1) + 8));
+    }
+  }
+}
+
+// Only 1, 2 and 9 coefficient slices (and 3 for 15x15) are supported; more
+// than nine cannot be represented at all.
+TEST(PackStencilHost, RejectsUnsupportedCoefficientSliceCounts) {
+  for (const KernelCase c : {KernelCase{2, 7, 3}, KernelCase{2, 15, 4}, KernelCase{3, 5, 3}, KernelCase{2, 3, 8},
+                             KernelCase{2, 7, 10}}) {
+    SCOPED_TRACE(std::to_string(c.side) + "^" + std::to_string(c.dimensions) + " slices=" + std::to_string(c.slices));
+    EXPECT_ANY_THROW(ozaki::gpu::pack_stencil(make_capacity_stencil(c.dimensions, c.side, c.slices)));
+  }
+}
+
+} // namespace

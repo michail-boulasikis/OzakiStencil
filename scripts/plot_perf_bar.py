@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
-Plot performance bar chart from eval.sh results.tsv.
+Plot performance bar chart from performance.sh results.tsv.
 
-Supports one or more result files plotted side by side as subplots.
-Each subplot shows bars grouped by slice count (s=5,7,10,13,17).
-Each group shows Ozaki, Ozaki+DSO1, and Ozaki+DSO2 (discrete subgroup optimization).
-Baselines appear at the matching precision level:
+Supports one or more result files plotted side by side as subplots. Each
+subplot is stacked vertically in black and white when --thesis is enabled. Each
+subplot compares the 7×7 CuTe coefficient-kernel variants. Direct baselines
+are measured with the 7x7LmNone stencil, then appear at the matching precision
+level:
   - s=5  (≈FP32):  + Direct FP32
-  - s=10 (≈FP64):  + Direct FP64, ConvStencil (box2d3r), EBISU (box2d3r)
+  - s=9  (≈FP64):  + Direct FP64; 7×7 also adds ConvStencil and EBISU
+  - s=17 (≈FP128): + Direct FP128 when supported by the device
 
 Usage:
     python scripts/plot_perf_bar.py R1.tsv [-o perf_bar.pdf]
     python scripts/plot_perf_bar.py R1.tsv R2.tsv --gpu A100,H200 [-o perf_bar.pdf]
+    python scripts/plot_perf_bar.py R1.tsv R2.tsv --gpu A100,H200 --thesis -o thesis_perf.pdf
 """
 
 import argparse
+import re
+
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -23,18 +28,20 @@ sns.set_theme(style="ticks", font_scale=1.2)
 sns.set_context("paper")
 plt.rcParams["ps.fonttype"] = 42
 
-OZAKI_VARIANTS = {
-    "7x7Lm1_0": "Ozaki + DSO1",
-    "7x7Lm2_0": "Ozaki + DSO2",
-    "7x7LmNone_0": "Ozaki",
-}
+OZAKI_VARIANTS = (
+    ("7x7Lm1_0", "Ozaki DSO1"),
+    ("7x7Lm2_0", "Ozaki DSO2"),
+    ("7x7LmNone_0", "Ozaki"),
+)
+BASELINE_STENCIL = "7x7LmNone_0"
 
 COLORS = {
-    "Ozaki + DSO2": "#87c55f",
-    "Ozaki + DSO1": "#9eb9f3",
+    "Ozaki DSO1": "#9eb9f3",
+    "Ozaki DSO2": "#87c55f",
     "Ozaki": "#dcb0f2",
     "Direct FP32": "#f89c74",
     "Direct FP64": "#f89c74",
+    "Direct FP128": "#f89c74",
     "ConvStencil": "#f6cf71",
     "EBISU": "#66c5cc",
 }
@@ -44,18 +51,19 @@ BAR_GAP = 0.0
 GROUP_GAP = 0.55
 
 HATCHES = {
-    "Ozaki + DSO2": "oo",
-    "Ozaki + DSO1": "",
+    "Ozaki DSO1": "",
+    "Ozaki DSO2": "oo",
     "Ozaki": "//",
     "Direct FP32": "xx",
     "Direct FP64": "xx",
+    "Direct FP128": "xx",
     "ConvStencil": "..",
     "EBISU": "\\\\",
 }
 
 PRECISION_LABELS = {
     5: r"($\approx$FP32)",
-    10: r"($\approx$FP64)",
+    9: r"($\approx$FP64)",
     17: r"($\approx$FP128)",
 }
 
@@ -67,27 +75,31 @@ def lookup(df, framework, stencil, detail="-"):
         & (df["Detail"] == detail)
     )
     vals = df.loc[mask, "GStPt/s"]
-    return float(vals.iloc[0]) if len(vals) else None
+    if not len(vals) or pd.isna(vals.iloc[0]):
+        return None
+    return float(vals.iloc[0])
 
 
 def build_groups(df, slice_counts):
     groups = []
     for s in slice_counts:
-        bars = []
-        # Ozaki variants (DSO first, then plain)
-        for tsv_name, display in OZAKI_VARIANTS.items():
-            bars.append((display, lookup(df, "OzakiConvStencil", tsv_name, f"s={s}")))
+        bars = [
+            (display, lookup(df, "OzakiStencil", stencil, f"s={s}"))
+            for stencil, display in OZAKI_VARIANTS
+        ]
 
-        # Baselines at matching precision
+        # Direct kernels do not depend on the Ozaki coefficient layout, so
+        # performance.sh records them only for the LmNone stencil.
         if s == 5:
-            # Use any ozaki stencil for the Direct FP32 baseline (same perf)
-            fp32 = lookup(df, "Direct FP32", next(iter(OZAKI_VARIANTS)))
-            bars.append(("Direct FP32", fp32))
-        if s == 10:
-            fp64 = lookup(df, "Direct FP64", next(iter(OZAKI_VARIANTS)))
-            bars.append(("Direct FP64", fp64))
+            bars.append(("Direct FP32", lookup(df, "Direct FP32", BASELINE_STENCIL)))
+        if s == 9:
+            bars.append(("Direct FP64", lookup(df, "Direct FP64", BASELINE_STENCIL)))
             bars.append(("ConvStencil", lookup(df, "ConvStencil", "box2d3r")))
             bars.append(("EBISU", lookup(df, "EBISU", "box2d3r")))
+        if s == 17:
+            fp128 = lookup(df, "Direct FP128", BASELINE_STENCIL)
+            if fp128 is not None:
+                bars.append(("Direct FP128", fp128))
 
         label = f"s={s}"
         if s in PRECISION_LABELS:
@@ -96,7 +108,7 @@ def build_groups(df, slice_counts):
     return groups
 
 
-def plot_groups(ax, groups):
+def plot_groups(ax, groups, thesis=False):
     """Draw variable-width grouped bars. Returns {label: patch} for legend."""
     seen = {}
     x = 0.0
@@ -116,18 +128,19 @@ def plot_groups(ax, groups):
                 BAR_WIDTH,
                 color=color,
                 hatch=hatch,
-                edgecolor="#555555",
+                edgecolor="black" if thesis else "#555555",
                 linewidth=0.5,
             )
-            ax.text(
-                pos,
-                val,
+            ax.annotate(
                 f"{val:.1f}",
-                ha="left",
+                (pos, val),
+                xytext=(0, 3 if thesis else 0),
+                textcoords="offset points",
+                ha="center" if thesis else "left",
                 va="bottom",
                 fontsize=6,
                 fontweight="bold",
-                rotation=45,
+                rotation=90 if thesis else 45,
             )
             if name not in seen:
                 seen[name] = rect[0]
@@ -155,13 +168,18 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "results_tsv", nargs="+", help="Path(s) to results.tsv from eval.sh"
+        "results_tsv", nargs="+", help="Path(s) to results.tsv from performance.sh"
     )
     parser.add_argument(
         "-o",
         "--output",
         default="perf_bar.pdf",
         help="Output file (default: perf_bar.pdf)",
+    )
+    parser.add_argument(
+        "--thesis",
+        action="store_true",
+        help="Use black-and-white hatched bars with one subplot per row",
     )
     parser.add_argument(
         "-g",
@@ -178,8 +196,19 @@ def main():
         gpu_names.extend([gpu_names[-1]] * (n - len(gpu_names)))
     gpu_names = gpu_names[:n]
 
-    fig, axes = plt.subplots(1, n, figsize=(7 * n, 3.2), squeeze=False)
-    axes = axes[0]  # flatten from (1, n) to (n,)
+    if args.thesis:
+        plt.rcParams.update({
+            "text.color": "black",
+            "axes.labelcolor": "black",
+            "axes.edgecolor": "black",
+            "xtick.color": "black",
+            "ytick.color": "black",
+            "hatch.color": "black",
+        })
+        fig, axes = plt.subplots(n, 1, figsize=(7, 3.2 * n), squeeze=False)
+    else:
+        fig, axes = plt.subplots(1, n, figsize=(7 * n, 3.2), squeeze=False)
+    axes = axes.ravel()
 
     all_handles = {}
     for idx, (tsv_path, gpu) in enumerate(zip(args.results_tsv, gpu_names)):
@@ -188,17 +217,22 @@ def main():
         df["GStPt/s"] = pd.to_numeric(df["GStPt/s"], errors="coerce")
 
         slice_counts = sorted(
-            int(d.split("=")[1])
-            for d in df.loc[df["Framework"] == "OzakiConvStencil", "Detail"].unique()
+            {
+                int(match.group(1))
+                for detail in df.loc[
+                    df["Framework"] == "OzakiStencil", "Detail"
+                ].unique()
+                if (match := re.fullmatch(r"s=(\d+)", str(detail))) is not None
+            }
         )
 
         groups = build_groups(df, slice_counts)
-        handles = plot_groups(ax, groups)
+        handles = plot_groups(ax, groups, thesis=args.thesis)
         all_handles.update(handles)
 
         ax.set_xlabel("Data slices")
-        if idx == 0:
-            ax.set_ylabel("GStPt/s")
+        if idx == 0 or args.thesis:
+            ax.set_ylabel("GPt/s")
         ax.set_title(f"{gpu}", pad=16)
         sns.despine(ax=ax)
 
@@ -208,9 +242,10 @@ def main():
     #    ax.set_ylim(0, global_ymax)
 
     # Single shared legend from the last subplot
-    order = list(OZAKI_VARIANTS.values()) + [
+    order = [display for _, display in OZAKI_VARIANTS] + [
         "Direct FP32",
         "Direct FP64",
+        "Direct FP128",
         "ConvStencil",
         "EBISU",
     ]

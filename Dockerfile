@@ -1,4 +1,4 @@
-FROM nvidia/cuda:13.2.0-cudnn-devel-ubuntu24.04
+FROM nvidia/cuda:13.2.0-devel-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN sed -i 's/archive.ubuntu.com/mirrors.kernel.org/g' /etc/apt/sources.list.d/ubuntu.sources || true \
@@ -35,6 +35,12 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir numpy scipy seaborn matplotlib pandas
+
+# CUTLASS/CuTe is header-only: a shallow clone of a pinned release is enough.
+# CMake locates it through CUTLASS_PATH (see find_path in CMakeLists.txt).
+ARG CUTLASS_VERSION=v4.8.1
+RUN git clone --depth 1 --branch ${CUTLASS_VERSION} https://github.com/NVIDIA/cutlass.git /opt/cutlass
+ENV CUTLASS_PATH=/opt/cutlass
 
 WORKDIR /artifact
 COPY . /artifact

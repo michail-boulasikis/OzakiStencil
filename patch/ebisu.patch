@@ -260,6 +260,11 @@ diff --git a/3dstencil/3d13pt/CMakeLists.txt b/3dstencil/3d13pt/CMakeLists.txt
 index 31df521..156e96e 100644
 --- a/3dstencil/3d13pt/CMakeLists.txt
 +++ b/3dstencil/3d13pt/CMakeLists.txt
+@@ -1,3 +1,3 @@
+-SET(CUDA_SEPARABLE_COMPILATION ON)
++set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+ # find_package(CUDA QUIET REQUIRED)
+ find_package(CUDA REQUIRED)
 @@ -24,7 +24,7 @@ target_link_libraries(${reference_goal} PUBLIC
  set_target_properties(${reference_goal} PROPERTIES
                              COMPILE_FLAGS " -DREFCHECK ")     
@@ -271,7 +276,8 @@ index 31df521..156e96e 100644
  
 @@ -60,13 +60,13 @@ function(subcompile prefix default_compiler_flag aim)
      add_library(${libraryname} ${LOCAL_SOURCE})
-     set_target_properties(${libraryname} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+-    set_target_properties(${libraryname} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
++    set_target_properties(${libraryname} PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS OFF)
      set_target_properties(${libraryname} PROPERTIES COMPILE_FLAGS "${local_compiler_flag} ")
 -    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "80")
 +    set_target_properties(${libraryname} PROPERTIES CUDA_ARCHITECTURES "${GPU_ARCH}")

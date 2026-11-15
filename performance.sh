@@ -7,9 +7,8 @@ set -u # Error on undefined variables
 
 # Default Arguments
 WARMUP_RUNS=10
-ARCH="${CUDA_COMPUTE_CAPABILITY:?Error: CUDA_COMPUTE_CAPABILITY is not set. Run via entrypoint.sh or set it manually (e.g. export CUDA_COMPUTE_CAPABILITY=90a).}"
+ARCH="${CUDA_COMPUTE_CAPABILITY:?Error: CUDA_COMPUTE_CAPABILITY is not set. Run via entrypoint.sh or set it manually (e.g. export CUDA_COMPUTE_CAPABILITY=120).}"
 CLEAN_FIRST=0
-USE_NCU=0
 JOBS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 
 # Paths
@@ -20,20 +19,7 @@ PATCH_DIR="${ROOT_DIR}/patch"
 
 # Problem Size
 INPUT_SIZE=8192
-
-# Database Query
-SQL_QUERY="SELECT
-  SUM(k.end - k.start)
-FROM CUPTI_ACTIVITY_KIND_KERNEL AS k
-JOIN StringIds AS s
-  ON k.demangledName = s.id
-WHERE k.start NOT IN (
-  SELECT start
-  FROM CUPTI_ACTIVITY_KIND_KERNEL
-  ORDER BY start ASC
-  LIMIT ${WARMUP_RUNS}
-) AND s.value NOT LIKE '%gold%'
-GROUP BY s.value;"
+INPUT_SIZE_3D=288
 
 # ==========================================
 # --- 2. Helper Functions ---
@@ -42,6 +28,12 @@ GROUP BY s.value;"
 log()      { echo "[$(date '+%H:%M:%S')] $*"; }
 log_warn() { echo "[$(date '+%H:%M:%S')] WARN: $*" >&2; }
 log_err()  { echo "[$(date '+%H:%M:%S')] ERROR: $*" >&2; }
+
+# Native device __float128 is compiled by this project for SM 10.0 and newer.
+supports_naive_fp128() {
+  local arch_digits="${ARCH%%[!0-9]*}"
+  [[ -n "$arch_digits" ]] && ((10#$arch_digits >= 100))
+}
 
 # Append a tab-separated result row: Framework  Stencil  Detail  GStPt/s
 record_result() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "${RESULTS_FILE}"; }
@@ -54,21 +46,6 @@ run_or_die() {
     log_err "$msg (Exit Code: $status)"
     exit $status
   fi
-}
-
-get_kernel_time_from_sqlite() {
-  local db_path="$1"
-  python3 -c "
-import sqlite3, sys
-try:
-  conn = sqlite3.connect('${db_path}')
-  cursor = conn.cursor()
-  cursor.execute(\"\"\"${SQL_QUERY}\"\"\")
-  result = cursor.fetchone()
-  print(result[0] if result and result[0] is not None else '')
-except Exception as e:
-  sys.exit(1)
-"
 }
 
 setup_repo() {
@@ -92,49 +69,6 @@ setup_repo() {
   popd > /dev/null
 }
 
-run_nsys() {
-  local output_path="$1"
-  shift
-  if [ ! -f "${output_path}.nsys-rep" ]; then
-    log "Profiling NSYS: $(basename "${output_path}")"
-    nsys profile \
-      --trace="cuda,nvtx" \
-      --stats=true \
-      --gpu-metrics-devices=cuda-visible \
-      --force-overwrite=true \
-      -o "${output_path}" \
-      "$@" > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-      log_warn "NSYS exited with error for ${output_path}, result is likely wrong."
-    fi
-  else
-    log "Report $(basename "${output_path}") already exists. Skipping."
-  fi
-}
-
-run_ncu() {
-  if [ "${USE_NCU}" -eq 0 ]; then return; fi
-
-  local output_path="$1"
-  shift
-  if [ ! -f "${output_path}.ncu-rep" ]; then
-    log "Profiling NCU: $(basename "${output_path}")"
-    ncu \
-      --set full \
-      --launch-skip "${WARMUP_RUNS}" \
-      --launch-count 1 \
-      --target-processes all \
-      --force-overwrite \
-      --export "${output_path}" \
-      "$@" > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-      log_warn "NCU exited with error for ${output_path}, result is likely wrong."
-    fi
-  else
-    log "Report $(basename "${output_path}").ncu-rep already exists. Skipping."
-  fi
-}
-
 # ==========================================
 # --- 3. Argument Parsing ---
 # ==========================================
@@ -142,11 +76,10 @@ run_ncu() {
 print_usage() {
   echo "Usage: $(basename "$0") [options]"
   echo "  -c, --clean         Clean results and benchmark build directories"
-  echo "  --ncu               Generate NCU reports (script runs slower)"
   echo "  -h, --help          Show this help"
   echo ""
   echo "  Requires CUDA_COMPUTE_CAPABILITY to be set in the environment"
-  echo "  (e.g. export CUDA_COMPUTE_CAPABILITY=90a). This is done automatically"
+  echo "  (e.g. export CUDA_COMPUTE_CAPABILITY=120). This is done automatically"
   echo "  when running via entrypoint.sh."
 }
 
@@ -154,7 +87,6 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     -c|--clean) CLEAN_FIRST=1; shift ;;
     -h|--help) print_usage; exit 0 ;;
-    --ncu) USE_NCU=1; shift ;;
     *) log_warn "Unknown option: $1 (ignored)"; shift ;;
   esac
 done
@@ -164,6 +96,52 @@ done
 # --- 4. Benchmark Modules ---
 # ==========================================
 
+domain_size_for_stencil() {
+  case "$1" in
+    3x3x3*|5x5x5*) printf '%sx%sx%s\n' "$INPUT_SIZE_3D" "$INPUT_SIZE_3D" "$INPUT_SIZE_3D" ;;
+    *)              printf '%sx%s\n' "$INPUT_SIZE" "$INPUT_SIZE" ;;
+  esac
+}
+
+bench_naive() {
+  log "--- Running naive baselines ---"
+  pushd "$ROOT_DIR" > /dev/null
+
+  local exe="./build/bin/bench-stencil"
+  local stencil_dir="data/stencils"
+  # The m=1, m=2, and m=None stencil variants use the same naive kernel.
+  local stencil_names=(
+    "7x7LmNone_0"
+    "15x15LmNone_0"
+    "5x5x5LmNone_0"
+  )
+
+  for name in "${stencil_names[@]}"; do
+    local stencil_file="${stencil_dir}/${name}.stc"
+    local domain_size
+    domain_size=$(domain_size_for_stencil "$name")
+    local output gstpts_64 gstpts_32
+    local naive_algorithms="naive-fp64,naive-fp32"
+    if supports_naive_fp128; then
+      naive_algorithms+=",naive-fp128"
+    fi
+
+    log "Benchmarking naive kernels: ${name}"
+    output=$("$exe" -S "$domain_size" --stencil-file "$stencil_file" \
+      -A "$naive_algorithms" -T 128 -W "$WARMUP_RUNS" 2>/dev/null)
+    gstpts_64=$(awk '/^Naive FP64 GStPt\/s / {print $NF}' <<< "$output")
+    gstpts_32=$(awk '/^Naive FP32 GStPt\/s / {print $NF}' <<< "$output")
+    record_result "Direct FP64" "$name" "-" "$gstpts_64"
+    record_result "Direct FP32" "$name" "-" "$gstpts_32"
+    if supports_naive_fp128; then
+      local gstpts_128
+      gstpts_128=$(awk '/^Naive FP128 GStPt\/s / {print $NF}' <<< "$output")
+      record_result "Direct FP128" "$name" "-" "$gstpts_128"
+    fi
+  done
+  popd > /dev/null
+}
+
 bench_ozaki() {
   log "--- Running OzakiStencil ---"
   pushd "$ROOT_DIR" > /dev/null
@@ -171,66 +149,36 @@ bench_ozaki() {
   local exe="./build/bin/bench-stencil"
   local stencil_dir="data/stencils"
 
-  declare -A STENCILS=(
-    ["7x7LmNone_0"]="${stencil_dir}/7x7LmNone_0.stc"
-    ["7x7Lm1_0"]="${stencil_dir}/7x7Lm1_0.stc"
-    ["7x7Lm2_0"]="${stencil_dir}/7x7Lm2_0.stc"
+  local stencil_names=(
+    "7x7Lm1_0"
+    "7x7Lm2_0"
+    "7x7LmNone_0"
+    "15x15Lm1_0"
+    "15x15Lm2_0"
+    "15x15Lm3_0"
+    "15x15LmNone_0"
+    "5x5x5Lm1_0"
+    "5x5x5Lm2_0"
+    "5x5x5LmNone_0"
   )
 
-  local slice_counts=(5 7 10 13 17)
-  local profile_slices=10  # only generate NSYS/NCU reports for this slice count
-
-  for name in "${!STENCILS[@]}"; do
-    local stencil_file="${STENCILS[$name]}"
-    local base_args="-S ${INPUT_SIZE}x${INPUT_SIZE} --stencil-file ${stencil_file}"
-
+  # Data slices control input precision.  They are independent of the packed
+  # coefficient-kernel variants selected by the stencil files below.
+  local slice_counts=(5 9 13 17)
+  for name in "${stencil_names[@]}"; do
+    local stencil_file="${stencil_dir}/${name}.stc"
+    local domain_size
+    domain_size=$(domain_size_for_stencil "$name")
     log "Benchmarking OzakiStencil: ${name}"
-
-    # FP64 baseline (independent of slice count, run once)
-    local output gstpts_64 gstpts_32
-    output=$($exe $base_args -A naive-fp64,naive-fp32 -T 128 -W ${WARMUP_RUNS} -R 2 2>/dev/null)
-    gstpts_64=$(echo "$output" | awk '/^Naive FP64/ {print $NF}')
-    gstpts_32=$(echo "$output" | awk '/^Naive FP32/ {print $NF}')
-    record_result "Direct FP64" "$name" "-" "$gstpts_64"
-    record_result "Direct FP32" "$name" "-" "$gstpts_32"
 
     for s in "${slice_counts[@]}"; do
       log "  slices=${s}"
 
-      output=$($exe $base_args -A convstencil -s "$s" -T 128 -W ${WARMUP_RUNS} -R 2 2>/dev/null)
-      gstpts=$(echo "$output" | awk '/^Ozaki ConvStencil/ {print $NF}')
-      record_result "OzakiConvStencil" "$name" "s=${s}" "$gstpts"
-
-      # NSYS/NCU reports only for the representative slice count
-      if [ "$s" -eq "${profile_slices}" ]; then
-        run_nsys "${REPORT_DIR}/ozaki_naive_fp64_${name}" \
-          $exe $base_args -A naive-fp64 -T 128 -W ${WARMUP_RUNS} -R 1
-        run_nsys "${REPORT_DIR}/ozaki_conv_${name}" \
-          $exe $base_args -A convstencil -s "$s" -T 128 -W ${WARMUP_RUNS} -R 1
-
-        if [ "${USE_NCU}" -eq 1 ]; then
-          for ncu_spec in "naive-fp64:ozaki_naive_fp64" "convstencil:ozaki_conv"; do
-            local algo="${ncu_spec%%:*}"
-            local report="${ncu_spec##*:}_${name}"
-            local ncu_args="$base_args -A ${algo} --ncu-mode"
-            [ "$algo" = "convstencil" ] && ncu_args="$ncu_args -s $s"
-            if [ ! -f "${REPORT_DIR}/${report}.ncu-rep" ]; then
-              log "Profiling NCU: ${report}"
-              ncu \
-                --set full \
-                --target-processes all \
-                --force-overwrite \
-                --export "${REPORT_DIR}/${report}" \
-                $exe $ncu_args > /dev/null 2>&1
-              if [ $? -ne 0 ]; then
-                log_warn "NCU exited with error for ${report}, result is likely wrong."
-              fi
-            else
-              log "Report ${report}.ncu-rep already exists. Skipping."
-            fi
-          done
-        fi
-      fi
+      local output gstpts
+      output=$("$exe" -S "$domain_size" --stencil-file "$stencil_file" \
+        -A ozaki -s "$s" -T 128 -W "$WARMUP_RUNS" 2>/dev/null)
+      gstpts=$(awk '/^OzakiStencil GStPt\/s / {print $NF}' <<< "$output")
+      record_result "OzakiStencil" "$name" "s=${s}" "$gstpts"
     done
   done
   popd > /dev/null
@@ -255,13 +203,11 @@ bench_convstencil() {
     local std_name="${MAP[$bench_arg]}"
     local total_runs=$((128 + WARMUP_RUNS))
     
-    log "Profiling ConvStencil: ${bench_arg} -> ${std_name}"
+    log "Benchmarking ConvStencil: ${bench_arg} -> ${std_name}"
 
     local cmd="./convstencil_2d ${bench_arg} ${INPUT_SIZE} ${INPUT_SIZE} ${total_runs}"
     gstpts=$(eval "$cmd" | awk '/GStencil\/s/ {print $3}')
     record_result "ConvStencil" "$std_name" "-" "$gstpts"
-    run_nsys "${REPORT_DIR}/convstencil_${std_name}" $cmd
-    run_ncu "${REPORT_DIR}/convstencil_${std_name}" $cmd
   done
   popd > /dev/null
 }
@@ -299,13 +245,11 @@ bench_ebisu() {
     local total_runs=$((128 + WARMUP_RUNS))
     local exe="./build/init/${bench_dir}/${bench_dir}_ebisu.exe"
 
-    log "Profiling EBISU: ${bench_dir} -> ${std_name}"
+    log "Benchmarking EBISU: ${bench_dir} -> ${std_name}"
 
     local cmd="${exe} ${INPUT_SIZE} ${INPUT_SIZE} --iter=${total_runs} --verbose"
     gstpts=$(eval "$cmd" 2>/dev/null | awk '/GCells\/s/ && !/Valid/ {print $NF}')
     record_result "EBISU" "$std_name" "-" "$gstpts"
-    run_nsys "${REPORT_DIR}/ebisu_${std_name}" $cmd
-    run_ncu "${REPORT_DIR}/ebisu_${std_name}" $cmd
   done
   popd > /dev/null
 }
@@ -327,6 +271,7 @@ mkdir -p "${BENCH_DIR}"
 RESULTS_FILE="${REPORT_DIR}/results.tsv"
 printf 'Framework\tStencil\tDetail\tGStPt/s\n' > "${RESULTS_FILE}"
 
+bench_naive
 bench_ozaki
 cd "$BENCH_DIR" || exit 1
 bench_convstencil
@@ -342,7 +287,7 @@ python3 "${ROOT_DIR}/scripts/plot_perf_bar.py" "${RESULTS_FILE}" \
 
 echo ""
 echo "================================================================"
-echo "  Summary — ${INPUT_SIZE}x${INPUT_SIZE}, sm_${ARCH}"
+echo "  Summary — 2D ${INPUT_SIZE}x${INPUT_SIZE}; 3D ${INPUT_SIZE_3D}x${INPUT_SIZE_3D}x${INPUT_SIZE_3D}, sm_${ARCH}"
 echo "================================================================"
 awk -F'\t' '
   NR==1 { next }

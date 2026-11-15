@@ -1,63 +1,29 @@
 #include <ozaki/utils/stencil_spec.hpp>
 
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 
-StencilSpec parse_stencil_arg(const std::string &arg) {
-  StencilSpec spec;
+#include <quadmath.h>
 
-  auto colon = arg.find(':');
-  if (colon == std::string::npos)
-    throw std::invalid_argument("Stencil arg must be 'RxC:c0,c1,...', got: " + arg);
+namespace {
 
-  // Parse shape from "RxC" or "RxCxD"
-  std::string shape_str = arg.substr(0, colon);
-  std::istringstream shape_ss(shape_str);
-  std::string dim_str;
-  while (std::getline(shape_ss, dim_str, 'x')) {
-    spec.shape.push_back(std::stoi(dim_str));
+size_t checked_shape_product(const std::vector<int> &shape, const std::string &context) {
+  if (shape.empty())
+    throw std::invalid_argument(context + ": shape must not be empty");
+  size_t product = 1;
+  for (const int extent : shape) {
+    if (extent <= 0)
+      throw std::invalid_argument(context + ": shape extents must be positive");
+    if (product > std::numeric_limits<size_t>::max() / static_cast<size_t>(extent))
+      throw std::overflow_error(context + ": shape product overflows size_t");
+    product *= static_cast<size_t>(extent);
   }
-
-  // Default offsets: center of each dimension
-  for (int d : spec.shape) {
-    spec.offsets.push_back(d / 2);
-  }
-
-  // Parse coefficients
-  std::string coeffs_str = arg.substr(colon + 1);
-  std::istringstream coeffs_ss(coeffs_str);
-  std::string coeff_str;
-  while (std::getline(coeffs_ss, coeff_str, ',')) {
-#ifdef OZAKI_HAVE_FLOAT128
-    spec.coeffs.push_back(strtoflt128(coeff_str.c_str(), nullptr));
-#else
-    spec.coeffs.push_back(static_cast<CoeffStorageType>(std::stold(coeff_str)));
-#endif
-  }
-
-  // Validate size
-  size_t expected_size = 1;
-  for (int d : spec.shape)
-    expected_size *= static_cast<size_t>(d);
-  if (spec.coeffs.size() != expected_size)
-    throw std::invalid_argument("Coefficient count (" + std::to_string(spec.coeffs.size()) +
-                                ") doesn't match shape product (" + std::to_string(expected_size) + ")");
-
-  // Infer precision from values: if all round-trip through int8, mark as Int8
-  bool all_int8 = true;
-  for (const auto &c : spec.coeffs) {
-    auto rounded = static_cast<CoeffStorageType>(static_cast<int8_t>(static_cast<long double>(c)));
-    if (rounded != c) {
-      all_int8 = false;
-      break;
-    }
-  }
-  spec.specified_precision = all_int8 ? OriginalPrecision::Int8 : OriginalPrecision::Double;
-  spec.name = "inline";
-
-  return spec;
+  return product;
 }
+
+} // namespace
 
 StencilSpec read_stencil_file(const std::string &path) {
   std::ifstream f(path);
@@ -83,11 +49,7 @@ StencilSpec read_stencil_file(const std::string &path) {
       std::istringstream ss(line);
       std::string token;
       while (ss >> token) {
-#ifdef OZAKI_HAVE_FLOAT128
         spec.coeffs.push_back(strtoflt128(token.c_str(), nullptr));
-#else
-        spec.coeffs.push_back(static_cast<CoeffStorageType>(std::stold(token)));
-#endif
       }
       continue;
     }
@@ -133,9 +95,7 @@ StencilSpec read_stencil_file(const std::string &path) {
   }
 
   // Validate
-  size_t expected_size = 1;
-  for (int d : spec.shape)
-    expected_size *= static_cast<size_t>(d);
+  const size_t expected_size = checked_shape_product(spec.shape, "Stencil file '" + path + "'");
   if (spec.coeffs.size() != expected_size)
     throw std::invalid_argument("Stencil file '" + path + "': coefficient count (" +
                                 std::to_string(spec.coeffs.size()) + ") doesn't match shape product (" +
@@ -143,4 +103,3 @@ StencilSpec read_stencil_file(const std::string &path) {
 
   return spec;
 }
-

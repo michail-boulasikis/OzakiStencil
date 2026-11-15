@@ -7,18 +7,10 @@
 #include <string>
 #include <vector>
 
-#ifndef OZAKI_HAVE_FLOAT128
-#if (defined(__GNUC__) && !defined(__NVCOMPILER) && !defined(__CUDA_ARCH__)) || __CUDA_ARCH__ >= 1000
-#define OZAKI_HAVE_FLOAT128 1
-#endif
-#endif
-
-#ifdef OZAKI_HAVE_FLOAT128
 #include <quadmath.h>
+
+// Coefficients are kept in binary128 so every supported file precision is exact.
 using CoeffStorageType = __float128;
-#else
-using CoeffStorageType = long double;
-#endif
 
 enum class OriginalPrecision { Int8, Float, Double, LongDouble, Float128 };
 
@@ -29,10 +21,6 @@ struct StencilSpec {
   std::vector<CoeffStorageType> coeffs;
   OriginalPrecision specified_precision = OriginalPrecision::Double;
 };
-
-// Parses an inline stencil specification of the form "RxC:c0,c1,c2,..."
-// Example: "3x3:0,3,0,3,4,3,0,3,0"
-StencilSpec parse_stencil_arg(const std::string &arg);
 
 // Reads a stencil specification from a text file.
 // Format:
@@ -45,6 +33,6 @@ StencilSpec parse_stencil_arg(const std::string &arg);
 //   0.0  3.0  0.0
 //   3.0  4.0  3.0
 //   0.0  3.0  0.0
-StencilSpec read_stencil_file(const std::string &path); 
+StencilSpec read_stencil_file(const std::string &path);
 
 #endif // HEADER_STENCIL_SPEC_HPP

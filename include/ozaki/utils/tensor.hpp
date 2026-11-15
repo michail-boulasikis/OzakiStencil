@@ -1,18 +1,16 @@
 #ifndef HEADER_TENSOR_HPP
 #define HEADER_TENSOR_HPP
 
-#include <vector>
 #include <fstream>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 template <typename T> struct Tensor {
   std::vector<size_t> shape;
   std::vector<T> data;
 
   size_t size() const { return data.size(); }
-  size_t width() const { return shape.empty() ? 0 : shape[0]; }
-  size_t height() const { return shape.size() > 1 ? shape[1] : 1; }
 };
 
 template <typename T> size_t get_type_id() {
@@ -22,16 +20,10 @@ template <typename T> size_t get_type_id() {
     return 1;
   } else if constexpr (std::is_same_v<T, long double>) {
     return 2;
-#if defined(__CUDACC__) && (__CUDA_ARCH__ >= 1000)
-  } else if constexpr (std::is_same_v<T, __float128>) {
-    return 3;
-  }
-#else
   } else {
+    static_assert(std::is_same_v<T, __float128>, "Unsupported tensor element type.");
     return 3;
   }
-#endif
-
 }
 
 template <typename T> Tensor<T> read_tensor(const std::string &filepath) {
@@ -105,13 +97,20 @@ template <typename T> Tensor<T> read_tensor_as(const std::string &filepath) {
   };
 
   switch (type_id) {
-  case 0: read_and_convert.template operator()<float>(); break;
-  case 1: read_and_convert.template operator()<double>(); break;
-  case 2: read_and_convert.template operator()<long double>(); break;
-#ifdef OZAKI_HAVE_FLOAT128
-  case 3: read_and_convert.template operator()<__float128>(); break;
-#endif
-  default: throw std::runtime_error("Unknown type_id " + std::to_string(type_id) + " in " + filepath);
+  case 0:
+    read_and_convert.template operator()<float>();
+    break;
+  case 1:
+    read_and_convert.template operator()<double>();
+    break;
+  case 2:
+    read_and_convert.template operator()<long double>();
+    break;
+  case 3:
+    read_and_convert.template operator()<__float128>();
+    break;
+  default:
+    throw std::runtime_error("Unknown type_id " + std::to_string(type_id) + " in " + filepath);
   }
   return {shape, data};
 }
@@ -155,7 +154,4 @@ template <typename T> void write_tensor(const std::string &filepath, const Tenso
   f.write(reinterpret_cast<const char *>(tensor.data.data()), tensor.size() * sizeof(T));
 }
 
-
-
 #endif // HEADER_TENSOR_HPP
-

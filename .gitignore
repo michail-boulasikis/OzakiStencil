@@ -20,3 +20,6 @@ presentation/node_modules/
 *.sqlite
 temp.txt
 docs/
+
+__pycache__/
+*.py[cod]

@@ -7,9 +7,7 @@
 #include <string>
 #include <vector>
 
-#ifdef OZAKI_HAVE_FLOAT128
 #include <quadmath.h>
-#endif
 
 // ============================================================
 // Roundtrip test fixture
@@ -53,8 +51,7 @@ TEST_F(TensorIOTest, Roundtrip_Float_1D) {
 
   // Shape accessor checks
   EXPECT_EQ(t2.shape.size(), 1u);
-  EXPECT_EQ(t2.width(), 10u);
-  EXPECT_EQ(t2.height(), 1u);
+  EXPECT_EQ(t2.shape, t.shape);
 }
 
 TEST_F(TensorIOTest, Roundtrip_Double_2D) {
@@ -75,8 +72,7 @@ TEST_F(TensorIOTest, Roundtrip_Double_2D) {
 
   // Shape accessor checks
   EXPECT_EQ(t2.shape.size(), 2u);
-  EXPECT_EQ(t2.width(), 4u);
-  EXPECT_EQ(t2.height(), 5u);
+  EXPECT_EQ(t2.shape, t.shape);
 }
 
 TEST_F(TensorIOTest, Roundtrip_LongDouble_3D) {
@@ -97,8 +93,7 @@ TEST_F(TensorIOTest, Roundtrip_LongDouble_3D) {
 
   // Shape accessor checks
   EXPECT_EQ(t2.shape.size(), 3u);
-  EXPECT_EQ(t2.width(), 2u);
-  EXPECT_EQ(t2.height(), 3u);
+  EXPECT_EQ(t2.shape, t.shape);
 }
 
 TEST_F(TensorIOTest, Roundtrip_Float128_1D) {

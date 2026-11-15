@@ -18,7 +18,6 @@ int main(int argc, char *argv[]) {
   std::string output_dir;
   std::string output_prefix;
   std::string input_file;
-  std::string stencil_arg;
   std::string stencil_file;
   std::vector<size_t> timesteps;
   bool compute_float_ref = false;
@@ -36,11 +35,7 @@ int main(int argc, char *argv[]) {
      "Directory for output tensor files")
     ("prefix,p", po::value<std::string>(&output_prefix)->default_value("ref"),
      "Output file prefix")
-    ("stencil", po::value<std::string>(&stencil_arg),
-     "Inline stencil spec: \"RxC:c0,c1,...\"")
-    ("stencil-arg", po::value<std::string>(&stencil_arg),
-     "Alias for --stencil")
-    ("stencil-file", po::value<std::string>(&stencil_file),
+    ("stencil-file", po::value<std::string>(&stencil_file)->required(),
      "Path to stencil text file")
     ("timesteps,T", po::value<std::vector<size_t>>(&timesteps)->multitoken(),
      "Timesteps to compute (e.g., -T 100 1000 10000)")
@@ -60,9 +55,6 @@ int main(int argc, char *argv[]) {
       std::cout << desc << "\n";
       return 0;
     }
-
-    if (!vm.count("stencil") && !vm.count("stencil-arg") && !vm.count("stencil-file"))
-      throw std::invalid_argument("Must specify --stencil, --stencil-arg, or --stencil-file");
 
     po::notify(vm);
 
@@ -91,16 +83,10 @@ int main(int argc, char *argv[]) {
   try {
     Tensor<__float128> input = read_tensor<__float128>(input_file);
 
-    // Collect stencil specifications
-    std::vector<StencilSpec> specs;
-    if (!stencil_arg.empty()) {
-      specs.push_back(parse_stencil_arg(stencil_arg));
-    } else {
-      specs.push_back(read_stencil_file(stencil_file));
-    }
+    const StencilSpec spec = read_stencil_file(stencil_file);
 
-    for (const auto &spec : specs) {
-      auto variant = ozi::make_stencil(spec);
+    {
+      auto variant = ozaki::make_stencil(spec);
 
       for (size_t timestep : timesteps) {
         std::cerr << "Computing references for '" << spec.name << "' at " << timestep << " timesteps...\n";
@@ -121,10 +107,8 @@ int main(int argc, char *argv[]) {
           std::cerr << "  Wrote: " << path << "\n";
         };
 
-#ifdef OZAKI_HAVE_FLOAT128
         if (compute_fp128_ref)
           compute_and_save.template operator()<__float128>("fp128");
-#endif
         if (compute_longdouble_ref)
           compute_and_save.template operator()<long double>("longdouble");
         if (compute_double_ref)

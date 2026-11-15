@@ -8,22 +8,14 @@ echo "========================================"
 # Check if the evaluator passed the GPU architecture variable
 if [ -z "$CUDA_COMPUTE_CAPABILITY" ]; then
     echo "Warning: CUDA_COMPUTE_CAPABILITY environment variable not set."
-    echo "Defaulting to '90a' (Hopper). If this is wrong,"
+    echo "Defaulting to '120' (sm120). If this is wrong,"
     echo "run the container with: -e CUDA_COMPUTE_CAPABILITY=\"your_arch\""
-    CUDA_COMPUTE_CAPABILITY="90a"
+    CUDA_COMPUTE_CAPABILITY="120"
 fi
 
 export CUDA_COMPUTE_CAPABILITY="${CUDA_COMPUTE_CAPABILITY}"
 
-./build.sh -c -t -- -DCUDA_COMPUTE_CAPABILITY="${CUDA_COMPUTE_CAPABILITY}" -DOZAKI_USE_BOOST_MULTIPRECISION="ON"
-
-echo "========================================"
-echo "Generating Test Tensors"
-echo "========================================"
-
-./build/bin/gen-tensor --N 262144 --dims 1 -o data/1D_262144.dat
-./build/bin/gen-tensor --N 512 --dims 2 -o data/2D_512x512.dat
-./build/bin/gen-tensor --N 64 --dims 3 -o data/3D_64x64x64.dat
+./build.sh -c -t -- -DCUDA_COMPUTE_CAPABILITY="${CUDA_COMPUTE_CAPABILITY}"
 
 echo ""
 echo "========================================"
@@ -32,10 +24,10 @@ echo "You are now inside the OzakiStencil artifact container. You can run the fo
 echo ""
 echo "1. Correctness Tests:"
 echo " To run the random stencil suite:"
-echo "    python scripts/precision_tester.py data/1D_262144.dat data/2D_512x512.dat data/3D_64x64x64.dat"
+echo "    python scripts/precision_tester.py"
 echo " To generate correctness plots:"
-echo "   ./correctness.sh <stencils...>"
-echo "   (Example (Figure 6 in paper): ./correctness.sh data/stencils/heat.stc data/stencils/ad.stc data/stencils/7x7Lm1_0.stc data/stencils/3x3x3LmNone_0.stc)"
+echo "   ./correctness.sh"
+echo "   (Runs the default 15-stencil suite; pass stencil files to override it.)"
 echo ""
 echo "2. Performance Benchmarks:"
 echo "   ./performance.sh"

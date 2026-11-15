@@ -14,15 +14,22 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/lib")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # options
-set(CUDA_COMPUTE_CAPABILITY "120" CACHE STRING "Target CUDA compute capability (single value, e.g. '90a', '100', '120').")
+set(CUDA_COMPUTE_CAPABILITY "120" CACHE STRING "Target CUDA compute capability (single value, e.g. '90a', '100', '103a' for GB300, '120').")
 option(BUILD_TESTING "Build the project's tests" ON)
-option(OZAKI_NVTX_EVENTS "Whether to record NVTX events" ON)
-option(OZAKI_USE_BOOST_MULTIPRECISION "Use Boost.Multiprecision for high-precision scale factor computation" OFF)
 
 # dependencies
 include(cmake/Dependencies.cmake)
 find_package(CUDAToolkit REQUIRED)
-find_package(CUDNN REQUIRED)
+find_path(CUTLASS_INCLUDE_DIR
+  NAMES cute/tensor.hpp
+  HINTS ENV CUTLASS_PATH ENV CUTLASS_ROOT
+  PATH_SUFFIXES include
+  DOC "CUTLASS include directory containing CuTe"
+)
+if(NOT CUTLASS_INCLUDE_DIR)
+  message(FATAL_ERROR
+    "CuTe was not found. Set CUTLASS_INCLUDE_DIR to the CUTLASS include directory.")
+endif()
 # remove a needless warning
 if(POLICY CMP0167)
   cmake_policy(SET CMP0167 NEW)
@@ -47,7 +54,7 @@ endif()
 
 # common config for GPU targets only
 add_library(ozaki_cuda_common INTERFACE)
-target_link_libraries(ozaki_cuda_common INTERFACE ozaki_common ${CUDAToolkit_NVTX_LIBRARY} CUDA::cuda_driver CUDA::cudart)
+target_link_libraries(ozaki_cuda_common INTERFACE ozaki_common CUDA::cuda_driver CUDA::cudart)
 set_target_properties(ozaki_cuda_common PROPERTIES
   CUDA_ARCHITECTURES "${CUDA_COMPUTE_CAPABILITY}"
 )
@@ -61,26 +68,16 @@ if(_arch_count GREATER 1)
   message(FATAL_ERROR "CUDA_COMPUTE_CAPABILITY must be a single architecture (e.g. '90a'), not a list. Got: '${CUDA_COMPUTE_CAPABILITY}'")
 endif()
 
+if(NOT CUDA_COMPUTE_CAPABILITY MATCHES "^(90|90a|100|100a|103|103a|120)$")
+  message(FATAL_ERROR
+    "OzakiStencil kernels require SM90 or newer. Supported CUDA_COMPUTE_CAPABILITY values are 90, 90a, 100, 100a, 103, 103a, and 120; got '${CUDA_COMPUTE_CAPABILITY}'.")
+endif()
+
 # OZAKI_CUDA_ARCH: strip suffixes (e.g. "90a" -> "90") so the define is a
 # plain integer usable in #if preprocessor expressions.
 string(REGEX REPLACE "[a-zA-Z]" "" OZAKI_CUDA_ARCH_NUM "${CUDA_COMPUTE_CAPABILITY}")
 target_compile_definitions(ozaki_common INTERFACE OZAKI_CUDA_ARCH=${OZAKI_CUDA_ARCH_NUM})
 
-# OZAKI_HAVE_WGMMA: WGMMA integer (wgmma.mma_async s8.s8) is only available
-# on SM_90a (Hopper with architecture acceleration). Blackwell (SM_100/SM_100a)
-# uses tcgen05.mma instead; SM_120 has no warp-group MMA at all.
-if(CUDA_COMPUTE_CAPABILITY STREQUAL "90a")
-  target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_HAVE_WGMMA=1)
-endif()
-
-if(OZAKI_NVTX_EVENTS)
-  target_compile_definitions(ozaki_cuda_common INTERFACE OZAKI_NVTX_EVENTS)
-endif()
-
-if(OZAKI_USE_BOOST_MULTIPRECISION)
-  message(STATUS "Boost.Multiprecision enabled for high-precision scale factor computation")
-  target_compile_definitions(ozaki_common INTERFACE OZAKI_USE_BOOST_MULTIPRECISION)
-endif()
 
 # helpers for defining targets with shared boilerplate
 function(add_cpu_lib name)
@@ -119,4 +116,3 @@ if(BUILD_TESTING)
   enable_testing()
   add_subdirectory(test)
 endif()
-

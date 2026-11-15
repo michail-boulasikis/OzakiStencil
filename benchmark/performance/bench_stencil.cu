@@ -1,1228 +1,251 @@
-#include <ozaki/cpu/ozi.hpp>
 #include <ozaki/core/device_memory.cuh>
-#include <ozaki/gpu/benchmark_utils.cuh>
 #include <ozaki/gpu/gpu_checks.cuh>
-#include <ozaki/gpu/ozi.cuh>
-#include <ozaki/gpu/ozi_kernels.cuh>
-#include <ozaki/gpu/ozi_stencil_conv.cuh>
-#include <ozaki/gpu/ozi_stencil_plain.cuh>
-#include <ozaki/gpu/stencil_gpu.cuh>
+#include <ozaki/gpu/naive_stencil.cuh>
+#include <ozaki/gpu/stencil_integrator.cuh>
 #include <ozaki/utils/stencil_registry.hpp>
 #include <ozaki/utils/stencil_spec.hpp>
 #include <ozaki/utils/tensor.hpp>
-
-#include <algorithm>
-#include <climits>
-#include <cmath>
-#include <cuda_runtime_api.h>
-#include <iomanip>
-#include <iostream>
-#include <limits>
-#include <numeric>
-#include <random>
-#include <set>
-#include <sstream>
-#include <stdexcept>
-#include <string>
-#include <type_traits>
-#include <variant>
-#include <vector>
+#include <ozaki/utils/zero_boundary.hpp>
 
 #include <boost/program_options.hpp>
 
-#ifdef OZAKI_HAVE_FLOAT128
-#include <quadmath.h>
-#endif
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <iostream>
+#include <limits>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <vector>
 
 namespace po = boost::program_options;
 
-using Real = double;
-using Oz = ozigpu::OzakiFP_Int8<Real>;
+namespace {
 
-// Configuration and result types
-
-struct BenchConfig {
+struct Config {
   std::vector<size_t> shape;
   int32_t timesteps = 100;
   int32_t warmup = 10;
-  int32_t repeats = 3;
-  int32_t slices_override = 0;
-  int32_t extra_msb = 0;
-  int32_t extra_lsb = 0;
-  uint64_t seed = 42;
-  bool flush_l2 = true;
-  bool ncu_mode = false;
-  dim3 block_size{0, 0, 0}; // {0,0,0} = use default
+  int32_t slices = 10;
 };
 
-struct PhaseTimings {
-  std::vector<float> dyn_range_ms;   // one per repeat
-  std::vector<float> slice_ms;       // one per repeat
-  std::vector<float> integration_ms; // one per repeat
-  std::vector<float> mend_ms;        // one per repeat
-};
-
-enum class AlgoFlag {
-  NaiveFP32 = 1 << 0,
-  NaiveFP64 = 1 << 1,
-  NaiveFP128 = 1 << 2,
-  Direct = 1 << 3,
-  ConvStencil = 1 << 4,
-};
-
-static int parse_algos(const std::string &arg, int device_cc) {
-  int flags = 0;
-  std::istringstream ss(arg);
-  std::string token;
-  while (std::getline(ss, token, ',')) {
-    if (token == "all") {
-      flags = 0xFF;
-    } else if (token == "naive") {
-      flags |= static_cast<int>(AlgoFlag::NaiveFP32) | static_cast<int>(AlgoFlag::NaiveFP64) |
-               static_cast<int>(AlgoFlag::NaiveFP128);
-    } else if (token == "naive-fp32") {
-      flags |= static_cast<int>(AlgoFlag::NaiveFP32);
-    } else if (token == "naive-fp64") {
-      flags |= static_cast<int>(AlgoFlag::NaiveFP64);
-    } else if (token == "naive-fp128") {
-      flags |= static_cast<int>(AlgoFlag::NaiveFP128);
-    } else if (token == "direct") {
-      flags |= static_cast<int>(AlgoFlag::Direct);
-    } else if (token == "convstencil") {
-      flags |= static_cast<int>(AlgoFlag::ConvStencil);
-    } else {
-      throw std::invalid_argument("Unknown algorithm: " + token);
-    }
-  }
-  return flags;
-}
-
-static bool has_algo(int flags, AlgoFlag a) { return (flags & static_cast<int>(a)) != 0; }
-
-// CUDA event timing helpers
-
-struct CudaEventPair {
-  cudaEvent_t start, stop;
-  CudaEventPair() {
-    CUDA_CHECK(cudaEventCreate(&start));
-    CUDA_CHECK(cudaEventCreate(&stop));
-  }
-  ~CudaEventPair() {
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-  }
-  CudaEventPair(const CudaEventPair &) = delete;
-  CudaEventPair &operator=(const CudaEventPair &) = delete;
-
-  void record_start() { CUDA_CHECK(cudaEventRecord(start)); }
-  void record_stop() { CUDA_CHECK(cudaEventRecord(stop)); }
-  float elapsed_ms() {
-    CUDA_CHECK(cudaEventSynchronize(stop));
-    float ms;
-    CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
-    return ms;
-  }
-};
-
-// Statistics helpers
-
-static float stat_min(const std::vector<float> &v) { return *std::min_element(v.begin(), v.end()); }
-
-static float stat_median(std::vector<float> v) {
-  std::sort(v.begin(), v.end());
-  size_t n = v.size();
-  if (n % 2 == 0)
-    return (v[n / 2 - 1] + v[n / 2]) / 2.0f;
-  return v[n / 2];
-}
-
-static float stat_max(const std::vector<float> &v) { return *std::max_element(v.begin(), v.end()); }
-
-static double compute_gstpts(const std::vector<size_t> &shape, int32_t timesteps, float time_ms) {
-  size_t n = 1;
-  for (auto s : shape)
-    n *= s;
-  return static_cast<double>(n) * timesteps / (time_ms * 1e-3) / 1e9;
-}
-
-// Grid/block helpers (same conventions as ozaki_runner.cuh)
-
-template <size_t NDims>
-static std::pair<dim3, dim3> make_grid_block(const std::vector<size_t> &shape, const dim3 *block_override = nullptr) {
-  dim3 block;
-  if (block_override && block_override->x > 0) {
-    block = *block_override;
-  } else if constexpr (NDims == 1) {
-    block = dim3(256);
-  } else if constexpr (NDims == 2) {
-    block = dim3(32, 8);
-  } else {
-    block = dim3(8, 8, 4);
-  }
-
-  dim3 grid;
-  if constexpr (NDims == 1) {
-    grid = dim3((shape[0] + block.x - 1) / block.x);
-  } else if constexpr (NDims == 2) {
-    grid = dim3((shape[1] + block.x - 1) / block.x, (shape[0] + block.y - 1) / block.y);
-  } else {
-    grid = dim3((shape[2] + block.x - 1) / block.x, (shape[1] + block.y - 1) / block.y,
-                (shape[0] + block.z - 1) / block.z);
-  }
-  return {grid, block};
-}
-
-// Naive FP benchmark (templated on Real type)
-
-template <typename FPType, size_t... Dims>
-static void launch_naive_kernel(FPType *out, const FPType *in,
-                                const typename ozi::Stencil<FPType, Dims...>::shape_type &input_shape, dim3 grid,
-                                dim3 block) {
-  if constexpr (std::is_same_v<FPType, float>) {
-    ozi::stencil_fp32<Dims...><<<grid, block>>>(out, in, input_shape);
-  } else if constexpr (std::is_same_v<FPType, double>) {
-    ozi::stencil_fp64<Dims...><<<grid, block>>>(out, in, input_shape);
-  } else {
-#if !defined(__CUDA_ARCH_LIST__) || __CUDA_ARCH_LIST__ >= 1000
-    ozi::stencil_fp128<Dims...><<<grid, block>>>(out, in, input_shape);
-#endif
-  }
-}
-
-template <typename FPType, size_t... Dims>
-PhaseTimings bench_naive(const ozi::Stencil<CoeffStorageType, Dims...> &coeff_stencil, const std::vector<size_t> &shape,
-                         const BenchConfig &cfg, ozigpu::L2CacheInvalidator &cache_inv, const char *label) {
-  constexpr size_t ndims = sizeof...(Dims);
-  size_t n_elems = 1;
-  for (auto s : shape)
-    n_elems *= s;
-
-  // Build typed stencil for this FPType
-  ozi::Stencil<FPType, Dims...> h_stencil;
-  for (size_t i = 0; i < ndims; ++i)
-    h_stencil.offsets[i] = coeff_stencil.offsets[i];
-  for (size_t i = 0; i < h_stencil.size; ++i)
-    h_stencil.coeffs[i] = static_cast<FPType>(coeff_stencil.coeffs[i]);
-
-  // Allocate device memory
-  core::DeviceArray<FPType> d_in(n_elems), d_out(n_elems);
-  CUDA_CHECK(cudaMemcpyToSymbol(ozi::stencil_cmem, &h_stencil, sizeof(h_stencil)));
-
-  // Generate random data on host and upload
-  std::vector<FPType> h_data(n_elems);
-  std::mt19937_64 rng(cfg.seed);
-  std::uniform_real_distribution<double> dist(-1.0, 1.0);
-  for (size_t i = 0; i < n_elems; ++i)
-    h_data[i] = static_cast<FPType>(dist(rng));
-  d_in.copy_from_host(h_data.data(), n_elems);
-  d_out.zero();
-
-  const dim3 *blk_ptr = (cfg.block_size.x > 0) ? &cfg.block_size : nullptr;
-  auto [grid, block] = make_grid_block<ndims>(shape, blk_ptr);
-
-  typename ozi::Stencil<FPType, Dims...>::shape_type input_shape{};
-  for (size_t d = 0; d < ndims; ++d)
-    input_shape[d] = shape[d];
-
-  PhaseTimings result;
-
-  NVTX_PUSH(label);
-
-  for (int32_t r = 0; r < cfg.repeats; ++r) {
-    // Re-upload data for each repeat to get a clean state
-    d_in.copy_from_host(h_data.data(), n_elems);
-
-    if (cfg.flush_l2)
-      cache_inv.invalidate();
-
-    // Warmup
-    NVTX_PUSH("Warmup");
-    for (int32_t t = 0; t < cfg.warmup; ++t) {
-      launch_naive_kernel<FPType, Dims...>(d_out.get(), d_in.get(), input_shape, grid, block);
-      CUDA_CHECK(cudaGetLastError());
-      std::swap(d_in, d_out);
-    }
-    CUDA_CHECK(cudaDeviceSynchronize());
-    NVTX_POP();
-
-    if (cfg.flush_l2)
-      cache_inv.invalidate();
-
-    // Measurement
-    CudaEventPair ev;
-    NVTX_PUSH("Integration");
-    ev.record_start();
-    for (int32_t t = 0; t < cfg.timesteps; ++t) {
-      launch_naive_kernel<FPType, Dims...>(d_out.get(), d_in.get(), input_shape, grid, block);
-      CUDA_CHECK(cudaGetLastError());
-      std::swap(d_in, d_out);
-    }
-    ev.record_stop();
-    NVTX_POP();
-
-    result.integration_ms.push_back(ev.elapsed_ms());
-  }
-
-  NVTX_POP(); // label
-
-  return result;
-}
-
-// Ozaki Direct benchmark
-
-static constexpr int RDC_THREADS = 512;
-
-template <int32_t M, size_t... Dims>
-PhaseTimings bench_ozaki_direct(const ozi::StencilSlices<ozi::Stencil<int8_t, Dims...>, M> &ss,
-                                const std::vector<size_t> &shape, int32_t num_slices_total, HighPrecType scaling_factor,
-                                const BenchConfig &cfg, ozigpu::L2CacheInvalidator &cache_inv) {
-  constexpr size_t ndims = sizeof...(Dims);
-  size_t n_elems = 1;
-  for (auto s : shape)
-    n_elems *= s;
-
-  std::string nvtx_label = "Ozaki Direct (M=" + std::to_string(M) + ", S=" + std::to_string(num_slices_total) + ")";
-  NVTX_PUSH(nvtx_label.c_str());
-
-  // Allocate device resources
-  core::DeviceArray<Real> d_data(n_elems);
-  core::DeviceArray<int8_t> d_slices_1, d_slices_2;
-  core::DeviceArray<ozigpu::OzakiDescriptor<Oz>> d_desc(1);
-  ozigpu::OzakiDescriptor<Oz> h_desc;
-
-  // Upload random data
-  std::vector<Real> h_data(n_elems);
-  std::mt19937_64 rng(cfg.seed);
-  std::uniform_real_distribution<double> dist(-1.0, 1.0);
-  for (size_t i = 0; i < n_elems; ++i)
-    h_data[i] = dist(rng);
-  d_data.copy_from_host(h_data.data(), n_elems);
-
-  PhaseTimings result;
-  CudaEventPair ev_phase;
-
-  // -- DynRange (with warmup + repetition) --
-  NVTX_PUSH("DynRange");
-  cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, 0);
-  const int32_t nBlocksDR = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / RDC_THREADS;
-
-  // Warmup
-  if (cfg.warmup > 0) {
-    h_desc = ozigpu::OzakiDescriptor<Oz>();
-    d_desc.copy_from_host(&h_desc, 1);
-    ozigpu::dyn_range<Oz><<<nBlocksDR, RDC_THREADS>>>(d_desc.get(), d_data.get(), n_elems);
-    CUDA_CHECK(cudaDeviceSynchronize());
-  }
-
-  // Measured repeats
-  for (int32_t r = 0; r < cfg.repeats; ++r) {
-    h_desc = ozigpu::OzakiDescriptor<Oz>();
-    d_desc.copy_from_host(&h_desc, 1);
-    ev_phase.record_start();
-    ozigpu::dyn_range<Oz><<<nBlocksDR, RDC_THREADS>>>(d_desc.get(), d_data.get(), n_elems);
-    ev_phase.record_stop();
-    result.dyn_range_ms.push_back(ev_phase.elapsed_ms());
-  }
-  NVTX_POP();
-
-  // Download descriptor from last repeat and compute actual slice count
-  d_desc.copy_to_host(&h_desc, 1);
-  h_desc.e_max += cfg.extra_msb;
-  h_desc.e_min -= cfg.extra_lsb;
-
-  int32_t actual_slices = num_slices_total;
-  if (cfg.slices_override > 0) {
-    actual_slices = cfg.slices_override;
-  } else {
-    actual_slices = 2 + (h_desc.e_max - h_desc.e_min) / (CHAR_BIT * sizeof(int8_t) - 1);
-  }
-
-  h_desc.n_slices_input = actual_slices;
-  d_desc.copy_from_host(&h_desc, 1);
-
-  const size_t slice_allocation = actual_slices * n_elems + ozigpu::STENCIL_V1_ALLOC_PAD;
-  d_slices_1.reset(slice_allocation);
-  d_slices_2.reset(slice_allocation);
-
-  // -- Slice (with warmup + repetition; D2D copy excluded from timing) --
-  NVTX_PUSH("Slice");
-  const int32_t nThreadsSlice = std::min(static_cast<size_t>(RDC_THREADS), n_elems / 4);
-  const int32_t nBlocksSlice = ((n_elems / 4) + nThreadsSlice - 1) / nThreadsSlice;
-
-  // Warmup
-  if (cfg.warmup > 0) {
-    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
-    CUDA_CHECK(cudaDeviceSynchronize());
-  }
-
-  // Measured repeats
-  for (int32_t r = 0; r < cfg.repeats; ++r) {
-    ev_phase.record_start();
-    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
-    ev_phase.record_stop();
-    result.slice_ms.push_back(ev_phase.elapsed_ms());
-  }
-
-  // Set up ping-pong buffer (not part of slice timing - benchmark infrastructure)
-  CUDA_CHECK(cudaDeviceSynchronize());
-  d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
-  NVTX_POP();
-
-  // Compute overflow threshold
-  double slice0_l1 = ss.slices[0].template l1_norm<double>();
-  int32_t l1_int = static_cast<int32_t>(slice0_l1);
-  if (l1_int == 0)
-    l1_int = 1;
-
-  // Proactive shift schedule
-  double log2_sf =
-      (scaling_factor > static_cast<HighPrecType>(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
-  int32_t total_shifts_needed = static_cast<int32_t>(std::ceil(cfg.timesteps * log2_sf / 7.0));
-
-  auto [grid, block] = make_grid_block<ndims>(shape);
-
-  typename ozi::Stencil<int8_t, Dims...>::shape_type input_shape{};
-  for (size_t d = 0; d < ndims; ++d)
-    input_shape[d] = shape[d];
-
-  for (int32_t r = 0; r < cfg.repeats; ++r) {
-    // Reset state for each repeat
-    d_data.copy_from_host(h_data.data(), n_elems);
-
-    h_desc.n_slices_input = actual_slices;
-    h_desc.shift_required = 0;
-    h_desc.carry_slice_index = 0;
-    h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
-    h_desc.just_shifted = 1;
-    h_desc.n_shifts = 0;
-    d_desc.copy_from_host(&h_desc, 1);
-
-    // Re-slice
-    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
-    CUDA_CHECK(cudaDeviceSynchronize());
-    d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
-
-    if (cfg.flush_l2)
-      cache_inv.invalidate();
-
-    // Copy stencil slices to constant memory
-    CUDA_CHECK(cudaMemcpyToSymbol(ozigpu::stencil_v1_cmem, &ss, sizeof(ss)));
-    ozigpu::upload_slice_phys_lut(actual_slices);
-
-    // Warmup
-    if (cfg.warmup > 0) {
-      NVTX_PUSH("Warmup");
-      for (int32_t t = 0; t < cfg.warmup; ++t) {
-        ozigpu::stencil_v1<Oz, M, Dims...><<<grid, block>>>(d_slices_2.get(), d_slices_1.get(), input_shape, d_desc.get());
-        if (t < cfg.warmup - 1)
-          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), 0);
-        std::swap(d_slices_1, d_slices_2);
-      }
-      CUDA_CHECK(cudaDeviceSynchronize());
-      NVTX_POP();
-
-      // Reset desc state after warmup
-      h_desc.n_slices_input = actual_slices;
-      h_desc.shift_required = 0;
-      h_desc.carry_slice_index = 0;
-      h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
-      h_desc.just_shifted = 1;
-      h_desc.n_shifts = 0;
-      d_desc.copy_from_host(&h_desc, 1);
-
-      // Re-slice again for clean measurement
-      ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
-      CUDA_CHECK(cudaDeviceSynchronize());
-      d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
-    }
-
-    if (cfg.flush_l2)
-      cache_inv.invalidate();
-
-    // Measurement
-    CudaEventPair ev;
-    NVTX_PUSH("Integration");
-    ev.record_start();
-    for (int32_t t = 0; t < cfg.timesteps; ++t) {
-      ozigpu::stencil_v1<Oz, M, Dims...><<<grid, block>>>(d_slices_2.get(), d_slices_1.get(), input_shape, d_desc.get());
-      if (t < cfg.timesteps - 1) {
-        int32_t min_shifts_now;
-        if (t == cfg.timesteps - 2)
-          min_shifts_now = total_shifts_needed;
-        else
-          min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
-        if (min_shifts_now < 0)
-          min_shifts_now = 0;
-        ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), min_shifts_now);
-      }
-      std::swap(d_slices_1, d_slices_2);
-    }
-    ev.record_stop();
-    NVTX_POP();
-
-    result.integration_ms.push_back(ev.elapsed_ms());
-  }
-
-  // -- Mend (with warmup + repetition) --
-  NVTX_PUSH("Mend");
-  const int32_t nThreadsMend = std::min(static_cast<size_t>(RDC_THREADS), n_elems / 4);
-  const int32_t nBlocksMend = ((n_elems / 4) + nThreadsMend - 1) / nThreadsMend;
-
-  // Warmup
-  if (cfg.warmup > 0) {
-    ozigpu::mend<Oz><<<nBlocksMend, nThreadsMend>>>(d_data.get(), d_slices_1.get(), d_desc.get(), n_elems);
-    CUDA_CHECK(cudaDeviceSynchronize());
-  }
-
-  // Measured repeats (mend reads slices+desc without modifying them, so repeats are safe)
-  for (int32_t r = 0; r < cfg.repeats; ++r) {
-    ev_phase.record_start();
-    ozigpu::mend<Oz><<<nBlocksMend, nThreadsMend>>>(d_data.get(), d_slices_1.get(), d_desc.get(), n_elems);
-    ev_phase.record_stop();
-    result.mend_ms.push_back(ev_phase.elapsed_ms());
-  }
-  NVTX_POP();
-
-  NVTX_POP(); // nvtx_label
-
-  return result;
-}
-
-// Ozaki ConvStencil benchmark (2D 7x7 only)
-
-template <int32_t M>
-PhaseTimings bench_ozaki_conv(const ozi::StencilSlices<ozi::Stencil<int8_t, 7, 7>, M> &ss, const int8_t *host_weight,
-                              const ozigpu::convstencil::BoundaryGainData &boundary, const std::vector<size_t> &shape,
-                              int32_t num_slices_total, HighPrecType scaling_factor, const BenchConfig &cfg,
-                              ozigpu::L2CacheInvalidator &cache_inv) {
-  size_t n_elems = shape[0] * shape[1];
-  const size_t height = shape[0];
-  const size_t ldm = shape[1];
-
-  std::string nvtx_label =
-      "Ozaki ConvStencil (M=" + std::to_string(M) + ", S=" + std::to_string(num_slices_total) + ")";
-  NVTX_PUSH(nvtx_label.c_str());
-
-  // Allocate device resources
-  core::DeviceArray<Real> d_data(n_elems);
-  core::DeviceArray<int8_t> d_slices_1, d_slices_2, d_weight;
-  core::DeviceArray<ozigpu::OzakiDescriptor<Oz>> d_desc(1);
-  ozigpu::OzakiDescriptor<Oz> h_desc;
-
-  constexpr size_t weight_size = M * 2 * ozigpu::convstencil::WT_SIZE;
-  d_weight.reset(weight_size);
-  d_weight.copy_from_host(host_weight, weight_size);
-
-  // Upload random data
-  std::vector<Real> h_data(n_elems);
-  std::mt19937_64 rng(cfg.seed);
-  std::uniform_real_distribution<double> dist(-1.0, 1.0);
-  for (size_t i = 0; i < n_elems; ++i)
-    h_data[i] = dist(rng);
-  d_data.copy_from_host(h_data.data(), n_elems);
-
-  PhaseTimings result;
-  CudaEventPair ev_phase;
-
-  // -- DynRange (with warmup + repetition) --
-  NVTX_PUSH("DynRange");
-  cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, 0);
-  const int32_t nBlocksDR = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / RDC_THREADS;
-
-  // Warmup
-  if (cfg.warmup > 0) {
-    h_desc = ozigpu::OzakiDescriptor<Oz>();
-    d_desc.copy_from_host(&h_desc, 1);
-    ozigpu::dyn_range<Oz><<<nBlocksDR, RDC_THREADS>>>(d_desc.get(), d_data.get(), n_elems);
-    CUDA_CHECK(cudaDeviceSynchronize());
-  }
-
-  // Measured repeats
-  for (int32_t r = 0; r < cfg.repeats; ++r) {
-    h_desc = ozigpu::OzakiDescriptor<Oz>();
-    d_desc.copy_from_host(&h_desc, 1);
-    ev_phase.record_start();
-    ozigpu::dyn_range<Oz><<<nBlocksDR, RDC_THREADS>>>(d_desc.get(), d_data.get(), n_elems);
-    ev_phase.record_stop();
-    result.dyn_range_ms.push_back(ev_phase.elapsed_ms());
-  }
-  NVTX_POP();
-
-  // Download descriptor from last repeat and compute slice count
-  d_desc.copy_to_host(&h_desc, 1);
-  h_desc.e_max += cfg.extra_msb;
-  h_desc.e_min -= cfg.extra_lsb;
-
-  int32_t actual_slices = num_slices_total;
-  if (cfg.slices_override > 0) {
-    actual_slices = cfg.slices_override;
-  } else {
-    actual_slices = 2 + (h_desc.e_max - h_desc.e_min) / (CHAR_BIT * sizeof(int8_t) - 1);
-  }
-
-  h_desc.n_slices_input = actual_slices;
-  d_desc.copy_from_host(&h_desc, 1);
-
-  const size_t slice_allocation = actual_slices * n_elems + ozigpu::STENCIL_V1_ALLOC_PAD;
-  d_slices_1.reset(slice_allocation);
-  d_slices_2.reset(slice_allocation);
-
-  // -- Slice (with warmup + repetition; D2D copy excluded from timing) --
-  NVTX_PUSH("Slice");
-  const int32_t nThreadsSlice = std::min(static_cast<size_t>(RDC_THREADS), n_elems / 4);
-  const int32_t nBlocksSlice = ((n_elems / 4) + nThreadsSlice - 1) / nThreadsSlice;
-
-  // Warmup
-  if (cfg.warmup > 0) {
-    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
-    CUDA_CHECK(cudaDeviceSynchronize());
-  }
-
-  // Measured repeats
-  for (int32_t r = 0; r < cfg.repeats; ++r) {
-    ev_phase.record_start();
-    ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
-    ev_phase.record_stop();
-    result.slice_ms.push_back(ev_phase.elapsed_ms());
-  }
-
-  // Set up ping-pong buffer (not part of slice timing -- benchmark infrastructure)
-  CUDA_CHECK(cudaDeviceSynchronize());
-  d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
-  NVTX_POP();
-
-  // Compute overflow threshold
-  double slice0_l1 = ss.slices[0].template l1_norm<double>();
-  int32_t l1_int = static_cast<int32_t>(slice0_l1);
-  if (l1_int == 0)
-    l1_int = 1;
-
-  // Proactive shift schedule
-  double log2_sf =
-      (scaling_factor > static_cast<HighPrecType>(1)) ? std::log2(static_cast<double>(scaling_factor)) : 0.0;
-  int32_t total_shifts_needed = static_cast<int32_t>(std::ceil(cfg.timesteps * log2_sf / 7.0));
-
-  // ConvStencil grid/block
-  constexpr int32_t BLOCK_THREADS = ozigpu::convstencil::NUM_WARPS * WARP_SIZE;
-  dim3 block_cv(BLOCK_THREADS);
-  dim3 grid_cv((height + ozigpu::convstencil::TILE_SIZE_ROW - 1) / ozigpu::convstencil::TILE_SIZE_ROW,
-               (ldm + ozigpu::convstencil::TILE_SIZE_COL - 1) / ozigpu::convstencil::TILE_SIZE_COL);
-
-  size_t total_height = static_cast<size_t>(actual_slices) * height;
-
-  if constexpr (M <= 3) {
-    cudaFuncSetAttribute(ozigpu::cvstencil_v2<Oz, M>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         ozigpu::convstencil::DYN_SMEM_BYTES);
-
-    ozigpu::convstencil::TmaDescriptorsV2 tma;
-    bool tma_ok = ozigpu::convstencil::create_tma_descriptors_v2(tma, d_slices_1.get(), d_slices_2.get(), total_height, ldm);
-    if (!tma_ok) {
-      std::cerr << "Skipping cvstencil: TMA requires ldm >= 128 and ldm % 16 == 0\n";
-      return {};
-    }
-
-    for (int32_t r = 0; r < cfg.repeats; ++r) {
-      d_data.copy_from_host(h_data.data(), n_elems);
-
-      h_desc.n_slices_input = actual_slices;
-      h_desc.shift_required = 0;
-      h_desc.carry_slice_index = 0;
-      h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
-      h_desc.just_shifted = 1;
-      h_desc.n_shifts = 0;
-      d_desc.copy_from_host(&h_desc, 1);
-
-      ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
-      CUDA_CHECK(cudaDeviceSynchronize());
-      d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
-
-      ozigpu::upload_slice_phys_lut(actual_slices);
-
-      if (cfg.flush_l2)
-        cache_inv.invalidate();
-
-      if (cfg.warmup > 0) {
-        NVTX_PUSH("Warmup");
-        for (int32_t t = 0; t < cfg.warmup; ++t) {
-          ozigpu::cvstencil_v2<Oz, M><<<grid_cv, block_cv, ozigpu::convstencil::DYN_SMEM_BYTES>>>(
-              d_slices_2.get(), d_slices_1.get(), d_weight.get(), ldm, height, d_desc.get(), boundary, tma.h_main[0]);
-          if (t < cfg.warmup - 1)
-            ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), 0);
-          std::swap(d_slices_1, d_slices_2);
-          tma.swap();
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-        NVTX_POP();
-
-        h_desc.n_slices_input = actual_slices;
-        h_desc.shift_required = 0;
-        h_desc.carry_slice_index = 0;
-        h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
-        h_desc.just_shifted = 1;
-        h_desc.n_shifts = 0;
-        d_desc.copy_from_host(&h_desc, 1);
-
-        ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
-      }
-
-      if (cfg.flush_l2)
-        cache_inv.invalidate();
-
-      CudaEventPair ev;
-      NVTX_PUSH("Integration");
-      ev.record_start();
-      for (int32_t t = 0; t < cfg.timesteps; ++t) {
-        ozigpu::cvstencil_v2<Oz, M><<<grid_cv, block_cv, ozigpu::convstencil::DYN_SMEM_BYTES>>>(
-            d_slices_2.get(), d_slices_1.get(), d_weight.get(), ldm, height, d_desc.get(), boundary, tma.h_main[0]);
-        if (t < cfg.timesteps - 1) {
-          int32_t min_shifts_now;
-          if (t == cfg.timesteps - 2)
-            min_shifts_now = total_shifts_needed;
-          else
-            min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
-          if (min_shifts_now < 0)
-            min_shifts_now = 0;
-          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), min_shifts_now);
-        }
-        std::swap(d_slices_1, d_slices_2);
-        tma.swap();
-      }
-      ev.record_stop();
-      NVTX_POP();
-
-      result.integration_ms.push_back(ev.elapsed_ms());
-    }
-
-    tma.free();
-  } else {
-    ozigpu::convstencil::TmaDescriptors tma;
-    bool tma_ok = ozigpu::convstencil::create_tma_descriptors(tma, d_slices_1.get(), d_slices_2.get(), total_height, ldm);
-    if (!tma_ok) {
-      std::cerr << "Skipping cvstencil: TMA requires ldm >= 128 and ldm % 16 == 0\n";
-      return {};
-    }
-
-    for (int32_t r = 0; r < cfg.repeats; ++r) {
-      d_data.copy_from_host(h_data.data(), n_elems);
-
-      h_desc.n_slices_input = actual_slices;
-      h_desc.shift_required = 0;
-      h_desc.carry_slice_index = 0;
-      h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
-      h_desc.just_shifted = 1;
-      h_desc.n_shifts = 0;
-      d_desc.copy_from_host(&h_desc, 1);
-
-      ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
-      CUDA_CHECK(cudaDeviceSynchronize());
-      d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
-
-      ozigpu::upload_slice_phys_lut(actual_slices);
-
-      if (cfg.flush_l2)
-        cache_inv.invalidate();
-
-      if (cfg.warmup > 0) {
-        NVTX_PUSH("Warmup");
-        for (int32_t t = 0; t < cfg.warmup; ++t) {
-          ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(d_slices_2.get(), d_slices_1.get(), d_weight.get(), ldm, height, d_desc.get(),
-                                                          boundary, tma.h_main[0], tma.h_extra[0]);
-          if (t < cfg.warmup - 1)
-            ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), 0);
-          std::swap(d_slices_1, d_slices_2);
-          tma.swap();
-        }
-        CUDA_CHECK(cudaDeviceSynchronize());
-        NVTX_POP();
-
-        h_desc.n_slices_input = actual_slices;
-        h_desc.shift_required = 0;
-        h_desc.carry_slice_index = 0;
-        h_desc.overflow_danger_threshold = (std::numeric_limits<int8_t>::max() / l1_int) - 1;
-        h_desc.just_shifted = 1;
-        h_desc.n_shifts = 0;
-        d_desc.copy_from_host(&h_desc, 1);
-
-        ozigpu::slice<Oz><<<nBlocksSlice, nThreadsSlice>>>(d_slices_1.get(), d_data.get(), d_desc.get(), n_elems);
-        CUDA_CHECK(cudaDeviceSynchronize());
-        d_slices_2.copy_from_device(d_slices_1.get(), actual_slices * n_elems);
-      }
-
-      if (cfg.flush_l2)
-        cache_inv.invalidate();
-
-      CudaEventPair ev;
-      NVTX_PUSH("Integration");
-      ev.record_start();
-      for (int32_t t = 0; t < cfg.timesteps; ++t) {
-        ozigpu::cvstencil<Oz, M><<<grid_cv, block_cv>>>(d_slices_2.get(), d_slices_1.get(), d_weight.get(), ldm, height, d_desc.get(), boundary,
-                                                        tma.h_main[0], tma.h_extra[0]);
-        if (t < cfg.timesteps - 1) {
-          int32_t min_shifts_now;
-          if (t == cfg.timesteps - 2)
-            min_shifts_now = total_shifts_needed;
-          else
-            min_shifts_now = static_cast<int32_t>(std::ceil((t + 1) * log2_sf / 7.0));
-          if (min_shifts_now < 0)
-            min_shifts_now = 0;
-          ozigpu::update_ozaki_desc<<<1, 32>>>(d_desc.get(), min_shifts_now);
-        }
-        std::swap(d_slices_1, d_slices_2);
-        tma.swap();
-      }
-      ev.record_stop();
-      NVTX_POP();
-
-      result.integration_ms.push_back(ev.elapsed_ms());
-    }
-
-    tma.free();
-  }
-
-  // -- Mend (with warmup + repetition) --
-  NVTX_PUSH("Mend");
-  const int32_t nThreadsMend = std::min(static_cast<size_t>(RDC_THREADS), n_elems / 4);
-  const int32_t nBlocksMend = ((n_elems / 4) + nThreadsMend - 1) / nThreadsMend;
-
-  // Warmup
-  if (cfg.warmup > 0) {
-    ozigpu::mend<Oz><<<nBlocksMend, nThreadsMend>>>(d_data.get(), d_slices_1.get(), d_desc.get(), n_elems);
-    CUDA_CHECK(cudaDeviceSynchronize());
-  }
-
-  // Measured repeats (mend reads slices+desc without modifying them, so repeats are safe)
-  for (int32_t r = 0; r < cfg.repeats; ++r) {
-    ev_phase.record_start();
-    ozigpu::mend<Oz><<<nBlocksMend, nThreadsMend>>>(d_data.get(), d_slices_1.get(), d_desc.get(), n_elems);
-    ev_phase.record_stop();
-    result.mend_ms.push_back(ev_phase.elapsed_ms());
-  }
-  NVTX_POP();
-
-  NVTX_POP(); // nvtx_label
-
-  return result;
-}
-
-// M dispatch (switch 1..9)
-
-template <size_t... Dims>
-PhaseTimings dispatch_bench_direct(int m, const ozi::Stencil<CoeffStorageType, Dims...> &stencil,
-                                   const std::vector<size_t> &shape, HighPrecType scaling_factor,
-                                   CoeffStorageType a_coeff, int32_t extra_msb_shift, int32_t num_slices_total,
-                                   const BenchConfig &cfg, ozigpu::L2CacheInvalidator &cache_inv) {
-  // We need to construct stencil slices on the host
-  auto do_bench = [&]<int32_t M_val>() -> PhaseTimings {
-    auto ss = ozicpu::slice_stencil<ozicpu::OzakiFP_Int8<Real>, ozi::Stencil<CoeffStorageType, Dims...>, M_val>(
-        stencil, a_coeff, extra_msb_shift, num_slices_total);
-    return bench_ozaki_direct<M_val, Dims...>(ss, shape, num_slices_total, scaling_factor, cfg, cache_inv);
-  };
-
-  switch (m) {
-  case 1:
-    return do_bench.template operator()<1>();
-  case 2:
-    return do_bench.template operator()<2>();
-  case 3:
-    return do_bench.template operator()<3>();
-  case 4:
-    return do_bench.template operator()<4>();
-  case 8:
-    return do_bench.template operator()<8>();
-  case 9:
-    return do_bench.template operator()<9>();
-  case 10:
-    return do_bench.template operator()<10>();
-  case 11:
-    return do_bench.template operator()<11>();
-  default:
-    throw std::invalid_argument("M=" + std::to_string(m) + " is not a supported instantiation");
-  }
-}
-
-template <size_t... Dims>
-PhaseTimings dispatch_bench_conv(int m, const ozi::Stencil<CoeffStorageType, Dims...> &stencil,
-                                 const std::vector<size_t> &shape, HighPrecType scaling_factor,
-                                 CoeffStorageType a_coeff, int32_t extra_msb_shift, int32_t num_slices_total,
-                                 const BenchConfig &cfg, ozigpu::L2CacheInvalidator &cache_inv) {
-  if constexpr (sizeof...(Dims) == 2) {
-    constexpr auto s_shape = ozi::Stencil<CoeffStorageType, Dims...>::shape;
-    if constexpr (s_shape[0] == 7 && s_shape[1] == 7) {
-      auto do_bench = [&]<int32_t M_val>() -> PhaseTimings {
-        auto ss = ozicpu::slice_stencil<ozicpu::OzakiFP_Int8<Real>, ozi::Stencil<CoeffStorageType, Dims...>, M_val>(
-            stencil, a_coeff, extra_msb_shift, num_slices_total);
-
-        // Build weight matrix
-        constexpr int32_t N_COEFFS = 7 * 7;
-        int8_t flat_coeffs[M_val * N_COEFFS];
-        for (int32_t si = 0; si < M_val; ++si)
-          for (int32_t c = 0; c < N_COEFFS; ++c)
-            flat_coeffs[si * N_COEFFS + c] = ss.slices[si].coeffs[c];
-
-        constexpr size_t weight_size = M_val * 2 * ozigpu::convstencil::WT_SIZE;
-        int8_t host_weight[weight_size];
-        ozigpu::convstencil::build_param_matrix<M_val>(host_weight, flat_coeffs);
-
-        // Build boundary gain data
-        ozigpu::convstencil::BoundaryGainData boundary{};
-        boundary.n_slices = ss.n_emulated_gain_slices;
-        for (int32_t g = 0; g < boundary.n_slices; ++g)
-          boundary.emulated_gain[g] = ss.emulated_gain[g];
-
-        return bench_ozaki_conv<M_val>(ss, host_weight, boundary, shape, num_slices_total, scaling_factor, cfg,
-                                       cache_inv);
-      };
-
-      switch (m) {
-      case 1:
-        return do_bench.template operator()<1>();
-      case 2:
-        return do_bench.template operator()<2>();
-      case 3:
-        return do_bench.template operator()<3>();
-      case 4:
-        return do_bench.template operator()<4>();
-      case 8:
-        return do_bench.template operator()<8>();
-      case 9:
-        return do_bench.template operator()<9>();
-      case 10:
-        return do_bench.template operator()<10>();
-      case 11:
-        return do_bench.template operator()<10>();
-      default:
-        throw std::invalid_argument("M=" + std::to_string(m) + " is not a supported instantiation");
-      }
-    }
-  }
-  throw std::invalid_argument("ConvStencil only supports 2D 7x7 stencils");
-}
-
-// Output formatting
-
-static void print_header(const cudaDeviceProp &prop, const std::vector<size_t> &shape, const std::string &stencil_name,
-                         int m, int slices, const BenchConfig &cfg) {
-  std::cout << "================================================================\n";
-  std::cout << "OzakiStencil Performance Benchmark\n";
-  std::cout << "================================================================\n";
-  std::cout << "Device:         " << prop.name << "\n";
-
-  std::string shape_str;
-  for (size_t i = 0; i < shape.size(); ++i) {
-    if (i > 0)
-      shape_str += " x ";
-    shape_str += std::to_string(shape[i]);
-  }
-  std::cout << "Input shape:    " << shape_str << "\n";
-  std::cout << "Stencil:        " << stencil_name << " (M=" << m << ")\n";
-  std::cout << "Data slices:    " << slices << "\n";
-  std::cout << "Timesteps:      " << cfg.timesteps << "\n";
-  std::cout << "Warmup:         " << cfg.warmup << "\n";
-  std::cout << "Repeats:        " << cfg.repeats << "\n";
-  std::cout << "----------------------------------------------------------------\n";
-  std::cout << std::left << std::setw(22) << "Algorithm" << std::right << std::setw(10) << "Min (ms)" << std::setw(10)
-            << "Med (ms)" << std::setw(10) << "Max (ms)" << std::setw(9) << "GStPt/s" << "\n";
-  std::cout << "----------------------------------------------------------------\n";
-}
-
-static void print_naive_row(const char *name, const PhaseTimings &t, const std::vector<size_t> &shape,
-                            int32_t timesteps) {
-  float mn = stat_min(t.integration_ms);
-  float md = stat_median(t.integration_ms);
-  float mx = stat_max(t.integration_ms);
-  double gstpts = compute_gstpts(shape, timesteps, mn);
-  std::cout << std::left << std::setw(22) << name << std::fixed << std::setprecision(2) << std::right << std::setw(10)
-            << mn << std::setw(10) << md << std::setw(10) << mx << std::setw(9) << gstpts << "\n";
-}
-
-static void print_ozaki_row(const char *name, const PhaseTimings &t, const std::vector<size_t> &shape,
-                            int32_t timesteps) {
-  float dr_min = stat_min(t.dyn_range_ms), dr_med = stat_median(t.dyn_range_ms), dr_max = stat_max(t.dyn_range_ms);
-  float sl_min = stat_min(t.slice_ms), sl_med = stat_median(t.slice_ms), sl_max = stat_max(t.slice_ms);
-  float int_min = stat_min(t.integration_ms), int_med = stat_median(t.integration_ms),
-        int_max = stat_max(t.integration_ms);
-  float mend_min = stat_min(t.mend_ms), mend_med = stat_median(t.mend_ms), mend_max = stat_max(t.mend_ms);
-
-  float total_min = dr_min + sl_min + int_min + mend_min;
-  float total_med = dr_med + sl_med + int_med + mend_med;
-  float total_max = dr_max + sl_max + int_max + mend_max;
-  double gstpts = compute_gstpts(shape, timesteps, total_min);
-  std::cout << std::left << std::setw(22) << name << std::fixed << std::setprecision(2) << std::right << std::setw(10)
-            << total_min << std::setw(10) << total_med << std::setw(10) << total_max << std::setw(9) << gstpts << "\n";
-  std::cout << "  " << std::left << std::setw(20) << "DynRange" << std::fixed << std::setprecision(2) << std::right
-            << std::setw(10) << dr_min << std::setw(10) << dr_med << std::setw(10) << dr_max << "\n";
-  std::cout << "  " << std::left << std::setw(20) << "Slice" << std::fixed << std::setprecision(2) << std::right
-            << std::setw(10) << sl_min << std::setw(10) << sl_med << std::setw(10) << sl_max << "\n";
-
-  double int_gstpts = compute_gstpts(shape, timesteps, int_min);
-  std::cout << "  " << std::left << std::setw(20) << "Integration" << std::fixed << std::setprecision(2) << std::right
-            << std::setw(10) << int_min << std::setw(10) << int_med << std::setw(10) << int_max << std::setw(9)
-            << int_gstpts << "\n";
-  std::cout << "  " << std::left << std::setw(20) << "Mend" << std::fixed << std::setprecision(2) << std::right
-            << std::setw(10) << mend_min << std::setw(10) << mend_med << std::setw(10) << mend_max << "\n";
-}
-
-static void print_skipped_row(const char *name, const char *reason) {
-  std::cout << std::left << std::setw(22) << name << " [skipped: " << reason << "]\n";
-}
-
-static void print_footer() { std::cout << "================================================================\n"; }
-
-// Compute actual data slice count from dynamic range
-
-static int32_t compute_actual_slices(const std::vector<size_t> &shape, const BenchConfig &cfg) {
-  if (cfg.slices_override > 0)
-    return cfg.slices_override;
-
-  size_t n_elems = 1;
-  for (auto s : shape)
-    n_elems *= s;
-
-  // Generate random data with the same seed and distribution as bench functions
-  std::vector<Real> h_data(n_elems);
-  std::mt19937_64 rng(cfg.seed);
-  std::uniform_real_distribution<double> dist(-1.0, 1.0);
-  for (size_t i = 0; i < n_elems; ++i)
-    h_data[i] = dist(rng);
-
-  core::DeviceArray<Real> d_data(n_elems);
-  core::DeviceArray<ozigpu::OzakiDescriptor<Oz>> d_desc(1);
-  ozigpu::OzakiDescriptor<Oz> h_desc;
-  d_data.copy_from_host(h_data.data(), n_elems);
-  d_desc.copy_from_host(&h_desc, 1);
-
-  cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, 0);
-  const int32_t nBlocks = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount / RDC_THREADS;
-
-  ozigpu::dyn_range<Oz><<<nBlocks, RDC_THREADS>>>(d_desc.get(), d_data.get(), n_elems);
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  d_desc.copy_to_host(&h_desc, 1);
-  h_desc.e_max += cfg.extra_msb;
-  h_desc.e_min -= cfg.extra_lsb;
-
-  int32_t actual = 2 + (h_desc.e_max - h_desc.e_min) / (CHAR_BIT * sizeof(int8_t) - 1);
-
-  return actual;
-}
-
-// Shape dispatch + run all benchmarks for a single stencil
-
-static void run_benchmarks(const StencilSpec &spec, const BenchConfig &cfg, int algo_flags, int device_cc) {
-  auto params = ozi::compute_stencil_params(spec);
-  auto variant = ozi::make_stencil(spec);
-
-  // Compute the actual data slice count from the input's dynamic range.
-  // This must happen before stencil slice construction so that emulated_gain
-  // (boundary correction) is encoded with the correct number of base-128 digits.
-  int32_t actual_slices = compute_actual_slices(cfg.shape, cfg);
-
-  cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, 0);
-
-  print_header(prop, cfg.shape, spec.name, params.m, actual_slices, cfg);
-
-  ozigpu::L2CacheInvalidator cache_inv;
-
-  std::visit(
-      [&](const auto &stencil) {
-        using StencilType = std::decay_t<decltype(stencil)>;
-        constexpr size_t ndims = StencilType::dims;
-
-        // Validate dimensionality
-        if (ndims != cfg.shape.size()) {
-          throw std::invalid_argument("Stencil '" + spec.name + "' has " + std::to_string(ndims) +
-                                      " dims but shape has " + std::to_string(cfg.shape.size()) + " dims");
-        }
-
-        // -- Naive FP32 --
-        if (has_algo(algo_flags, AlgoFlag::NaiveFP32)) {
-          auto t = bench_naive<float>(stencil, cfg.shape, cfg, cache_inv, "Naive FP32");
-          print_naive_row("Naive FP32", t, cfg.shape, cfg.timesteps);
-        }
-
-        // -- Naive FP64 --
-        if (has_algo(algo_flags, AlgoFlag::NaiveFP64)) {
-          auto t = bench_naive<double>(stencil, cfg.shape, cfg, cache_inv, "Naive FP64");
-          print_naive_row("Naive FP64", t, cfg.shape, cfg.timesteps);
-        }
-
-        // -- Naive FP128 --
-        if (has_algo(algo_flags, AlgoFlag::NaiveFP128)) {
-#if __CUDA_ARCH_LIST__ >= 1200 || !defined(__CUDA_ARCH_LIST__)
-          if (device_cc >= 1200) {
-            auto t = bench_naive<__float128>(stencil, cfg.shape, cfg, cache_inv, "Naive FP128");
-            std::string label = "Naive FP128 [sm_" + std::to_string(device_cc / 10) + "]";
-            print_naive_row(label.c_str(), t, cfg.shape, cfg.timesteps);
-          } else {
-            std::string reason = "device sm_" + std::to_string(device_cc / 10) + " < sm_120";
-            print_skipped_row("Naive FP128", reason.c_str());
-          }
-#else
-          std::string reason = "device sm_" + std::to_string(device_cc / 10) + " < sm_120";
-          print_skipped_row("Naive FP128", reason.c_str());
-#endif
-        }
-
-        // -- Ozaki Direct --
-        if (has_algo(algo_flags, AlgoFlag::Direct)) {
-          auto t = dispatch_bench_direct(params.m, stencil, cfg.shape, params.scaling_factor, params.a_coeff,
-                                         params.extra_msb_shift, actual_slices, cfg, cache_inv);
-          print_ozaki_row("Ozaki Direct", t, cfg.shape, cfg.timesteps);
-        }
-
-        // -- Ozaki ConvStencil --
-        if (has_algo(algo_flags, AlgoFlag::ConvStencil)) {
-          if constexpr (ndims == 2) {
-            constexpr auto s_shape = StencilType::shape;
-            if constexpr (s_shape[0] == 7 && s_shape[1] == 7) {
-              auto t = dispatch_bench_conv(params.m, stencil, cfg.shape, params.scaling_factor, params.a_coeff,
-                                           params.extra_msb_shift, actual_slices, cfg, cache_inv);
-              print_ozaki_row("Ozaki ConvStencil", t, cfg.shape, cfg.timesteps);
-            } else {
-              print_skipped_row("Ozaki ConvStencil", "requires 2D 7x7 stencil");
-            }
-          } else {
-            print_skipped_row("Ozaki ConvStencil", "requires 2D 7x7 stencil");
-          }
-        }
-      },
-      variant);
-
-  print_footer();
-}
-
-// CLI parsing and main
-
-static std::vector<size_t> parse_shape(const std::string &s) {
+std::vector<size_t> parse_shape(const std::string &text) {
   std::vector<size_t> shape;
-  std::istringstream ss(s);
-  std::string dim;
-  while (std::getline(ss, dim, 'x'))
-    shape.push_back(std::stoull(dim));
-  if (shape.empty())
-    throw std::invalid_argument("Empty shape");
+  std::istringstream input(text);
+  std::string extent;
+  while (std::getline(input, extent, 'x')) {
+    shape.push_back(std::stoull(extent));
+  }
+  if (shape.size() != 2U && shape.size() != 3U) {
+    throw std::invalid_argument("Shape must be 2D or 3D.");
+  }
   return shape;
 }
 
-static dim3 parse_block_size(const std::string &s) {
-  std::vector<unsigned> dims;
-  std::istringstream ss(s);
-  std::string token;
-  while (std::getline(ss, token, 'x'))
-    dims.push_back(static_cast<unsigned>(std::stoul(token)));
-  if (dims.empty() || dims.size() > 3)
-    throw std::invalid_argument("Block size must have 1-3 dimensions");
-  return dim3(dims[0], dims.size() > 1 ? dims[1] : 1, dims.size() > 2 ? dims[2] : 1);
+size_t volume(const std::vector<size_t> &shape) {
+  size_t result = 1;
+  for (const size_t extent : shape) {
+    if (extent == 0 || result > std::numeric_limits<size_t>::max() / extent) {
+      throw std::overflow_error("Shape volume overflows size_t.");
+    }
+    result *= extent;
+  }
+  return result;
 }
 
-static void validate_block_size(const dim3 &block, const cudaDeviceProp &prop) {
-  uint32_t total = block.x * block.y * block.z;
-  if (total > static_cast<uint32_t>(prop.maxThreadsPerBlock))
-    throw std::invalid_argument("Block size " + std::to_string(block.x) + "x" + std::to_string(block.y) + "x" +
-                                std::to_string(block.z) + " = " + std::to_string(total) +
-                                " threads exceeds device limit of " + std::to_string(prop.maxThreadsPerBlock));
-  if (total % WARP_SIZE != 0)
-    throw std::invalid_argument("Block size " + std::to_string(block.x) + "x" + std::to_string(block.y) + "x" +
-                                std::to_string(block.z) + " = " + std::to_string(total) +
-                                " threads is not a multiple of WARP_SIZE (" + std::to_string(WARP_SIZE) + ")");
+bool selected(const std::string &algorithms, std::string_view name) {
+  if (algorithms == "all") {
+    return true;
+  }
+  std::istringstream input(algorithms);
+  std::string token;
+  while (std::getline(input, token, ',')) {
+    if (token == name || (token == "naive" && name.starts_with("naive-"))) {
+      return true;
+    }
+  }
+  return false;
 }
+
+class Events {
+public:
+  Events() {
+    CUDA_CHECK(cudaEventCreate(&start_));
+    CUDA_CHECK(cudaEventCreate(&stop_));
+  }
+  ~Events() {
+    (void)cudaEventDestroy(start_);
+    (void)cudaEventDestroy(stop_);
+  }
+  float measure_start(cudaStream_t stream) {
+    CUDA_CHECK(cudaEventRecord(start_, stream));
+    return 0.0F;
+  }
+  float measure_stop(cudaStream_t stream) {
+    CUDA_CHECK(cudaEventRecord(stop_, stream));
+    CUDA_CHECK(cudaEventSynchronize(stop_));
+    float milliseconds = 0.0F;
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start_, stop_));
+    return milliseconds;
+  }
+
+private:
+  cudaEvent_t start_ = nullptr;
+  cudaEvent_t stop_ = nullptr;
+};
+
+double throughput(size_t cells, int32_t timesteps, float milliseconds) {
+  return milliseconds > 0.0F ? static_cast<double>(cells) * timesteps / (static_cast<double>(milliseconds) * 1.0e6)
+                             : 0.0;
+}
+
+template <typename T, class RawStencil> auto rebind_stencil(const RawStencil &raw) {
+  using Stencil = ozaki::RebindStencil_t<RawStencil, T>;
+  Stencil result;
+  result.offsets = raw.offsets;
+  for (size_t coefficient = 0; coefficient < RawStencil::size; ++coefficient) {
+    result.coeffs[coefficient] = static_cast<T>(raw.coeffs[coefficient]);
+  }
+  return result;
+}
+
+template <typename T, size_t... Dims>
+void launch_naive(core::DeviceArray<T> &output, core::DeviceArray<T> &input, const ozaki::Stencil<T, Dims...> &,
+                  const typename ozaki::Stencil<T, Dims...>::shape_type &shape) {
+  constexpr size_t dimensions = sizeof...(Dims);
+  const dim3 block = dimensions == 2 ? dim3(32, 8) : dim3(8, 8, 4);
+  const dim3 grid(static_cast<unsigned>((shape[dimensions - 1] + block.x - 1) / block.x),
+                  static_cast<unsigned>((shape[dimensions - 2] + block.y - 1) / block.y),
+                  dimensions == 3 ? static_cast<unsigned>((shape[0] + block.z - 1) / block.z) : 1U);
+  ozaki::naive_stencil<T, Dims...><<<grid, block>>>(output.get(), input.get(), shape);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+template <typename T, class RawStencil>
+double bench_naive(const RawStencil &raw, const Tensor<ozaki::gpu::IntegrationReal> &source, const Config &config) {
+  auto stencil = rebind_stencil<T>(raw);
+  using Stencil = decltype(stencil);
+  typename Stencil::shape_type shape{};
+  for (size_t dimension = 0; dimension < Stencil::dims; ++dimension) {
+    shape[dimension] = source.shape[dimension];
+  }
+  Tensor<T> host;
+  host.shape = source.shape;
+  host.data.resize(source.data.size());
+  std::transform(source.data.begin(), source.data.end(), host.data.begin(),
+                 [](auto value) { return static_cast<T>(value); });
+  host = zero_boundary_copy(host, Stencil::shape[0] / 2);
+
+  core::DeviceArray<T> first{std::span<const T>(host.data)};
+  core::DeviceArray<T> second(host.data.size());
+  second.zero();
+  CUDA_CHECK(cudaMemcpyToSymbol(ozaki::stencil_cmem, &stencil, sizeof(stencil)));
+  for (int32_t step = 0; step < config.warmup; ++step) {
+    launch_naive(second, first, stencil, shape);
+    first.swap(second);
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+  first.copy_from_host(host.data);
+  second.zero();
+
+  Events events;
+  events.measure_start(nullptr);
+  for (int32_t step = 0; step < config.timesteps; ++step) {
+    launch_naive(second, first, stencil, shape);
+    first.swap(second);
+  }
+  const float elapsed = events.measure_stop(nullptr);
+  return throughput(host.data.size(), config.timesteps, elapsed);
+}
+
+double bench_ozaki(const StencilSpec &spec, const Tensor<ozaki::gpu::IntegrationReal> &input, const Config &config) {
+  ozaki::gpu::StencilIntegrator integrator(spec, input, config.slices);
+  integrator.integrate(config.warmup);
+  integrator.synchronize();
+  integrator.reset();
+  Events events;
+  events.measure_start(integrator.stream());
+  integrator.integrate(config.timesteps);
+  const float elapsed = events.measure_stop(integrator.stream());
+  return throughput(input.data.size(), config.timesteps, elapsed);
+}
+
+} // namespace
 
 int main(int argc, char **argv) {
-  po::options_description desc("bench-stencil options");
-  // clang-format off
-  desc.add_options()
-    ("help,h", "Show help")
-    ("shape,S", po::value<std::string>()->required(), "Input grid shape (e.g., 1024x1024)")
-    ("stencil", po::value<std::string>(), "Inline stencil spec: \"7x7:c0,c1,...\"")
-    ("stencil-arg", po::value<std::string>(), "Alias for --stencil")
-    ("stencil-file", po::value<std::string>(), "Stencil .stc file path")
-    ("timesteps,T", po::value<int32_t>()->default_value(100), "Integration timesteps")
-    ("warmup,W", po::value<int32_t>()->default_value(10), "Warmup timesteps")
-    ("repeats,R", po::value<int32_t>()->default_value(3), "Measurement repeats")
-    ("slices,s", po::value<int32_t>()->default_value(0), "Override data slice count")("extra-msb", po::value<int32_t>()->default_value(0), "Extra MSB headroom")
-    ("extra-lsb", po::value<int32_t>()->default_value(0), "Extra LSB headroom")
-    ("algorithm,A", po::value<std::string>()->default_value("all"), "Algorithms: naive-fp32,naive-fp64,naive-fp128,naive,direct,convstencil,all")
-    ("seed", po::value<uint64_t>()->default_value(42), "Random seed")
-    ("block-size,B", po::value<std::string>(), "Thread block dimensions for naive kernels (e.g., 256, 32x8, 8x8x4)")
-    ("input,i", po::value<std::string>(), "Input tensor file")
-    ("no-flush-l2", po::bool_switch(), "Skip L2 cache invalidation")
-    ("ncu-mode", po::bool_switch(), "NCU capture mode (warmup=0, timesteps=1, repeats=1)");
-  // clang-format on
-  po::variables_map vm;
+  po::options_description options("bench-stencil options");
+  options.add_options()                                                                 //
+      ("help,h", "Show help")                                                           //
+      ("shape,S", po::value<std::string>()->required(), "Input grid shape, e.g. 1024x1024") //
+      ("stencil-file", po::value<std::string>()->required(), "Stencil file")            //
+      ("timesteps,T", po::value<int32_t>()->default_value(100), "Measured timesteps")   //
+      ("warmup,W", po::value<int32_t>()->default_value(10), "Warmup timesteps")         //
+      ("slices,s", po::value<int32_t>()->default_value(10), "Ozaki data slices")        //
+      ("algorithm,A", po::value<std::string>()->default_value("all"),
+       "Algorithms: ozaki, naive-fp32, naive-fp64, naive-fp128, naive, all");
+
+  po::variables_map variables;
   try {
-    po::store(po::parse_command_line(argc, argv, desc), vm);
-    if (vm.count("help")) {
-      std::cout << desc << "\n";
+    po::store(po::parse_command_line(argc, argv, options), variables);
+    if (variables.count("help") != 0U) {
+      std::cout << options << '\n';
       return 0;
     }
-    if (!vm.count("stencil") && !vm.count("stencil-arg") && !vm.count("stencil-file"))
-      throw std::invalid_argument("Must specify --stencil, --stencil-arg, or --stencil-file");
-    po::notify(vm);
-  } catch (const po::error &e) {
-    std::cerr << "Error: " << e.what() << "\n" << desc << "\n";
+    po::notify(variables);
+
+    Config config;
+    config.shape = parse_shape(variables["shape"].as<std::string>());
+    config.timesteps = variables["timesteps"].as<int32_t>();
+    config.warmup = variables["warmup"].as<int32_t>();
+    config.slices = variables["slices"].as<int32_t>();
+    if (config.timesteps <= 0 || config.warmup < 0 || config.slices < 1 || config.slices > 31) {
+      throw std::invalid_argument("Invalid timing or slice-count arguments.");
+    }
+
+    const StencilSpec spec = read_stencil_file(variables["stencil-file"].as<std::string>());
+    if (config.shape.size() != spec.shape.size()) {
+      throw std::invalid_argument("Benchmark shape rank does not match stencil rank.");
+    }
+
+    using Real = ozaki::gpu::IntegrationReal;
+    Tensor<Real> input;
+    input.shape = config.shape;
+    input.data.resize(volume(config.shape));
+    std::mt19937_64 generator(42);
+    std::uniform_real_distribution<double> distribution(-1.0, 1.0);
+    for (Real &value : input.data) {
+      value = static_cast<Real>(distribution(generator));
+    }
+
+    const std::string algorithms = variables["algorithm"].as<std::string>();
+    const auto typed = ozaki::make_stencil(spec);
+    if (selected(algorithms, "naive-fp32")) {
+      const double value =
+          std::visit([&](const auto &stencil) { return bench_naive<float>(stencil, input, config); }, typed);
+      std::cout << "Naive FP32 GStPt/s " << value << '\n';
+    }
+    if (selected(algorithms, "naive-fp64")) {
+      const double value =
+          std::visit([&](const auto &stencil) { return bench_naive<double>(stencil, input, config); }, typed);
+      std::cout << "Naive FP64 GStPt/s " << value << '\n';
+    }
+#if defined(OZAKI_CUDA_ARCH) && OZAKI_CUDA_ARCH >= 100
+    if (selected(algorithms, "naive-fp128")) {
+      const double value =
+          std::visit([&](const auto &stencil) { return bench_naive<__float128>(stencil, input, config); }, typed);
+      std::cout << "Naive FP128 GStPt/s " << value << '\n';
+    }
+#endif
+    if (selected(algorithms, "ozaki")) {
+      std::cout << "OzakiStencil GStPt/s " << bench_ozaki(spec, input, config) << '\n';
+    }
+  } catch (const std::exception &error) {
+    std::cerr << "Error: " << error.what() << '\n';
     return 1;
   }
-
-  // Build config
-  BenchConfig cfg;
-  cfg.shape = parse_shape(vm["shape"].as<std::string>());
-  cfg.timesteps = vm["timesteps"].as<int32_t>();
-  cfg.warmup = vm["warmup"].as<int32_t>();
-  cfg.repeats = vm["repeats"].as<int32_t>();
-  cfg.slices_override = vm["slices"].as<int32_t>();
-  cfg.extra_msb = vm["extra-msb"].as<int32_t>();
-  cfg.extra_lsb = vm["extra-lsb"].as<int32_t>();
-  cfg.seed = vm["seed"].as<uint64_t>();
-  cfg.flush_l2 = !vm["no-flush-l2"].as<bool>();
-  cfg.ncu_mode = vm["ncu-mode"].as<bool>();
-  if (vm.count("block-size"))
-    cfg.block_size = parse_block_size(vm["block-size"].as<std::string>());
-
-  if (cfg.ncu_mode) {
-    cfg.warmup = 0;
-    cfg.timesteps = 1;
-    cfg.repeats = 1;
-  }
-
-  // Get device compute capability
-  cudaDeviceProp prop;
-  CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
-  int device_cc = prop.major * 100 + prop.minor * 10;
-
-  if (cfg.block_size.x > 0)
-    validate_block_size(cfg.block_size, prop);
-
-  int algo_flags = parse_algos(vm["algorithm"].as<std::string>(), device_cc);
-
-  // Collect stencil specs
-  std::vector<StencilSpec> specs;
-  if (vm.count("stencil-file")) {
-    specs.push_back(read_stencil_file(vm["stencil-file"].as<std::string>()));
-  } else if (vm.count("stencil")) {
-    specs.push_back(parse_stencil_arg(vm["stencil"].as<std::string>()));
-  } else if (vm.count("stencil-arg")) {
-    specs.push_back(parse_stencil_arg(vm["stencil-arg"].as<std::string>()));
-  } else {
-    throw std::invalid_argument("Must specify --stencil, --stencil-arg, or --stencil-file");
-  }
-
-  NVTX_PUSH("bench-stencil");
-  for (const auto &spec : specs) {
-    NVTX_PUSH(spec.name.c_str());
-    try {
-      run_benchmarks(spec, cfg, algo_flags, device_cc);
-    } catch (const std::exception &e) {
-      std::cerr << "Error benchmarking '" << spec.name << "': " << e.what() << "\n";
-    }
-    NVTX_POP();
-  }
-  NVTX_POP();
-
   return 0;
 }

@@ -13,7 +13,7 @@ Run the following command to build the image.
 ```bash
 docker build -t ozaki_stencil .
 ```
-If you run into network issues try using the flag `--network=host`. If the package mirror does not work, comment out the `RUN sed` lines in the Dockerfile.
+Depending on your permissions, you might have to run `docker` commands as super user. If you run into network issues try using the flag `--network=host`. If the package mirror does not work, comment out the `RUN sed` lines in the Dockerfile.
 
 The image may then be launched as follows:
 
@@ -21,7 +21,7 @@ The image may then be launched as follows:
 docker run -it --gpus all -e CUDA_COMPUTE_CAPABILITY="120" -v $(pwd)/data/results:/artifact/data/results ozaki_stencil
 ```
 
-Make sure to replace the `CUDA_COMPUTE_CAPABILITY` environment variable with the one that corresponds to the test environment's GPU. OzakiStencil supports `90`, `90a`, `100`, `100a` and `120`.
+Make sure to replace the `CUDA_COMPUTE_CAPABILITY` environment variable with the one that corresponds to the test environment's GPU. OzakiStencil supports `90`, `90a`, `100`, `100a`, `103`, `103a` and `120`. If the variable is not set, `entrypoint.sh` defaults to `120`.
 Note that if you want to see correctness results past `double` precision, you will need to use a GPU that supports the `__float128` type (`sm100` and above). This is a limitation of the implementation, not OzakiStencil.
 The volume `-v` argument allows accessing the resulting files from outside the container. 
 

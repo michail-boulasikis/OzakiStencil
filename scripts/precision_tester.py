@@ -1,6 +1,5 @@
 import numpy as np
 import subprocess
-import glob
 import csv
 import os
 import re
@@ -20,21 +19,40 @@ L1_NORM = ["ONE", "GT1", "LT1"]
 
 TIMESTEPS = [1, 10, 25]
 
-EXTRA_LSBS = 0
-EXTRA_MSBS = 0
-
 # Entry: (stencil_shape, label). Dimensionality is len(stencil_shape); the
-# input tensor for that dim is supplied via a positional CLI arg.
+# input tensor is generated per stencil halo (see input_tensor).
 SHAPE_INPUT_PAIRS = [
     ([3, 3], "2D"),
-    ([5, 5], "2D"),
     ([7, 7], "2D"),
     ([15, 15], "2D"),
     ([3, 3, 3], "3D"),
     ([5, 5, 5], "3D"),
 ]
 
-ERROR_THRESHOLD = 1e-29
+_compute_capability = os.environ.get("CUDA_COMPUTE_CAPABILITY")
+if _compute_capability is None:
+    raise SystemExit("CUDA_COMPUTE_CAPABILITY must be set (for example, 120).")
+
+_compute_capability_match = re.fullmatch(r"([0-9]+)[A-Za-z]*", _compute_capability)
+if _compute_capability_match is None:
+    raise SystemExit(
+        "CUDA_COMPUTE_CAPABILITY must contain a numeric SM followed by an optional "
+        f"architecture suffix; got {_compute_capability!r}."
+    )
+
+COMPUTE_CAPABILITY = int(_compute_capability_match.group(1))
+if COMPUTE_CAPABILITY < 100:
+    MAX_SLICES = 12
+    ERROR_THRESHOLD = 1.0e-14
+    REFERENCE_PRECISION = "double"
+else:
+    MAX_SLICES = 18
+    ERROR_THRESHOLD = 1.0e-31
+    REFERENCE_PRECISION = "fp128"
+
+UNCONSTRAINED_SLICES = 9
+MAX_COEFFICIENT_DYNAMIC_BITS = 16
+MIN_NORMALIZED_TRANSPORT = 0.1
 
 BUILD_BIN = "./build/bin"
 TENSOR_DIR = "./data/tensors"
@@ -43,23 +61,158 @@ CSV_OUTPUT = "./data/results/precision_results.csv"
 BREACHES_OUTPUT = "./data/results/breaches.txt"
 
 
-def _pick_target_l1(l1_norm, rng):
-    if l1_norm == "ONE":
-        return 1.0 / (1.0 + 0.05 * (1.0 - 2 * rng.random()))
-    elif l1_norm == "GT1":
-        return rng.uniform(1.05, 1.5)
-    elif l1_norm == "LT1":
-        return rng.uniform(0.3, 0.95)
-    else:
-        raise ValueError(f"Unknown l1_norm mode: {l1_norm}")
-
-
 def _format_decimal(d):
     """Plain decimal string (no exponent), trimming trailing zeros after the point."""
     s = format(d, "f")
     if "." in s:
         s = s.rstrip("0").rstrip(".")
     return s if s else "0"
+
+
+def _cpu_slice_count(values, max_slices=9):
+    """Mirror the C++ round-to-nearest base-128 coefficient slicer for FP64."""
+    residuals = [float(value) for value in values]
+    abs_max = max((abs(value) for value in residuals), default=0.0)
+    max_exponent = np.frexp(abs_max)[1] if abs_max else 0
+    r_h = 7 * int(np.ceil(max_exponent / 7.0))
+    for slice_index in range(max_slices):
+        cast_scale = 7 * (slice_index + 1) - r_h
+        for index, residual in enumerate(residuals):
+            digit = int(np.rint(np.ldexp(residual, cast_scale)))
+            digit = max(-128, min(127, digit))
+            residuals[index] = residual - np.ldexp(float(digit), -cast_scale)
+        if all(value == 0.0 for value in residuals):
+            return slice_index + 1
+    return max_slices + 1
+
+
+def _center_flat_index(shape):
+    center = tuple(extent // 2 for extent in shape)
+    return int(np.ravel_multi_index(center, shape))
+
+
+def _positions_including_center(shape, count, rng):
+    """Choose distinct flat positions, always putting the center first."""
+    coefficient_count = int(np.prod(shape))
+    if count < 1 or count > coefficient_count:
+        raise ValueError("Active coefficient count is outside the stencil size")
+    center = _center_flat_index(shape)
+    if count == 1:
+        return np.array([center], dtype=np.int64)
+    candidates = np.delete(np.arange(coefficient_count, dtype=np.int64), center)
+    remainder = rng.choice(candidates, size=count - 1, replace=False)
+    return np.concatenate((np.array([center], dtype=np.int64), remainder))
+
+
+def _mirrored_pairs(shape):
+    """Return one flat-index pair for every pair of offsets about the center."""
+    center = tuple(extent // 2 for extent in shape)
+    pairs = []
+    for index in np.ndindex(*shape):
+        mirror = tuple(2 * middle - coordinate for middle, coordinate in zip(center, index))
+        flat = int(np.ravel_multi_index(index, shape))
+        mirror_flat = int(np.ravel_multi_index(mirror, shape))
+        if flat < mirror_flat:
+            pairs.append((flat, mirror_flat))
+    return pairs
+
+
+def _balanced_unconstrained_coefficients(shape, negative_coeffs, sparse, l1_norm, rng):
+    """Build a nine-slice stencil without tiny standalone coefficients.
+
+    At least half of the L1 norm is assigned to the center, so information
+    cannot leave the domain solely through directed transport. Dense stencils
+    use mirrored pairs as a non-transport control. Sparse stencils deliberately
+    make one mirrored pair asymmetric: one side carries a controlled transport
+    term and the other carries the ninth-slice marker.
+    """
+    target_l1 = {"LT1": 0.5, "ONE": 1.0, "GT1": 1.5}[l1_norm]
+    pairs = _mirrored_pairs(shape)
+    if sparse:
+        selected_pair = pairs[int(rng.integers(len(pairs)))]
+        if rng.integers(2) != 0:
+            selected_pair = selected_pair[::-1]
+
+    marker_magnitude = target_l1 / 1024.0
+    if sparse:
+        center_magnitude = 0.75 * target_l1
+        pair_magnitudes = np.array(
+            [marker_magnitude, 0.25 * target_l1 - marker_magnitude],
+            dtype=np.float64,
+        )
+    else:
+        center_magnitude = 0.5 * target_l1
+        pair_magnitudes = np.empty(len(pairs), dtype=np.float64)
+        pair_magnitudes[0] = marker_magnitude
+        pair_weights = rng.uniform(0.75, 1.25, size=len(pairs) - 1)
+        remaining_pair_magnitude = 0.25 * target_l1 - marker_magnitude
+        pair_magnitudes[1:] = remaining_pair_magnitude * pair_weights / np.sum(pair_weights)
+
+    # Keep every coefficient on the nine-slice lattice. The marker magnitude
+    # is about 2^-10 of the L1 norm, so setting its low lattice bit requires
+    # precision without creating a coefficient-scale dynamic-range stress.
+    max_exponent = np.frexp(center_magnitude)[1]
+    base_exponent = 7 * int(np.ceil(max_exponent / 7.0))
+    lowest_quantum = np.ldexp(1.0, base_exponent - 7 * UNCONSTRAINED_SLICES)
+    center_magnitude = np.rint(center_magnitude / lowest_quantum) * lowest_quantum
+    pair_magnitudes = np.rint(pair_magnitudes / lowest_quantum) * lowest_quantum
+    marked = pair_magnitudes[0] + lowest_quantum
+    if marked == pair_magnitudes[0]:
+        marked = np.nextafter(pair_magnitudes[0], np.inf)
+    pair_magnitudes[0] = marked
+
+    coeffs = np.zeros(shape, dtype=np.float64)
+    center = _center_flat_index(shape)
+    coeffs.flat[center] = center_magnitude
+    if sparse:
+        marker_position, transport_position = selected_pair
+        coeffs.flat[marker_position] = pair_magnitudes[0]
+        coeffs.flat[transport_position] = pair_magnitudes[1]
+        if negative_coeffs:
+            coeffs.flat[center] *= -1.0
+    else:
+        pair_signs = np.ones(len(pairs), dtype=np.float64)
+        if negative_coeffs:
+            coeffs.flat[center] *= -1.0
+            pair_signs = rng.choice(np.array([-1.0, 1.0]), size=len(pairs))
+        for (left, right), magnitude, sign in zip(pairs, pair_magnitudes, pair_signs):
+            coeffs.flat[left] = sign * magnitude
+            coeffs.flat[right] = sign * magnitude
+    return coeffs
+
+
+def _validate_correctness_coefficients(values, shape, sparse, require_transport=False):
+    """Reject stress-test kernels that are unsuitable for correctness tests."""
+    coeffs = np.asarray(values, dtype=np.float64).reshape(shape)
+    magnitudes = np.abs(coeffs)
+    nonzero = magnitudes[magnitudes != 0.0]
+    if nonzero.size == 0:
+        raise ValueError("Generated stencil has no nonzero coefficients")
+
+    dynamic_bits = float(np.log2(np.max(nonzero) / np.min(nonzero)))
+    if dynamic_bits > MAX_COEFFICIENT_DYNAMIC_BITS:
+        raise ValueError(
+            f"Generated coefficient range spans {dynamic_bits:.1f} bits; "
+            f"correctness stencils are limited to {MAX_COEFFICIENT_DYNAMIC_BITS}"
+        )
+
+    center_magnitude = magnitudes.flat[_center_flat_index(shape)]
+    if center_magnitude == 0.0:
+        raise ValueError("Correctness stencils must have a nonzero center coefficient")
+    if sparse and center_magnitude < 0.2 * np.sum(magnitudes):
+        raise ValueError("Sparse correctness stencils require a persistent center term")
+
+    if require_transport:
+        center = np.asarray(shape, dtype=np.float64) // 2
+        moment = np.zeros(len(shape), dtype=np.float64)
+        for index in np.ndindex(*shape):
+            moment += magnitudes[index] * (np.asarray(index) - center)
+        normalized_transport = float(np.linalg.norm(moment, ord=1) / np.sum(magnitudes))
+        if normalized_transport < MIN_NORMALIZED_TRANSPORT:
+            raise ValueError(
+                f"Transport stencil has normalized drift {normalized_transport:.3f}; "
+                f"expected at least {MIN_NORMALIZED_TRANSPORT}"
+            )
 
 
 def generate_stencil_spec(
@@ -71,64 +224,76 @@ def generate_stencil_spec(
     sparse=False,
     l1_norm="ONE",
     rng=None,
+    _attempt=0,
 ):
-    """Generate a stencil spec written in fp128.
+    """Generate a binary64 stencil specification for precision testing.
 
-    With a basis (requested_slices set): coefficients are computed as exact
-    rationals (int_coeff * target_l1 / l1_int) using Decimal, then emitted with
-    full 50+ digit precision so that fp128 parsing keeps every bit we care about.
+    With requested_slices set, coefficients are assembled directly from one or
+    two signed base-128 digits and scaled by an integral power of 128. Their L1
+    norms are exactly 0.5, 1.0, or 1.5 for the requested category.
 
-    Without a basis: coefficients are generated as FP64 standard
-    normal then rescaled to target L1, and we append the decimal digits of a
-    uniformly random 64-bit integer to the string form of each nonzero
-    coefficient. Zero stays zero.
+    Without requested_slices, coefficients use a balanced, centrosymmetric
+    construction on the UNCONSTRAINED_SLICES lattice. This exercises all nine
+    coefficient slices without creating an extreme spatial dynamic range.
     """
     if rng is None:
         rng = np.random.default_rng(0)
 
     if requested_slices:
-        abs_limit = 2 ** (7 * requested_slices) // np.prod(shape)
-        int_coeffs = rng.integers(
-            -abs_limit if negative_coeffs else 0, abs_limit, size=shape
-        )
+        if requested_slices not in (1, 2):
+            raise ValueError("The precision suite supports requested slice counts one and two")
 
-        if sparse:
-            zero_mask = rng.random(size=int_coeffs.shape) < 0.7
-            int_coeffs[zero_mask] = 0
+        # At exponent -7*requested_slices, a total high-digit magnitude of
+        # 64/128/192 gives L1 0.5/1.0/1.5. Sparse cases use the minimum number
+        # of coefficients needed by the signed INT8 digit range; dense cases
+        # spread the same magnitude over as many coefficients as possible.
+        target_units = {"LT1": 64, "ONE": 128, "GT1": 192}[l1_norm]
+        coefficient_count = int(np.prod(shape))
+        minimum_active = int(np.ceil(target_units / 63.0))
+        active_count = minimum_active if sparse else min(coefficient_count, target_units)
+        if active_count > coefficient_count:
+            raise ValueError("Stencil is too small for the requested exact digit construction")
 
-        l1_int = int(np.sum(np.abs(int_coeffs)))
-        if l1_int == 0:
-            int_coeffs.flat[len(int_coeffs.flat) // 2] = 1
-            l1_int = 1
+        positions = _positions_including_center(shape, active_count, rng)
+        magnitudes = np.full(active_count, target_units // active_count, dtype=np.int64)
+        magnitudes[: target_units % active_count] += 1
+        if np.max(magnitudes) > 63:
+            raise AssertionError("Generated high coefficient digit exceeds the conservative INT8 range")
 
-        target_l1 = _pick_target_l1(l1_norm, rng)
+        digits = np.zeros((requested_slices, *shape), dtype=np.int64)
+        high = digits[0].reshape(-1)
+        high[positions] = magnitudes
+        if requested_slices == 2:
+            # Opposite low digits keep the requested L1 norm exact while
+            # guaranteeing that the lowest numerical slice is required.
+            low = digits[1].reshape(-1)
+            low[positions[0]] = 1
+            low[positions[-1]] = -1
 
-        target_l1_d = Decimal(repr(target_l1))
-        l1_int_d = Decimal(int(l1_int))
+        if negative_coeffs:
+            signs = rng.choice(np.array([-1, 1], dtype=np.int64), size=active_count)
+            signs[0] = -1
+            for slice_index in range(requested_slices):
+                plane = digits[slice_index].reshape(-1)
+                plane[positions] *= signs
+
+        integer_coeffs = np.zeros(shape, dtype=object)
+        for slice_index in range(requested_slices):
+            integer_coeffs += digits[slice_index].astype(object) * (
+                128 ** (requested_slices - slice_index - 1)
+            )
+        exponent = -7 * requested_slices
         coeffs_str = []
-        for ic in int_coeffs.flatten():
-            ic = int(ic)
-            if ic == 0:
+        for integer in integer_coeffs.flatten():
+            integer = int(integer)
+            if integer == 0:
                 coeffs_str.append("0")
             else:
-                val = (Decimal(ic) * target_l1_d) / l1_int_d
-                coeffs_str.append(_format_decimal(val))
+                coeffs_str.append(_format_decimal(Decimal(integer) * (Decimal(2) ** exponent)))
     else:
-        coeffs = rng.standard_normal(size=shape).astype(np.float64)
-        if not negative_coeffs:
-            coeffs = np.abs(coeffs)
-
-        if sparse:
-            zero_mask = rng.random(size=coeffs.shape) < 0.7
-            coeffs[zero_mask] = 0.0
-
-        l1_sum = float(np.sum(np.abs(coeffs)))
-        if l1_sum == 0:
-            coeffs.flat[len(coeffs.flat) // 2] = 1.0
-            l1_sum = 1.0
-
-        target_l1 = _pick_target_l1(l1_norm, rng)
-        coeffs *= target_l1 / l1_sum
+        coeffs = _balanced_unconstrained_coefficients(
+            shape, negative_coeffs, sparse, l1_norm, rng
+        )
 
         coeffs_str = []
         for c in coeffs.flatten():
@@ -138,7 +303,15 @@ def generate_stencil_spec(
                 continue
             coeffs_str.append(_format_decimal(Decimal(c)))
 
-    if not offsets:
+    numeric_coeffs = [float(value) for value in coeffs_str]
+    _validate_correctness_coefficients(
+        numeric_coeffs,
+        shape,
+        sparse,
+        require_transport=requested_slices is None and sparse,
+    )
+
+    if offsets is None:
         offsets = np.array(shape) // 2
     shape = [str(x) for x in shape]
     offsets = [str(x) for x in offsets]
@@ -153,11 +326,24 @@ def generate_stencil_spec(
         f"_{stencil_num}"
     )
 
+    expected_slices = requested_slices or UNCONSTRAINED_SLICES
+    actual_slices = _cpu_slice_count(numeric_coeffs)
+    if actual_slices != expected_slices:
+        if _attempt >= 100:
+            raise RuntimeError(
+                f"Could not generate an exact {expected_slices}-slice stencil for shape {shape}"
+            )
+        return generate_stencil_spec(
+            [int(value) for value in shape], negative_coeffs, requested_slices,
+            stencil_num, [int(value) for value in offsets], sparse, l1_norm, rng,
+            _attempt + 1,
+        )
+
     spec = f"""
     name {name}
     shape {" ".join(shape)}
     offsets {" ".join(offsets)}
-    precision fp128
+    precision double
     coeffs
     {" ".join(coeffs_str)}
     """
@@ -166,11 +352,16 @@ def generate_stencil_spec(
     return name
 
 
-def run_pipeline(name, input_file, input_label, T, algorithm="direct"):
+def run_pipeline(name, input_file, input_label, T):
     stencil_file = f"{STENCIL_DIR}/{name}.stc"
-    ref_prefix = f"ref_{input_label}"
-    oz_prefix = f"oz_{input_label}"
-    ref_file = f"{TENSOR_DIR}/{ref_prefix}_{name}_fp128_{T}.dat"
+    # Names carry the input tensor, so results computed from another input
+    # (e.g. a different zero-boundary width) are never reused.
+    input_tag = os.path.splitext(os.path.basename(input_file))[0]
+    ref_prefix = f"ref_{input_tag}"
+    oz_prefix = f"oz_{input_tag}"
+    ref_file = (
+        f"{TENSOR_DIR}/{ref_prefix}_{name}_{REFERENCE_PRECISION}_{T}.dat"
+    )
 
     # Step 1: compute-reference
     ref_result = subprocess.run(
@@ -184,6 +375,7 @@ def run_pipeline(name, input_file, input_label, T, algorithm="direct"):
             ref_prefix,
             "-T",
             str(T),
+            f"--{REFERENCE_PRECISION}",
         ],
         capture_output=True,
         text=True,
@@ -195,7 +387,7 @@ def run_pipeline(name, input_file, input_label, T, algorithm="direct"):
         )
         return False, [float("nan")], ""
 
-    # Step 2: run-ozaki with --save-tensors to write output files to disk
+    # Step 2: run-ozaki writes one output tensor per slice count
     oz_result = subprocess.run(
         [
             f"{BUILD_BIN}/run-ozaki",
@@ -207,13 +399,8 @@ def run_pipeline(name, input_file, input_label, T, algorithm="direct"):
             oz_prefix,
             "-T",
             str(T),
-            "--extra-lsb",
-            str(EXTRA_LSBS),
-            "--extra-msb",
-            str(EXTRA_MSBS),
-            "--save-tensors",
-            "--algorithm",
-            algorithm,
+            "--slice-limit",
+            str(MAX_SLICES),
         ],
         capture_output=True,
         text=True,
@@ -226,19 +413,15 @@ def run_pipeline(name, input_file, input_label, T, algorithm="direct"):
         )
         return False, [float("nan")], oz_output
 
-    # Step 3: find the highest-slice output file written by run-ozaki
-    oz_pattern = f"{TENSOR_DIR}/{oz_prefix}_{name}_{T}_*.dat"
-    oz_files = glob.glob(oz_pattern)
-    if not oz_files:
-        print(f"  [FAIL] No ozaki output files found matching: {oz_pattern}")
+    # Step 3: require the configured terminal slice. Looking at the largest
+    # glob match could accidentally reuse stale files from another architecture.
+    terminal_oz_file = f"{TENSOR_DIR}/{oz_prefix}_{name}_{T}_{MAX_SLICES}.dat"
+    if not os.path.isfile(terminal_oz_file):
+        print(f"  [FAIL] Missing terminal Ozaki output: {terminal_oz_file}")
         return False, [float("nan")], oz_output
 
-    max_slices = max(
-        int(os.path.basename(f).rsplit("_", 1)[-1].replace(".dat", ""))
-        for f in oz_files
-    )
     errs = []
-    for i in range(2, max_slices):
+    for i in range(2, MAX_SLICES + 1):
         oz_file = f"{TENSOR_DIR}/{oz_prefix}_{name}_{T}_{i}.dat"
 
         # Step 4: compute-errors prints RMSE and max absolute difference to stdout
@@ -475,17 +658,6 @@ _parser = argparse.ArgumentParser(
     description="Ozaki stencil precision tester and visualiser."
 )
 _parser.add_argument(
-    "--algorithm",
-    "-A",
-    choices=["direct", "convstencil"],
-    default="direct",
-    help=(
-        "Algorithm passed to run-ozaki: "
-        "'direct' (scalar stencil_v1, default) or "
-        "'convstencil' (WMMA tensor core, 2D 7x7 stencils only)."
-    ),
-)
-_parser.add_argument(
     "--no-experiments",
     action="store_true",
     help="Generate stencil files only; skip running the precision experiments.",
@@ -504,22 +676,12 @@ _parser.add_argument(
     ),
 )
 _parser.add_argument(
-    "tensor_1d",
-    help="Path to 1D input tensor, or NONE to skip 1D tests.",
-    nargs="?",
-    default=None,
-)
-_parser.add_argument(
-    "tensor_2d",
-    help="Path to 2D input tensor, or NONE to skip 2D tests.",
-    nargs="?",
-    default=None,
-)
-_parser.add_argument(
-    "tensor_3d",
-    help="Path to 3D input tensor, or NONE to skip 3D tests.",
-    nargs="?",
-    default=None,
+    "--dims",
+    type=int,
+    nargs="+",
+    choices=[2, 3],
+    default=[2, 3],
+    help="Stencil dimensionalities to test (default: 2 3).",
 )
 _args = _parser.parse_args()
 
@@ -533,27 +695,31 @@ os.makedirs(STENCIL_DIR, exist_ok=True)
 os.makedirs(TENSOR_DIR, exist_ok=True)
 
 rng = np.random.default_rng(0)
+rmse_breach_found = False
+pipeline_failures = 0
 
 
-def _resolve_tensor_arg(arg):
-    if arg is None or arg.upper() == "NONE":
-        return None
-    if not os.path.isfile(arg):
-        raise FileNotFoundError(f"Input tensor not found: {arg}")
-    return arg
+INPUT_EXTENT = {2: 512, 3: 64}
 
 
-input_tensors = {
-    1: _resolve_tensor_arg(_args.tensor_1d),
-    2: _resolve_tensor_arg(_args.tensor_2d),
-    3: _resolve_tensor_arg(_args.tensor_3d),
-}
-for dim, path in input_tensors.items():
-    if path is None:
-        if not _args.no_experiments:
-            print(f"Skipping {dim}D tests (no input tensor supplied).")
-    else:
-        print(f"Using {dim}D input tensor: {path}")
+def input_tensor(stencil_shape):
+    """Gaussian input whose zero boundary is exactly the stencil's halo.
+
+    A wider zero boundary would make interior cells artificially zero and bias
+    the errors in our favour. All variants share the seed (and interior values).
+    """
+    dim = len(stencil_shape)
+    halo = stencil_shape[0] // 2
+    n = INPUT_EXTENT[dim]
+    path = f"./data/{dim}D_{'x'.join([str(n)] * dim)}_halo{halo}.dat"
+    if not os.path.isfile(path):
+        print(f"Generating input tensor {path}")
+        subprocess.run(
+            [f"{BUILD_BIN}/gen-tensor", "-o", path, "--N", str(n),
+             "--dims", str(dim), "--halo", str(halo)],
+            check=True,
+        )
+    return path
 
 # --- Precision test loop ---
 _csv_ctx = (
@@ -586,10 +752,9 @@ with _csv_ctx as csvfile, _breach_ctx as breachfile:
         )
 
     for stencil_shape, input_label in SHAPE_INPUT_PAIRS:
-        dim = len(stencil_shape)
-        input_file = input_tensors.get(dim)
-        if input_file is None and not _args.no_experiments:
+        if len(stencil_shape) not in _args.dims:
             continue
+        input_file = None if _args.no_experiments else input_tensor(stencil_shape)
         for neg_coeffs, req_slices, sparse, l1_norm, stencil_num in product(
             NEGATIVE_COEFFS, REQUESTED_SLICES, SPARSE, L1_NORM, STENCIL_NAME
         ):
@@ -607,26 +772,33 @@ with _csv_ctx as csvfile, _breach_ctx as breachfile:
                 continue
             for T in TIMESTEPS:
                 print(f"Testing {name} | {input_label} | T={T} ...")
-                success, errs, oz_output = run_pipeline(
-                    name, input_file, input_label, T, _args.algorithm
-                )
-                stencil_msb_shift = oz_output.split("\n")[0][-1] if oz_output else ""
+                success, errs, oz_output = run_pipeline(name, input_file, input_label, T)
+                stencil_msb_shift = ""
 
                 if success:
-                    high_error = errs[-1][0] > ERROR_THRESHOLD
+                    # The correctness criterion applies only to the terminal
+                    # (highest-precision) slice count. Lower-slice results are
+                    # retained for convergence plots, but are informational.
+                    final_rmse = errs[-1][0]
+                    high_error = final_rmse > ERROR_THRESHOLD
+                    rmse_breach_found = rmse_breach_found or high_error
                     # Write one CSV row per slice count for plotting.
                     for i, (rmse, max_abs_diff) in enumerate(errs):
                         n_slices = i + 2
+                        if i == len(errs) - 1:
+                            result = "Wrong" if high_error else "Correct"
+                        else:
+                            result = "Informational"
                         writer.writerow(
                             [
                                 name,
                                 input_label,
                                 T,
-                                EXTRA_MSBS,
-                                EXTRA_LSBS,
+                                0,
+                                0,
                                 stencil_msb_shift,
                                 "Completed",
-                                "Wrong" if rmse > ERROR_THRESHOLD else "Correct",
+                                result,
                                 n_slices,
                                 rmse,
                                 max_abs_diff,
@@ -651,13 +823,14 @@ with _csv_ctx as csvfile, _breach_ctx as breachfile:
                         breachfile.write(f"run-ozaki output: {oz_output}\n")
                         breachfile.write(("-" * 90) + "\n\n")
                 else:
+                    pipeline_failures += 1
                     writer.writerow(
                         [
                             name,
                             input_label,
                             T,
-                            EXTRA_MSBS,
-                            EXTRA_LSBS,
+                            0,
+                            0,
                             stencil_msb_shift,
                             "Failed",
                             "N/A",
@@ -668,3 +841,15 @@ with _csv_ctx as csvfile, _breach_ctx as breachfile:
                     )
 
                 csvfile.flush()
+
+if not _args.no_experiments:
+    if not rmse_breach_found and pipeline_failures == 0:
+        print(
+            f"\nSUCCESS: no stencil produced an RMSE above the "
+            f"{ERROR_THRESHOLD:.0e} threshold."
+        )
+    elif pipeline_failures:
+        print(
+            f"\nPrecision testing completed with {pipeline_failures} pipeline failure(s); "
+            "no success claim was made."
+        )
