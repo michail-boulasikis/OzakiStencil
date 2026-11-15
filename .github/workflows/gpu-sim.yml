@@ -1,0 +1,78 @@
+name: GPU tests (simulated H100)
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# the GPU gtests and runs them on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behavior or timing, so it complements real-GPU testing and
+# does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "include/**"
+      - "lib/**"
+      - "test/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gpu-sim:
+    name: GPU tests, simulated H100
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@656f502ef4782d94d34d8ddd368e333960609639 # v0.1.8
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      # The CMake files require cuDNN (only the benchmarks use it), and the GPU
+      # headers include cudnn.h and the NVTX header.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build libboost-program-options-dev libcudnn9-dev-cuda-13 cuda-nvtx-13-0
+
+      # The simulator runs PTX only. "90" embeds PTX for sm_90 (the default
+      # "90a" is SASS only); the wgmma path is off for it and the tests use
+      # mma.sync. The GPU libraries link the shared cudart (CUDA::cudart).
+      - name: Configure
+        run: |
+          cmake -S . -B build -GNinja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.0/bin/nvcc \
+                -DCUDAToolkit_ROOT=/usr/local/cuda-13.0 \
+                -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared \
+                -DCUDA_COMPUTE_CAPABILITY=90
+
+      - name: Build GPU tests
+        run: cmake --build build -j3 --target test-ozaki-gpu test-stencil-gpu
+
+      # The tests call GTEST_SKIP when no device is found, so check that the
+      # simulated H100 was used and that nothing was skipped.
+      - name: Run GPU tests
+        run: |
+          for t in test-ozaki-gpu test-stencil-gpu; do
+            echo "::group::$t"
+            vgpu run ./build/bin/$t 2>&1 | tee "$t.log"
+            echo "::endgroup::"
+            test "${PIPESTATUS[0]}" -eq 0
+            grep -q "1 x nvidia/h100" "$t.log"
+            grep -Eq "\[  PASSED  \] [1-9][0-9]* tests?" "$t.log"
+            if grep -q "SKIPPED" "$t.log"; then echo "tests were skipped"; exit 1; fi
+          done
